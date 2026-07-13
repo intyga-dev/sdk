@@ -1,0 +1,17 @@
+{
+  "name": "@sakra/mcp-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "sakra-proxy": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@sakra/config": "workspace:*",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

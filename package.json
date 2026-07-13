@@ -1,0 +1,14 @@
+{
+  "name": "sakra-sdk-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm --filter @sakra/verify build && pnpm --filter @sakra/sdk build && pnpm --filter @sakra/mcp-sdk build",
+    "typecheck": "pnpm --recursive exec tsc --noEmit",
+    "test": "pnpm --filter @sakra/verify test && pnpm --filter @sakra/sdk test"
+  }
+}

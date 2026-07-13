@@ -1,0 +1,25 @@
+{
+  "name": "@sakra/verify",
+  "version": "0.1.0",
+  "description": "Independently verify SÄKRA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO SÄKRA secret. Zero runtime dependencies; inspect it yourself.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": { "types": "./src/index.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "src", "README.md"],
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'src/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@sakra/config": "workspace:*",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
