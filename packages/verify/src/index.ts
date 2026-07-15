@@ -1,10 +1,10 @@
-// @sakra/verify — independently confirm that a human cryptographically approved EXACTLY the action
+// @sakra-trust/verify — independently confirm that a human cryptographically approved EXACTLY the action
 // you are about to run. Zero runtime dependencies (node:crypto only), no network, and NO SÄKRA secret:
 // a relying party recomputes the canonical payload from its own params, checks it byte-matches what was
 // signed, and verifies the human's P-256 / WebAuthn signature. This is the "inspect-it-yourself" trust
 // artifact — the whole point is that you don't have to take SÄKRA's word for it.
 //
-// The canonicalization + hashing here MUST stay byte-for-byte identical to @sakra/mcp-schemas and the
+// The canonicalization + hashing here MUST stay byte-for-byte identical to @sakra-trust/mcp-schemas and the
 // mobile wallet, or signatures won't verify. Do not "tidy" the JSON shapes.
 
 import crypto from "node:crypto";
@@ -159,3 +159,32 @@ export function verifyApprovalReceipt(
     return { ok: true };
   }
 }
+
+// ─── Audit ledger inclusion proofs ───────────────────────────────────────────
+// The other half of "inspect-it-yourself": confirm an audit event is committed to SÄKRA's append-only
+// Merkle log against an independently anchored daily root. Same zero-dependency, no-secret contract as
+// the approval-receipt verifier above. See @sakra-trust/ledger (SPEC.md) for the format and the
+// published end-of-day roots. Surfaced on the CLI as `sakra audit-verify`.
+
+export {
+  sha256Hex,
+  hashLeaf,
+  hashPair,
+  merkleRoot,
+  merkleProof,
+  verifyMerkleProof,
+  type ProofStep,
+} from "./ledger-merkle.js";
+
+export { canonicalPreimage, leafHash, type AuditLeaf } from "./ledger-leaf.js";
+
+export { verifyInclusionProof, type InclusionProof } from "./ledger-proof.js";
+
+export {
+  verifyBundle,
+  BUNDLE_KIND,
+  type ProofBundle,
+  type BundleVerification,
+  type CheckResult,
+  type VerifyOptions,
+} from "./ledger-bundle.js";

@@ -1,5 +1,5 @@
 {
-  "name": "@sakra/verify",
+  "name": "@sakra-trust/verify",
   "version": "0.1.0",
   "description": "Independently verify SÄKRA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO SÄKRA secret. Zero runtime dependencies; inspect it yourself.",
   "license": "MIT",
@@ -18,7 +18,7 @@
     "test": "node --test 'src/**/*.test.ts'"
   },
   "devDependencies": {
-    "@sakra/config": "workspace:*",
+    "@sakra-trust/config": "workspace:*",
     "@types/node": "^22.9.0",
     "typescript": "^5.6.3"
   }

@@ -7,8 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "pnpm --filter @sakra/verify build && pnpm --filter @sakra/sdk build && pnpm --filter @sakra/mcp-sdk build",
+    "build": "pnpm --filter @sakra-trust/verify build && pnpm --filter @sakra-trust/sdk build && pnpm --filter @sakra-trust/mcp-sdk build",
     "typecheck": "pnpm --recursive exec tsc --noEmit",
-    "test": "pnpm --filter @sakra/verify test && pnpm --filter @sakra/sdk test"
+    "test": "pnpm --filter @sakra-trust/verify test && pnpm --filter @sakra-trust/sdk test"
   }
 }

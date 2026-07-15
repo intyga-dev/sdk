@@ -46,6 +46,27 @@ function signPayload(privateKeyB64: string, payload: string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Pick the published daily root that covers this proof's seq (or matches its anchorRef), from a JSONL
+ *  roots file (e.g. a checkout of sakra-trust/ledger's roots/roots.jsonl). Undefined if no file/match. */
+function resolveRootFromFile(rootsPath: string | undefined, bundle: { proof: { seq: string; anchorRef: string | null } }): string | undefined {
+  if (!rootsPath) return undefined;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(rootsPath, "utf8");
+  } catch (err) {
+    die(`cannot read roots file: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const entries = raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as { seqStart?: string; seqEnd?: string; root: string; anchorRef?: string });
+  const seq = BigInt(bundle.proof.seq);
+  const byAnchor = bundle.proof.anchorRef ? entries.find((e) => e.anchorRef && e.anchorRef === bundle.proof.anchorRef) : undefined;
+  const bySeq = entries.find((e) => e.seqStart != null && e.seqEnd != null && BigInt(e.seqStart) <= seq && seq <= BigInt(e.seqEnd));
+  return (byAnchor ?? bySeq)?.root;
+}
+
 function parseParamsArg(): Record<string, unknown> {
   const raw = arg("params");
   if (!raw) return {};
@@ -348,6 +369,45 @@ async function main() {
       console.log(JSON.stringify(await client.verify(hash), null, 2));
       return;
     }
+    case "audit-verify": {
+      // Offline, no-secret verification of an audit inclusion proof exported from the dashboard.
+      // For a trustworthy verdict, supply the daily root from an independent source: --root <hex>
+      // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
+      // a checkout of the sakra-trust/ledger repo). Without one, the bundle is only checked against its
+      // own asserted root. Exit code 0 = verified, 1 = not.
+      const { verifyBundle } = await import("@sakra-trust/verify");
+      const bundlePath = rest.find((a) => !a.startsWith("--"));
+      if (!bundlePath) die("usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]");
+
+      let bundle: import("@sakra-trust/verify").ProofBundle;
+      try {
+        bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8")) as import("@sakra-trust/verify").ProofBundle;
+      } catch (err) {
+        die(`cannot read bundle: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      const trustedRoot = arg("root") ?? resolveRootFromFile(arg("roots"), bundle);
+      if (arg("roots") && !trustedRoot) console.error("warning: no matching root in the roots file for this event.");
+
+      const result = verifyBundle(bundle, { trustedRoot });
+
+      if (process.argv.indexOf("--json") >= 0) {
+        console.log(JSON.stringify(result, null, 2));
+        process.exit(result.ok ? 0 : 1);
+      }
+      const c = result.checks;
+      const m = (x: { pass: boolean | null }) => (x.pass === true ? "PASS" : x.pass === false ? "FAIL" : "n/a ");
+      console.log(`SÄKRA inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`);
+      console.log(`  root source     ${result.rootSource}`);
+      console.log(`  [${m(c.inclusion)}] inclusion       ${c.inclusion.detail}`);
+      console.log(`  [${m(c.rootConsistency)}] root match      ${c.rootConsistency.detail}`);
+      console.log(`  [${m(c.leafBinding)}] leaf binding    ${c.leafBinding.detail}`);
+      console.log(`  [${m(c.anchored)}] anchored        ${c.anchored.detail}`);
+      for (const n of result.notes) console.log(`  note: ${n}`);
+      console.log("");
+      console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m");
+      process.exit(result.ok ? 0 : 1);
+    }
     default:
       console.log(
         [
@@ -361,6 +421,7 @@ async function main() {
           "  sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
           '  sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
           "  sakra verify <documentHash> --gateway <url>",
+          "  sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]",
         ].join("\n"),
       );
       process.exit(cmd ? 1 : 0);

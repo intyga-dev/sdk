@@ -1,10 +1,10 @@
-// @sakra/sdk — one client for every SÄKRA use case. The primitive is uniform: request a challenge →
+// @sakra-trust/sdk — one client for every SÄKRA use case. The primitive is uniform: request a challenge →
 // a human approves on their wallet → poll until resolved. Works for AI agents, humans, and any
 // backend service; the only difference is which API key/token you hold.
 
 export * as policy from "./policy.js";
 
-// Receipt verification + canonical helpers now live in the standalone, zero-dependency @sakra/verify
+// Receipt verification + canonical helpers now live in the standalone, zero-dependency @sakra-trust/verify
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
 export {
   verifyApprovalReceipt,
@@ -12,8 +12,8 @@ export {
   verificationCode,
   verifyEcdsaP256,
   type ApprovalReceipt,
-} from "@sakra/verify";
-import type { ApprovalReceipt } from "@sakra/verify";
+} from "@sakra-trust/verify";
+import type { ApprovalReceipt } from "@sakra-trust/verify";
 
 export interface SakraClientOptions {
   gatewayUrl: string;

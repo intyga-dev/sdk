@@ -12,27 +12,27 @@ SÄKRA is a general **action-governance and witness primitive**: no high-risk op
 
 | Package | Purpose | Version |
 | :--- | :--- | :--- |
-| [`@sakra/sdk`](#sakra-sdk) | The main client SDK for Node.js / TypeScript. | `0.1.0` |
-| [`@sakra/verify`](#sakra-verify) | Zero-dependency offline cryptographic receipt verifier. | `0.1.0` |
-| [`@sakra/mcp-sdk`](#sakra-mcp) | SDK helper utilities and Zod schemas for Model Context Protocol. | `1.0.0` |
-| `@sakra/mcp-proxy` | Standard I/O to SSE bridge proxy for MCP servers. | `1.0.0` |
+| [`@sakra-trust/sdk`](#sakra-sdk) | The main client SDK for Node.js / TypeScript. | `0.1.0` |
+| [`@sakra-trust/verify`](#sakra-verify) | Zero-dependency offline cryptographic receipt verifier. | `0.1.0` |
+| [`@sakra-trust/mcp-sdk`](#sakra-mcp) | SDK helper utilities and Zod schemas for Model Context Protocol. | `1.0.0` |
+| `@sakra-trust/mcp-proxy` | Standard I/O to SSE bridge proxy for MCP servers. | `1.0.0` |
 
 ---
 
 ## 1. Quickstart: Gating a Blast-Radius Operation
 
-Add `@sakra/sdk` to your backend service to prevent fat-fingered scripts, prompt-injected AI models, or compromised API keys from executing critical operations without human sign-off.
+Add `@sakra-trust/sdk` to your backend service to prevent fat-fingered scripts, prompt-injected AI models, or compromised API keys from executing critical operations without human sign-off.
 
 ### Install
 ```bash
-npm install @sakra/sdk
+npm install @sakra-trust/sdk
 ```
 
 ### Integration Example
 Wrap any irreversible call in your backend with `requireApproval` and verify the cryptographic signature receipt offline:
 
 ```typescript
-import { SakraClient, verifyApprovalReceipt } from "@sakra/sdk";
+import { SakraClient, verifyApprovalReceipt } from "@sakra-trust/sdk";
 
 const sakra = new SakraClient({
   gatewayUrl: process.env.SAKRA_GATEWAY_URL!,      // Your SÄKRA gateway or cloud endpoint
@@ -72,14 +72,14 @@ async function wipeDatabase(targetDatabase: string) {
 
 ---
 
-## 2. Independent Cryptographic Verification (`@sakra/verify`)
+## 2. Independent Cryptographic Verification (`@sakra-trust/verify`)
 
-If you are running in highly secure environments (like enclave execution or regulated services), you can use `@sakra/verify` with **zero runtime dependencies** (relying only on Node's native `crypto` module).
+If you are running in highly secure environments (like enclave execution or regulated services), you can use `@sakra-trust/verify` with **zero runtime dependencies** (relying only on Node's native `crypto` module).
 
 You check SÄKRA's math yourself:
 
 ```typescript
-import { verifyApprovalReceipt } from "@sakra/verify";
+import { verifyApprovalReceipt } from "@sakra-trust/verify";
 
 // Verify a receipt returned from the SÄKRA gateway offline
 const result = verifyApprovalReceipt(receipt, {
@@ -94,7 +94,7 @@ if (!result.ok) {
 ```
 
 ### Policy Auto-Approvals
-If a policy was evaluated and auto-approved during a break-glass window, the receipt will have `sigAlg: "AUTO_APPROVED"`. Because no human signature exists to check, `@sakra/verify` **refuses this by default**. To explicitly opt in to policy auto-approvals, pass the allowance option:
+If a policy was evaluated and auto-approved during a break-glass window, the receipt will have `sigAlg: "AUTO_APPROVED"`. Because no human signature exists to check, `@sakra-trust/verify` **refuses this by default**. To explicitly opt in to policy auto-approvals, pass the allowance option:
 
 ```typescript
 verifyApprovalReceipt(receipt, expectedAction, { allowAutoApproved: true });
@@ -107,7 +107,7 @@ verifyApprovalReceipt(receipt, expectedAction, { allowAutoApproved: true });
 Ensure your security policies remain entirely confidential. Under SÄKRA's ZK policy design, you author policies locally, encrypt them using an organization public key, and publish the encrypted blob. The SÄKRA gateway only stores the ciphertext and enforces policy version hash freshness—it never decrypts or views the rules.
 
 ### Using the CLI
-The `@sakra/sdk` publishes a standalone CLI utility `sakra`:
+The `@sakra-trust/sdk` publishes a standalone CLI utility `sakra`:
 
 ```bash
 # 1. Generate local key pair

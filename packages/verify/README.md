@@ -1,4 +1,4 @@
-# @sakra/verify
+# @sakra-trust/verify
 
 **Independently confirm that a human cryptographically approved exactly the action you're about to run — with no SÄKRA secret.**
 
@@ -9,7 +9,7 @@ When SÄKRA returns an approval, it hands you a **receipt**: the exact canonical
 - Verifies both **raw P-256** (mobile wallet) and **WebAuthn** (passkey / hardware key) approvals, plus policy `AUTO_APPROVED` receipts.
 
 ```ts
-import { verifyApprovalReceipt } from "@sakra/verify";
+import { verifyApprovalReceipt } from "@sakra-trust/verify";
 
 // `receipt` came back from SÄKRA when the human approved.
 const check = verifyApprovalReceipt(receipt, {
@@ -46,6 +46,6 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 
 > The canonicalization here is byte-for-byte identical to the SÄKRA gateway, the mobile wallet, and
-> `@sakra/mcp-schemas`. That identity is the whole point — don't reformat it.
+> `@sakra-trust/mcp-schemas`. That identity is the whole point — don't reformat it.
 
 MIT licensed.

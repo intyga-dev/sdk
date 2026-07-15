@@ -1,5 +1,5 @@
 {
-  "name": "@sakra/sdk",
+  "name": "@sakra-trust/sdk",
   "version": "0.1.0",
   "description": "SÄKRA SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption. Publish-ready; not yet published.",
   "license": "MIT",
@@ -15,7 +15,7 @@
   "publishConfig": { "access": "public" },
   "engines": { "node": ">=18" },
   "dependencies": {
-    "@sakra/verify": "workspace:*"
+    "@sakra-trust/verify": "workspace:*"
   },
   "scripts": {
     "build": "tsc",
@@ -23,7 +23,7 @@
     "test": "node --test 'src/**/*.test.ts'"
   },
   "devDependencies": {
-    "@sakra/config": "workspace:*",
+    "@sakra-trust/config": "workspace:*",
     "@types/node": "^22.9.0",
     "typescript": "^5.6.3"
   }
