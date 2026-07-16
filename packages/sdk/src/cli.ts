@@ -318,9 +318,15 @@ async function main() {
       const onPending = () => {
         printApprovalBanner();
         if (process.argv.indexOf("--no-open") >= 0) return;
-        const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+        // Open the approval URL via execFile with an argument array — never a shell command string.
+        // approvalUrl embeds a server-provided nonce, and string interpolation into `exec` would let a
+        // malicious/compromised gateway inject shell (e.g. `$(...)`/backticks) and run code locally.
         try {
-          void import("node:child_process").then(({ exec }) => exec(`${openCmd} "${approvalUrl}"`));
+          void import("node:child_process").then(({ execFile }) => {
+            if (process.platform === "darwin") execFile("open", [approvalUrl]);
+            else if (process.platform === "win32") execFile("cmd", ["/c", "start", "", approvalUrl]);
+            else execFile("xdg-open", [approvalUrl]);
+          });
         } catch {}
       };
 
