@@ -13,6 +13,7 @@ SÄKRA is a general **action-governance and witness primitive**: no high-risk op
 | Package | Purpose | Version |
 | :--- | :--- | :--- |
 | [`@sakra-trust/sdk`](#sakra-sdk) | The main client SDK for Node.js / TypeScript. | `0.1.0` |
+| [`sakra-sdk` (Python)](#sakra-sdk-python) | SÄKRA client SDK for Python applications & pipelines. | `0.1.0` |
 | [`@sakra-trust/verify`](#sakra-verify) | Zero-dependency offline cryptographic receipt verifier. | `0.1.0` |
 | [`@sakra-trust/mcp-sdk`](#sakra-mcp) | SDK helper utilities and Zod schemas for Model Context Protocol. | `1.0.0` |
 | `@sakra-trust/mcp-proxy` | Standard I/O to SSE bridge proxy for MCP servers. | `1.0.0` |
@@ -68,6 +69,48 @@ async function wipeDatabase(targetDatabase: string) {
   // 3. Safe to proceed
   await executeWipeCommand(targetDatabase);
 }
+```
+
+### Python Quickstart
+
+Install the Python SDK:
+```bash
+pip install sakra-sdk
+```
+
+Wrap critical operations and verify the signature receipt:
+```python
+import asyncio
+from sakra_sdk import SakraClient, verify_approval_receipt
+
+sakra = SakraClient(
+    gateway_url="https://api.sakra.com",
+    client_id="your-client-id",
+    client_secret="your-client-secret"
+)
+
+async def wipe_database(target_database: str):
+    action = {
+        "actionType": "wipe_production",
+        "params": { "target": target_database }
+    }
+
+    # 1. Block and request human verification
+    approval = await sakra.require_approval(
+        f"Wipe production database: {target_database}",
+        action_type=action["actionType"],
+        params=action["params"]
+    )
+    if approval["status"] != "APPROVED":
+        raise Exception(f"Unauthorized: {approval['status']}")
+
+    # 2. Offline cryptographic verification (no connection or secret required)
+    check = verify_approval_receipt(approval["receipt"], action)
+    if not check["ok"]:
+        raise Exception(f"Verification failed: {check['reason']}")
+
+    # 3. Safe to proceed
+    await execute_wipe_command(target_database)
 ```
 
 ---
