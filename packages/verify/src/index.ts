@@ -188,3 +188,11 @@ export {
   type CheckResult,
   type VerifyOptions,
 } from "./ledger-bundle.js";
+export {
+  verifyEvidenceBundle,
+  EVIDENCE_BUNDLE_KIND,
+  type EvidenceBundle,
+  type EvidenceEntry,
+  type EvidenceVerification,
+  type EvidenceVerifyOptions,
+} from "./ledger-evidence.js";

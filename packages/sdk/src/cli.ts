@@ -381,7 +381,7 @@ async function main() {
       // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
       // a checkout of the sakra-trust/ledger repo). Without one, the bundle is only checked against its
       // own asserted root. Exit code 0 = verified, 1 = not.
-      const { verifyBundle } = await import("@sakra-trust/verify");
+      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND } = await import("@sakra-trust/verify");
       const bundlePath = rest.find((a) => !a.startsWith("--"));
       if (!bundlePath) die("usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]");
 
@@ -390,6 +390,27 @@ async function main() {
         bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8")) as import("@sakra-trust/verify").ProofBundle;
       } catch (err) {
         die(`cannot read bundle: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
+      if ((bundle as { kind?: string }).kind === EVIDENCE_BUNDLE_KIND) {
+        const evidence = bundle as unknown as import("@sakra-trust/verify").EvidenceBundle;
+        const rootArgs = arg("root") ? [arg("root")!] : undefined;
+        const result = verifyEvidenceBundle(evidence, { trustedRoots: rootArgs });
+        if (process.argv.indexOf("--json") >= 0) {
+          console.log(JSON.stringify(result, null, 2));
+          process.exit(result.ok ? 0 : 1);
+        }
+        console.log(`SÄKRA evidence bundle — ${result.total} entries (${evidence.range.from} → ${evidence.range.to})`);
+        console.log(`  content-verified  ${result.contentVerified}`);
+        console.log(`  commitment-only   ${result.commitmentOnly} (redacted by retention — digest verified, content removed)`);
+        console.log(`  failed            ${result.failed.length}`);
+        for (const f of result.failed.slice(0, 20)) console.log(`    seq ${f.seq}: ${f.reason}`);
+        for (const r of result.roots) console.log(`  root ${r.root.slice(0, 16)}… anchor: ${r.anchorRef ?? "(none)"}`);
+        for (const n of result.notes) console.log(`  note: ${n}`);
+        console.log("");
+        console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m");
+        process.exit(result.ok ? 0 : 1);
       }
 
       const trustedRoot = arg("root") ?? resolveRootFromFile(arg("roots"), bundle);
