@@ -25,6 +25,6 @@
   "devDependencies": {
     "@sakra-trust/config": "workspace:*",
     "@types/node": "^22.9.0",
-    "typescript": "^5.6.3"
+    "typescript": "^7.0.2"
   }
 }
