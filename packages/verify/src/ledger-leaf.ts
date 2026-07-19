@@ -1,4 +1,4 @@
-import { hashLeaf } from "./ledger-merkle.js";
+import { hashLeaf } from "./ledger-merkle.js"
 
 // Canonical leaf encoding — the exact preimage the producer commits to for one audit event. To bind a
 // proof to a human-readable event ("this leaf IS this record"), a bundle must carry every field below
@@ -7,23 +7,23 @@ import { hashLeaf } from "./ledger-merkle.js";
 // format-version bump on both sides).
 
 export interface AuditLeaf {
-  seq: string; // stringified bigint — matches producer's row.seq.toString()
-  createdAt: string; // ISO 8601 — matches row.createdAt.toISOString()
-  event: string;
-  outcome: string;
-  detail: string | null;
-  metadata: unknown; // arbitrary JSON; hashed as JSON.stringify(metadata ?? null)
-  signerDid: string | null;
-  signerPublicKey: string | null;
-  signedPayload: string | null;
-  signature: string | null;
-  sigAlg: string | null;
-  isBillable: boolean;
-  tenantId: string | null;
-  actorNodeId: string | null;
-  subjectNodeId: string | null;
-  edgeId: string | null;
-  challengeId: string | null;
+  seq: string // stringified bigint — matches producer's row.seq.toString()
+  createdAt: string // ISO 8601 — matches row.createdAt.toISOString()
+  event: string
+  outcome: string
+  detail: string | null
+  metadata: unknown // arbitrary JSON; hashed as JSON.stringify(metadata ?? null)
+  signerDid: string | null
+  signerPublicKey: string | null
+  signedPayload: string | null
+  signature: string | null
+  sigAlg: string | null
+  isBillable: boolean
+  tenantId: string | null
+  actorNodeId: string | null
+  subjectNodeId: string | null
+  edgeId: string | null
+  challengeId: string | null
 }
 
 /** The 17-field ordered array that gets JSON-stringified into the leaf preimage. Keep in lockstep
@@ -47,10 +47,10 @@ export function canonicalPreimage(row: AuditLeaf): string {
     row.subjectNodeId,
     row.edgeId,
     row.challengeId,
-  ]);
+  ])
 }
 
 /** Domain-separated leaf digest over the full event content. */
 export function leafHash(row: AuditLeaf): string {
-  return hashLeaf(canonicalPreimage(row));
+  return hashLeaf(canonicalPreimage(row))
 }
