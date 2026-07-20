@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "pnpm --filter @sakra-trust/verify build && pnpm --filter @sakra-trust/sdk build",
-    "typecheck": "pnpm --recursive exec tsc --noEmit",
+    "typecheck": "pnpm --recursive run typecheck",
     "test": "pnpm --filter @sakra-trust/verify test && pnpm --filter @sakra-trust/sdk test"
   }
 }

@@ -1,6 +1,6 @@
 # SÄKRA — Cryptographic Governance for Critical Infrastructure
 
-This repository contains the public-facing client SDKs, offline verification libraries, and Model Context Protocol (MCP) plugins for the SÄKRA action-governance protocol.
+This repository contains the public-facing client SDKs and offline verification libraries for the SÄKRA action-governance protocol. The Model Context Protocol (MCP) tooling for AI agents lives in its own repository: [`SAKRA-trust/mcp`](https://github.com/SAKRA-trust/mcp).
 
 SÄKRA is a general **action-governance and witness primitive**: no high-risk operation (database mutations, treasury commands, deployments, or AI agent tool calls) runs without a cryptographically-signed human approval and a tamper-evident record.
 
@@ -15,8 +15,6 @@ SÄKRA is a general **action-governance and witness primitive**: no high-risk op
 | [`@sakra-trust/sdk`](#sakra-sdk) | The main client SDK for Node.js / TypeScript. | `0.1.0` |
 | [`sakra-sdk` (Python)](#sakra-sdk-python) | SÄKRA client SDK for Python applications & pipelines. | `0.1.0` |
 | [`@sakra-trust/verify`](#sakra-verify) | Zero-dependency offline cryptographic receipt verifier. | `0.1.0` |
-| [`@sakra-trust/mcp-sdk`](#sakra-mcp) | SDK helper utilities and Zod schemas for Model Context Protocol. | `1.0.0` |
-| `@sakra-trust/mcp-proxy` | Standard I/O to SSE bridge proxy for MCP servers. | `1.0.0` |
 
 ---
 
@@ -165,34 +163,15 @@ npx sakra verify <documentHash> --gateway https://api.sakra.com
 
 ---
 
-## 4. Connecting to SÄKRA as an MCP Server
+## 4. Governing AI Agent Tool Calls (MCP)
 
-SÄKRA implements the **Model Context Protocol (MCP)**. This allows AI coding agents (such as Claude Code, Cursor, or custom LLM loops) to interface directly with SÄKRA to request human-in-the-loop validation for tool calls.
-
-### Client Configuration (`mcp.json`)
-Add the SÄKRA Server configuration to your LLM agent client configuration:
-
-```json
-{
-  "mcpServers": {
-    "sakra": {
-      "type": "sse",
-      "url": "https://api.sakra.com/mcp/sse",
-      "headers": { 
-        "Authorization": "Bearer <your_agent_jwt_token>" 
-      }
-    }
-  }
-}
-```
-
-### Provided Tools
-
-* **`verify_human_authorization`**: Initiates a challenge request. Returns a `nonce` UUID and immediately responds with `PENDING` while pushing a request to the user's mobile wallet.
-* **`check_human_authorization`**: Polls the status of the request by `nonce`. Returns `PENDING`, `APPROVED` (with cryptographic signature receipt), `DENIED`, or `EXPIRED`.
+For gating an AI agent's Model Context Protocol tool calls behind human approval — either by
+connecting to SÄKRA's hosted MCP endpoint or by wrapping your own MCP server — see the dedicated
+repository and packages: **[`SAKRA-trust/mcp`](https://github.com/SAKRA-trust/mcp)**
+(`@sakra-trust/mcp-sdk`, `@sakra-trust/mcp-proxy`).
 
 ---
 
 ## License
 
-This repository is licensed under the MIT License.
+Apache-2.0. See each package's `LICENSE`.
