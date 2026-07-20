@@ -15,6 +15,15 @@ function die(msg: string): never {
   process.exit(1)
 }
 
+function parseTimeout(val: string | undefined): { timeoutSec?: number; timeoutMs: number } {
+  if (!val) return { timeoutMs: 120_000 }
+  const num = Number(val)
+  if (!Number.isFinite(num) || num <= 0) {
+    die(`Invalid --timeout value: "${val}". Must be a positive number of seconds.`)
+  }
+  return { timeoutSec: num, timeoutMs: Math.round(num * 1000) }
+}
+
 /** Best-effort permission tightening — `chmod` throws on Windows/exotic filesystems and must never
  *  break `sakra login`. The `mode` options on mkdir/writeFile are no-ops when the target already
  *  exists, so these calls are also what repairs a 0644 credentials file from an earlier install. */
@@ -367,17 +376,17 @@ async function main() {
         token: arg("token") ?? process.env.SAKRA_TOKEN,
         clientId: arg("client-id") ?? process.env.SAKRA_CLIENT_ID,
         clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
+        allowStoredCredentials: true,
       })
 
       const actionType = arg("type") ?? ""
       const params = parseParamsArg()
-      const timeoutVal = arg("timeout")
-      const timeoutMs = timeoutVal ? Number(timeoutVal) * 1000 : 120_000
+      const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
 
       const { nonce } = await client.authorize(actionDescription, {
         actionType,
         params,
-        timeout: timeoutVal ? Number(timeoutVal) : undefined,
+        timeout: timeoutSec,
       })
 
       const webUrl = arg("web") || process.env.SAKRA_APP_URL || "http://localhost:3999"
@@ -443,14 +452,15 @@ async function main() {
         token: arg("token") ?? process.env.SAKRA_TOKEN,
         clientId: arg("client-id") ?? process.env.SAKRA_CLIENT_ID,
         clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
+        allowStoredCredentials: true,
       })
-      const timeoutVal = arg("timeout")
+      const { timeoutMs } = parseTimeout(arg("timeout"))
       await pollVerifyConsume(
         client,
         nonce,
         arg("type") ?? "",
         parseParamsArg(),
-        timeoutVal ? Number(timeoutVal) * 1000 : 120_000,
+        timeoutMs,
         process.argv.indexOf("--consume") >= 0,
       )
       process.exit(0)

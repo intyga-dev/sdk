@@ -119,9 +119,16 @@ test("a stored credential from `sakra login` is picked up per gateway", async (t
   const f = stubFetch(() => ({ body: {} }))
   t.after(f.restore)
 
-  assert.equal(await new SakraClient({ gatewayUrl: GW }).token(), "tok-stored")
-  // A gateway with no stored entry must not silently borrow another gateway's token.
-  await assert.rejects(() => new SakraClient({ gatewayUrl: "https://third.example" }).token())
+  assert.equal(await new SakraClient({ gatewayUrl: GW, allowStoredCredentials: true }).token(), "tok-stored")
+  // Without explicit allowStoredCredentials, stored tokens are ignored to prevent server-side identity borrowing.
+  await assert.rejects(
+    () => new SakraClient({ gatewayUrl: GW }).token(),
+    /provide `token`, or `clientId` \+ `clientSecret`/,
+  )
+  // A gateway with no stored entry must not silently borrow another gateway's token even when enabled.
+  await assert.rejects(() =>
+    new SakraClient({ gatewayUrl: "https://third.example", allowStoredCredentials: true }).token(),
+  )
   assert.equal(f.calls.length, 0)
 })
 

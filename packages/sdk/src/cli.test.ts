@@ -68,3 +68,35 @@ test("notify without --url exits non-zero", () => {
   assert.notEqual(r.status, 0)
   assert.match(r.stderr, /usage: sakra notify/)
 })
+
+for (const badTimeout of ["abc", "-10", "0"]) {
+  test(`authorize with invalid --timeout (${badTimeout}) exits non-zero`, () => {
+    const r = run([
+      "authorize",
+      "do a thing",
+      "--timeout",
+      badTimeout,
+      "--token",
+      "t",
+      "--gateway",
+      "http://127.0.0.1:9",
+    ])
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /Invalid --timeout value/)
+  })
+
+  test(`await with invalid --timeout (${badTimeout}) exits non-zero`, () => {
+    const r = run([
+      "await",
+      "nonce-123",
+      "--timeout",
+      badTimeout,
+      "--token",
+      "t",
+      "--gateway",
+      "http://127.0.0.1:9",
+    ])
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /Invalid --timeout value/)
+  })
+}

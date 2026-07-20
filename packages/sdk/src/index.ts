@@ -21,6 +21,8 @@ export interface SakraClientOptions {
   token?: string
   clientId?: string
   clientSecret?: string
+  /** Allow loading stored bearer token from ~/.sakra/credentials.json (intended for CLI tools). */
+  allowStoredCredentials?: boolean
 }
 
 export type ApprovalStatus = "APPROVED" | "DENIED" | "EXPIRED" | "PENDING"
@@ -79,13 +81,19 @@ export class SakraClient {
   async token(): Promise<string> {
     if (this.opts.token) return this.opts.token
     if (this.cachedToken) return this.cachedToken
-    const stored = loadStoredToken(this.opts.gatewayUrl)
-    if (stored) {
-      this.cachedToken = stored
-      return stored
+    if (this.opts.allowStoredCredentials) {
+      const stored = loadStoredToken(this.opts.gatewayUrl)
+      if (stored) {
+        this.cachedToken = stored
+        return stored
+      }
     }
     if (!this.opts.clientId || !this.opts.clientSecret) {
-      throw new Error("provide `token`, or `clientId` + `clientSecret`, or run `sakra login` first")
+      throw new Error(
+        this.opts.allowStoredCredentials
+          ? "provide `token`, or `clientId` + `clientSecret`, or run `sakra login` first"
+          : "provide `token`, or `clientId` + `clientSecret`",
+      )
     }
     const basic = Buffer.from(`${this.opts.clientId}:${this.opts.clientSecret}`).toString("base64")
     const res = await fetch(`${this.opts.gatewayUrl}/oauth/token`, {
