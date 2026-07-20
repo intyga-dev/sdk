@@ -29,15 +29,117 @@ function base64url(str: string | Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "")
 }
 
-function parseCosePublicKey(coseBuffer: Buffer): { x: string; y: string } {
-  const xIdx = coseBuffer.indexOf(Buffer.from([0x21, 0x58, 0x20]))
-  const yIdx = coseBuffer.indexOf(Buffer.from([0x22, 0x58, 0x20]))
-  if (xIdx === -1 || yIdx === -1) {
-    throw new Error("Invalid COSE public key format: coordinates not found")
+// ─── Minimal CBOR reader (COSE_Key only) ─────────────────────────────────────
+// Just enough CBOR to walk a COSE_Key map: ints, byte/text strings, arrays, maps. Deliberately NOT a
+// general decoder and deliberately not a dependency — this package ships with zero runtime deps so a
+// relying party can audit every byte of it. Anything outside that subset is rejected rather than guessed.
+
+type CborValue = number | Buffer | string | CborValue[] | Map<CborValue, CborValue>
+
+function cborFail(detail: string): never {
+  throw new Error(`Invalid COSE public key format: ${detail}`)
+}
+
+function requireBytes(buf: Buffer, pos: number, len: number) {
+  if (pos + len > buf.length) cborFail("truncated CBOR item")
+}
+
+function readHead(buf: Buffer, pos: number): { major: number; value: number; pos: number } {
+  requireBytes(buf, pos, 1)
+  const initial = buf.readUInt8(pos)
+  const major = initial >> 5
+  const info = initial & 0x1f
+  let next = pos + 1
+  let value: number
+  if (info < 24) value = info
+  else if (info === 24) {
+    requireBytes(buf, next, 1)
+    value = buf.readUInt8(next)
+    next += 1
+  } else if (info === 25) {
+    requireBytes(buf, next, 2)
+    value = buf.readUInt16BE(next)
+    next += 2
+  } else if (info === 26) {
+    requireBytes(buf, next, 4)
+    value = buf.readUInt32BE(next)
+    next += 4
+  } else {
+    // 27 = 64-bit, 28-30 reserved, 31 = indefinite length. No COSE_Key needs any of them.
+    cborFail("unsupported CBOR length encoding")
   }
-  const xBytes = coseBuffer.subarray(xIdx + 3, xIdx + 3 + 32)
-  const yBytes = coseBuffer.subarray(yIdx + 3, yIdx + 3 + 32)
-  return { x: base64url(xBytes), y: base64url(yBytes) }
+  return { major, value, pos: next }
+}
+
+function decodeItem(buf: Buffer, pos: number): { value: CborValue; pos: number } {
+  const head = readHead(buf, pos)
+  switch (head.major) {
+    case 0: // unsigned int
+      return { value: head.value, pos: head.pos }
+    case 1: // negative int — COSE labels like -1 (crv), -2 (x), -3 (y)
+      return { value: -1 - head.value, pos: head.pos }
+    case 2: // byte string
+      requireBytes(buf, head.pos, head.value)
+      return { value: buf.subarray(head.pos, head.pos + head.value), pos: head.pos + head.value }
+    case 3: // text string
+      requireBytes(buf, head.pos, head.value)
+      return {
+        value: buf.toString("utf-8", head.pos, head.pos + head.value),
+        pos: head.pos + head.value,
+      }
+    case 4: {
+      const items: CborValue[] = []
+      let cursor = head.pos
+      for (let i = 0; i < head.value; i++) {
+        const item = decodeItem(buf, cursor)
+        items.push(item.value)
+        cursor = item.pos
+      }
+      return { value: items, pos: cursor }
+    }
+    case 5: {
+      const map = new Map<CborValue, CborValue>()
+      let cursor = head.pos
+      for (let i = 0; i < head.value; i++) {
+        const key = decodeItem(buf, cursor)
+        const val = decodeItem(buf, key.pos)
+        map.set(key.value, val.value)
+        cursor = val.pos
+      }
+      return { value: map, pos: cursor }
+    }
+    default:
+      return cborFail(`unsupported CBOR major type ${head.major}`)
+  }
+}
+
+/**
+ * Extract the P-256 coordinates from a WebAuthn COSE_Key. This walks the CBOR structure rather than
+ * scanning for the `0x21 0x58 0x20` / `0x22 0x58 0x20` byte patterns: a raw search can match those
+ * bytes *inside* another field's payload, and it cannot tell whether the 32 bytes it slices actually
+ * exist (a truncated buffer silently yields a short coordinate). We also pin kty/crv so a key for some
+ * other curve can never be reinterpreted as P-256.
+ */
+function parseCosePublicKey(coseBuffer: Buffer): { x: string; y: string } {
+  // Decode only the leading item; trailing bytes are tolerated, as some wallets slice the COSE key out
+  // of attestedCredentialData without trimming what follows it.
+  const { value } = decodeItem(coseBuffer, 0)
+  if (!(value instanceof Map)) cborFail("expected a CBOR map")
+
+  const kty = value.get(1)
+  if (kty !== 2) cborFail(`expected kty EC2 (2), got ${String(kty)}`)
+  const crv = value.get(-1)
+  if (crv !== 1) cborFail(`expected crv P-256 (1), got ${String(crv)}`)
+  const alg = value.get(3)
+  if (alg !== undefined && alg !== -7) cborFail(`expected alg ES256 (-7), got ${String(alg)}`)
+
+  const coordinate = (label: number, name: string): Buffer => {
+    const raw = value.get(label)
+    if (!Buffer.isBuffer(raw)) cborFail(`missing ${name} coordinate`)
+    if (raw.length !== 32) cborFail(`${name} coordinate must be 32 bytes, got ${raw.length}`)
+    return raw
+  }
+  return { x: base64url(coordinate(-2, "x")), y: base64url(coordinate(-3, "y")) }
 }
 
 /** Deterministic JSON with recursively sorted keys — identical to mcp-schemas.stableStringify. */

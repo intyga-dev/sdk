@@ -36,7 +36,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --test 'src/**/*.test.ts'"
+    "test": "node --test 'src/**/*.test.ts'",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude='../**' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "@sakra-trust/config": "workspace:*",

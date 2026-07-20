@@ -266,6 +266,58 @@ test("requireApproval gives up as EXPIRED and converts timeoutMs to whole second
   assert.equal(f.calls[0]!.body ? (f.calls[0]!.body as { timeout: number }).timeout : undefined, 2)
 })
 
+// Regression: the local deadline used to ignore opts.timeout and hardcode 120s, so it agreed with the
+// backend TTL only by accident. The test timeout is what catches the old behaviour — with `timeout: 1`
+// the pre-fix client ignored the 1s window and kept polling for the full two minutes.
+test("requireApproval derives its deadline from opts.timeout", { timeout: 20_000 }, async (t) => {
+  const f = stubFetch((call) =>
+    call.url.endsWith("/authorize")
+      ? { body: { nonce: "n-12", status: "PENDING" } }
+      : { body: { status: "PENDING" } },
+  )
+  t.after(f.restore)
+  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+
+  const started = Date.now()
+  const r = await c.requireApproval("Wire", { intervalMs: 10, timeout: 1 })
+  assert.equal(r.status, "EXPIRED")
+  // Client deadline and backend TTL now come from one value, so neither can outlive the other.
+  assert.equal((f.calls[0]!.body as { timeout: number }).timeout, 1)
+  assert.ok(Date.now() - started < 5_000, "should give up on its own 1s deadline, not the 120s default")
+})
+
+test("requireApproval rides out a transient polling failure", async (t) => {
+  let polls = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/authorize")) return { body: { nonce: "n-13", status: "PENDING" } }
+    polls += 1
+    if (polls === 1) return { status: 502, text: "bad gateway" }
+    if (polls === 2) return { body: { status: "PENDING" } }
+    return { body: { status: "APPROVED" } }
+  })
+  t.after(f.restore)
+  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+
+  // A momentary 502 must not throw away a wait the human may already have acted on.
+  const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 5_000 })
+  assert.equal(r.status, "APPROVED")
+})
+
+test("requireApproval gives up when the gateway is persistently unreachable", async (t) => {
+  const f = stubFetch((call) =>
+    call.url.endsWith("/authorize") ? { body: { nonce: "n-14", status: "PENDING" } } : { status: 503 },
+  )
+  t.after(f.restore)
+  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+
+  // Tolerating blips is not the same as hanging forever: sustained failure must surface, not
+  // masquerade as EXPIRED, so the caller can tell "no answer" from "the human said no".
+  await assert.rejects(
+    c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 60_000 }),
+    /5 consecutive errors/,
+  )
+})
+
 test("verify url-encodes the document hash and needs no token", async (t) => {
   const f = stubFetch(() => ({
     body: { verified: true, status: "SIGNED", documentHash: "ab/cd" },

@@ -54,11 +54,17 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+/** Where `sakra login` caches bearer tokens. Shared with the CLI writer so reader and writer can't desync. */
+export const SAKRA_DIR = path.join(os.homedir(), ".sakra")
+export const CREDENTIALS_FILE = path.join(SAKRA_DIR, "credentials.json")
+
+/** How many back-to-back polling failures before `requireApproval` declares the gateway unreachable. */
+const MAX_POLL_ERRORS = 5
+
 function loadStoredToken(gatewayUrl: string): string | undefined {
   try {
-    const credsPath = path.join(os.homedir(), ".sakra", "credentials.json")
-    if (fs.existsSync(credsPath)) {
-      const data = JSON.parse(fs.readFileSync(credsPath, "utf-8")) as Record<string, string>
+    if (fs.existsSync(CREDENTIALS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8")) as Record<string, string>
       return data[gatewayUrl]
     }
   } catch {}
@@ -159,22 +165,41 @@ export class SakraClient {
    *   if (r.status !== "APPROVED") throw new Error("not authorized");
    *   // Optional hard binding before executing:
    *   const ok = verifyApprovalReceipt(r.receipt!, { actionType: "wire_transfer", params: {...} });
+   *
+   * Note this always sends an explicit TTL, derived from `timeoutMs`/`timeout` or the 120s default, so
+   * the challenge cannot outlive the wait. A deployment that has raised AUTH_CHALLENGE_TIMEOUT_MS above
+   * 120s will not see that default apply here — pass `timeout` to match it. Plain `authorize()` still
+   * defers to the server's configured TTL.
    */
   async requireApproval(
     actionDescription: string,
     opts: AuthorizeOptions & { timeoutMs?: number; intervalMs?: number } = {},
   ): Promise<ApprovalResult> {
-    const backendTimeoutSec = opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : opts.timeout
+    // One source of truth for the wait window: the local deadline and the backend TTL must agree, or we
+    // either abandon a still-live challenge (returning a false EXPIRED after the human already approved)
+    // or keep polling a nonce the gateway has already dropped. `!= null` so `timeout: 0` isn't swallowed.
+    const timeoutMs = opts.timeoutMs ?? (opts.timeout != null ? opts.timeout * 1000 : 120_000)
     const { nonce } = await this.authorize(actionDescription, {
       actionType: opts.actionType,
       params: opts.params,
-      timeout: backendTimeoutSec,
+      timeout: Math.ceil(timeoutMs / 1000),
     })
-    const deadline = Date.now() + (opts.timeoutMs ?? 120_000)
+    const deadline = Date.now() + timeoutMs
     const interval = opts.intervalMs ?? 2_000
+    let consecutiveErrors = 0
     for (;;) {
-      const r = await this.status(nonce)
-      if (r.status !== "PENDING") return r
+      // A human approval can outlast a transient 502 or socket hangup — don't discard the whole wait
+      // over one bad poll. Only give up once the gateway looks genuinely unreachable.
+      try {
+        const r = await this.status(nonce)
+        consecutiveErrors = 0
+        if (r.status !== "PENDING") return r
+      } catch (err: unknown) {
+        if (++consecutiveErrors >= MAX_POLL_ERRORS) {
+          const msg = err instanceof Error ? err.message : String(err)
+          throw new Error(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`)
+        }
+      }
       if (Date.now() > deadline) return { status: "EXPIRED" }
       await new Promise((resolve) => setTimeout(resolve, interval))
     }

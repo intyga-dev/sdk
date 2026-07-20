@@ -27,7 +27,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test 'src/**/*.test.ts'"
+    "test": "tsx --test 'src/**/*.test.ts'",
+    "test:coverage": "tsx --test --experimental-test-coverage 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "@sakra-trust/config": "workspace:*",

@@ -38,6 +38,25 @@ test("authorize with invalid --params JSON exits non-zero", () => {
   assert.match(r.stderr, /Invalid JSON in --params/)
 })
 
+// Non-object params used to pass the unchecked cast: `params ?? {}` then signs `{}` while the later
+// verify call rebinds against the raw value, so what was signed and what is checked diverge.
+for (const bad of ["null", "[1,2]", "42", '"hello"']) {
+  test(`authorize with non-object --params (${bad}) exits non-zero`, () => {
+    const r = run([
+      "authorize",
+      "do a thing",
+      "--params",
+      bad,
+      "--token",
+      "t",
+      "--gateway",
+      "http://127.0.0.1:9",
+    ])
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /--params must be a JSON object/)
+  })
+}
+
 test("await without a nonce exits non-zero", () => {
   const r = run(["await"])
   assert.notEqual(r.status, 0)

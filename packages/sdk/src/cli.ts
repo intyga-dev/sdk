@@ -1,13 +1,9 @@
 #!/usr/bin/env node
 import crypto from "node:crypto"
 import fs from "node:fs"
-import os from "node:os"
-import path from "node:path"
-import { type ApprovalResult, SakraClient } from "./index.js"
+// Paths come from the SDK so this writer and the `token()` reader can never drift apart.
+import { type ApprovalResult, CREDENTIALS_FILE, SAKRA_DIR, SakraClient } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
-
-const SAKRA_DIR = path.join(os.homedir(), ".sakra")
-const CREDENTIALS_FILE = path.join(SAKRA_DIR, "credentials.json")
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
@@ -19,10 +15,20 @@ function die(msg: string): never {
   process.exit(1)
 }
 
+/** Best-effort permission tightening — `chmod` throws on Windows/exotic filesystems and must never
+ *  break `sakra login`. The `mode` options on mkdir/writeFile are no-ops when the target already
+ *  exists, so these calls are also what repairs a 0644 credentials file from an earlier install. */
+function restrictPermissions(target: string, mode: number) {
+  try {
+    fs.chmodSync(target, mode)
+  } catch {}
+}
+
 function saveStoredToken(gatewayUrl: string, token: string) {
   if (!fs.existsSync(SAKRA_DIR)) {
-    fs.mkdirSync(SAKRA_DIR, { recursive: true })
+    fs.mkdirSync(SAKRA_DIR, { recursive: true, mode: 0o700 })
   }
+  restrictPermissions(SAKRA_DIR, 0o700)
   let data: Record<string, string> = {}
   if (fs.existsSync(CREDENTIALS_FILE)) {
     try {
@@ -30,7 +36,9 @@ function saveStoredToken(gatewayUrl: string, token: string) {
     } catch {}
   }
   data[gatewayUrl] = token
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), "utf-8")
+  // This file holds a live bearer token — never leave it at the default umask (0644) on a shared host.
+  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 })
+  restrictPermissions(CREDENTIALS_FILE, 0o600)
 }
 
 function _signPayload(privateKeyB64: string, payload: string): string {
@@ -85,11 +93,18 @@ function resolveRootFromFile(
 function parseParamsArg(): Record<string, unknown> {
   const raw = arg("params")
   if (!raw) return {}
+  let parsed: unknown
   try {
-    return JSON.parse(raw) as Record<string, unknown>
+    parsed = JSON.parse(raw)
   } catch (err: unknown) {
     die(`Invalid JSON in --params: ${err instanceof Error ? err.message : String(err)}`)
   }
+  // Must be a plain object: `null`, arrays and primitives would otherwise sail through the cast and
+  // desync WYSIWYS — `params ?? {}` signs `{}` while the later verify call rebinds against the raw value.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    die(`--params must be a JSON object (e.g. '{"amount":5000}')`)
+  }
+  return parsed as Record<string, unknown>
 }
 
 /** Emit GitHub Actions step outputs when running in a workflow (so later steps can read nonce/url). */
