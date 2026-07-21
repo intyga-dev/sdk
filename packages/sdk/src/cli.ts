@@ -113,7 +113,14 @@ function parseParamsArg(): Record<string, unknown> {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     die(`--params must be a JSON object (e.g. '{"amount":5000}')`)
   }
-  return parsed as Record<string, unknown>
+  // Strip potential prototype poisoning keys (__proto__, constructor, prototype)
+  const cleanObj = JSON.parse(
+    JSON.stringify(parsed, (key, value) => {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") return undefined
+      return value
+    }),
+  )
+  return cleanObj as Record<string, unknown>
 }
 
 /** Emit GitHub Actions step outputs when running in a workflow (so later steps can read nonce/url). */
