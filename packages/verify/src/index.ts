@@ -21,6 +21,9 @@ export interface ApprovalReceipt {
   sigAlg?: string | null // "ES256" | "WEBAUTHN" | "AUTO_APPROVED"
   authenticatorData?: string | null // base64url (WEBAUTHN only)
   clientDataJSON?: string | null // base64url (WEBAUTHN only)
+  // Who REQUESTED the action (v3 receipts only; absent on v2). Present here so a relying party can
+  // recompute the signed bytes and, optionally, assert the requester via expected.requesterDid.
+  requester?: RequesterIdentity | null
   verificationCode: string
 }
 
@@ -165,6 +168,32 @@ export function canonicalAuthorizationPayload(input: {
   )
 }
 
+/** The requesting workload's identity, as bound into a v3 payload. Mirrors mcp-schemas. */
+export interface RequesterIdentity {
+  did: string
+  attestation: { method: string; issuer: string; subject: string } | null
+}
+
+/** v3 agent-authorization canonical payload — identical to mcp-schemas.canonicalAuthorizationPayloadV3. */
+export function canonicalAuthorizationPayloadV3(input: {
+  nonce: string
+  actionType: string
+  actionDescription: string
+  params: Record<string, unknown>
+  requester: RequesterIdentity
+}): string {
+  const a = input.requester.attestation
+  const attestation = a
+    ? `{"method":${JSON.stringify(a.method)},"issuer":${JSON.stringify(a.issuer)},"subject":${JSON.stringify(a.subject)}}`
+    : "null"
+  return (
+    `{"v":3,"type":"agent-authorization","nonce":${JSON.stringify(input.nonce)},` +
+    `"actionType":${JSON.stringify(input.actionType)},"action":${JSON.stringify(input.actionDescription)},` +
+    `"params":${stableStringify(input.params)},` +
+    `"requester":{"did":${JSON.stringify(input.requester.did)},"attestation":${attestation}}}`
+  )
+}
+
 /** Short verification code (first 8 hex of SHA-256 of the canonical payload), grouped XXXX-XXXX. */
 export function verificationCode(canonical: string): string {
   const hex = crypto
@@ -200,6 +229,16 @@ function parseNonce(canonical: string): string {
   }
 }
 
+/** Which canonical-payload version a receipt was signed under. Unparseable/absent ⇒ 0 (rejected). */
+function parseVersion(canonical: string): number {
+  try {
+    const v = (JSON.parse(canonical) as { v?: unknown }).v
+    return typeof v === "number" ? v : 0
+  } catch {
+    return 0
+  }
+}
+
 /**
  * Independently verify an approval receipt against the instruction you are ABOUT to execute. Recomputes
  * the canonical payload from your params, confirms it byte-matches what was signed, and verifies the
@@ -208,20 +247,48 @@ function parseNonce(canonical: string): string {
  */
 export function verifyApprovalReceipt(
   receipt: ApprovalReceipt,
-  expected: { actionType: string; params: Record<string, unknown> },
+  expected: { actionType: string; params: Record<string, unknown>; requesterDid?: string },
   opts: { allowAutoApproved?: boolean } = {},
 ): { ok: boolean; reason?: string; autoApproved?: boolean } {
-  const recomputed = canonicalAuthorizationPayload({
-    nonce: parseNonce(receipt.canonicalPayload),
-    actionType: expected.actionType,
-    actionDescription: receipt.actionDescription,
-    params: expected.params,
-  })
+  const version = parseVersion(receipt.canonicalPayload)
+  if (version !== 2 && version !== 3)
+    return { ok: false, reason: `unsupported canonical payload version (${version || "unparseable"})` }
+
+  // v3 additionally binds the requester, so it must be rebuilt from the receipt's own requester block.
+  // That is not circular: the rebuilt string has to byte-match the signed bytes below, so a forged
+  // requester changes the payload and fails the comparison.
+  let recomputed: string
+  if (version === 3) {
+    if (!receipt.requester) return { ok: false, reason: "v3 receipt missing requester" }
+    recomputed = canonicalAuthorizationPayloadV3({
+      nonce: parseNonce(receipt.canonicalPayload),
+      actionType: expected.actionType,
+      actionDescription: receipt.actionDescription,
+      params: expected.params,
+      requester: receipt.requester,
+    })
+  } else {
+    recomputed = canonicalAuthorizationPayload({
+      nonce: parseNonce(receipt.canonicalPayload),
+      actionType: expected.actionType,
+      actionDescription: receipt.actionDescription,
+      params: expected.params,
+    })
+  }
   if (recomputed !== receipt.canonicalPayload)
     return {
       ok: false,
       reason: "params/actionType do not match what was approved",
     }
+
+  // Optional: assert WHICH workload the approval was granted to. Only v3 carries this, so asking for
+  // it against a v2 receipt fails rather than silently passing — a v2 receipt genuinely cannot answer.
+  if (expected.requesterDid !== undefined) {
+    if (version !== 3)
+      return { ok: false, reason: "requesterDid asserted but receipt is v2 (no requester bound)" }
+    if (receipt.requester?.did !== expected.requesterDid)
+      return { ok: false, reason: "approval was requested by a different principal" }
+  }
   // A policy AUTO_APPROVED receipt carries NO human signature — there is nothing to cryptographically
   // verify, and such a receipt is trivially forgeable. We therefore REFUSE to attest it by default
   // (so `if (!verify().ok) throw` correctly blocks unsigned approvals). A relying party that has
