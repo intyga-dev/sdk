@@ -46,7 +46,8 @@ async function wipeDatabase(targetDatabase: string) {
   };
 
   // 1. Block and request human verification.
-  // Pushes a biometric/FIDO2 challenge to the owner's mobile wallet or browser.
+  // Raises a FIDO2/WebAuthn challenge the approver signs in their browser
+  // (Touch ID, Windows Hello, YubiKey). Nothing to install.
   const approval = await sakra.requireApproval(
     `Wipe production database: ${targetDatabase}`, 
     action

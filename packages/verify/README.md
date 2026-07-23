@@ -6,7 +6,7 @@ When SÄKRA returns an approval, it hands you a **receipt**: the exact canonical
 
 - **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — it's ~150 lines.
 - **No SÄKRA secret required.** Verification uses only the signer's public key from the receipt.
-- Verifies both **raw P-256** (mobile wallet) and **WebAuthn** (passkey / hardware key) approvals, plus policy `AUTO_APPROVED` receipts.
+- Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
 ```ts
 import { verifyApprovalReceipt } from "@sakra-trust/verify";
@@ -42,10 +42,12 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 ## API
 - `verifyApprovalReceipt(receipt, { actionType, params }, { allowAutoApproved? })` → `{ ok, reason?, autoApproved? }`
 - `canonicalAuthorizationPayload({ nonce, actionType, actionDescription, params })` → the exact signed string
-- `verificationCode(canonical)` → the short `XXXX-XXXX` code shown in the wallet
+- `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 
-> The canonicalization here is byte-for-byte identical to the SÄKRA gateway, the mobile wallet, and
+> The canonicalization here is byte-for-byte identical to the SÄKRA gateway, the approval UI, and
 > `@sakra-trust/mcp-schemas`. That identity is the whole point — don't reformat it.
 
-MIT licensed.
+Requires Node ≥18 (`node:crypto`).
+
+Apache-2.0 licensed — see [`LICENSE`](./LICENSE).
