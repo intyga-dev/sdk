@@ -141,6 +141,7 @@ function ghOutput(kv: Record<string, string>) {
 async function pollVerifyConsume(
   client: SakraClient,
   nonce: string,
+  target: string,
   actionType: string,
   params: Record<string, unknown>,
   timeoutMs: number,
@@ -168,7 +169,7 @@ async function pollVerifyConsume(
   const { verifyApprovalReceipt } = await import("./index.js")
   // The nonce is asserted too: it binds the receipt to the challenge this call issued, so a receipt
   // for some other (equally valid) approval cannot be substituted.
-  const v = verifyApprovalReceipt(result.receipt, { actionType, params, nonce })
+  const v = verifyApprovalReceipt(result.receipt, { target, actionType, params, nonce })
   // The payload is always checked first, so a tampered action still fails here regardless of mode.
   if (!v.ok && !v.autoApproved) die(`Offline verification FAILED: ${v.reason}`)
   if (v.autoApproved) {
@@ -191,7 +192,7 @@ async function pollVerifyConsume(
   }
 
   if (consume) {
-    const c = await client.consume(nonce, { actionType, params })
+    const c = await client.consume(nonce, { target, actionType, params })
     if (!c.ok) die(`Failed to consume authorization: ${c.reason}`)
     console.log("✓ Authorization CONSUMED.")
   }
@@ -375,13 +376,15 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: sakra authorize "<action>" --gateway <url> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
+          'usage: sakra authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
         )
+      const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
+      const params = parseParamsArg()
+      const target = arg("target") ?? ""
+      if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
 
       const client = new SakraClient({
         gatewayUrl,
-        // Prefer env for credentials so secrets never sit on the command line (visible in process
-        // listings / CI logs). Flags remain for local convenience.
         token: arg("token") ?? process.env.SAKRA_TOKEN,
         clientId: arg("client-id") ?? process.env.SAKRA_CLIENT_ID,
         clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
@@ -389,10 +392,9 @@ async function main() {
       })
 
       const actionType = arg("type") ?? ""
-      const params = parseParamsArg()
-      const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
 
       const { nonce } = await client.authorize(actionDescription, {
+        target,
         actionType,
         params,
         timeout: timeoutSec,
@@ -441,6 +443,7 @@ async function main() {
       await pollVerifyConsume(
         client,
         nonce,
+        target,
         actionType,
         params,
         timeoutMs,
@@ -454,8 +457,11 @@ async function main() {
       const nonce = rest.find((a) => !a.startsWith("--"))
       if (!nonce)
         die(
-          "usage: sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
+          "usage: sakra await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
         )
+      const { timeoutMs } = parseTimeout(arg("timeout"))
+      const target = arg("target") ?? ""
+      if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
       const client = new SakraClient({
         gatewayUrl,
         token: arg("token") ?? process.env.SAKRA_TOKEN,
@@ -463,10 +469,10 @@ async function main() {
         clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
         allowStoredCredentials: true,
       })
-      const { timeoutMs } = parseTimeout(arg("timeout"))
       await pollVerifyConsume(
         client,
         nonce,
+        target,
         arg("type") ?? "",
         parseParamsArg(),
         timeoutMs,
@@ -505,7 +511,8 @@ async function main() {
       // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
       // a checkout of the sakra-trust/ledger repo). Without one, the bundle is only checked against its
       // own asserted root. Exit code 0 = verified, 1 = not.
-      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND } = await import("@sakra-trust/verify")
+      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND, EVIDENCE_BUNDLE_KIND_ALIASES } =
+        await import("@sakra-trust/verify")
       const bundlePath = rest.find((a) => !a.startsWith("--"))
       if (!bundlePath)
         die("usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]")
@@ -517,8 +524,10 @@ async function main() {
         die(`cannot read bundle: ${err instanceof Error ? err.message : String(err)}`)
       }
 
-      // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
-      if ((bundle as { kind?: string }).kind === EVIDENCE_BUNDLE_KIND) {
+      // Multi-entry evidence bundle (date-range export): its own verifier + report shape. Accept the
+      // canonical dewp.* kind and its legacy sakra.* alias (DEWP §6.5).
+      const bundleKind = (bundle as { kind?: string }).kind
+      if (bundleKind === EVIDENCE_BUNDLE_KIND || EVIDENCE_BUNDLE_KIND_ALIASES.includes(bundleKind as never)) {
         const evidence = bundle as unknown as import("@sakra-trust/verify").EvidenceBundle
         const root = arg("root")
         const rootArgs = root ? [root] : undefined
@@ -565,6 +574,14 @@ async function main() {
       console.log(`  [${m(c.rootConsistency)}] root match      ${c.rootConsistency.detail}`)
       console.log(`  [${m(c.leafBinding)}] leaf binding    ${c.leafBinding.detail}`)
       console.log(`  [${m(c.anchored)}] anchored        ${c.anchored.detail}`)
+      // DEWP §7.1 property model + summary level.
+      const p = result.properties
+      const yn = (b: boolean) => (b ? "yes" : "no ")
+      console.log(
+        `  DEWP level: ${result.verificationLevel}  ` +
+          `(commitment:${yn(p.commitmentVerified)} content:${yn(p.contentVerified)} ` +
+          `signature:${yn(p.signatureVerified)} anchor:${yn(p.anchorVerified)})`,
+      )
       for (const n of result.notes) console.log(`  note: ${n}`)
       console.log("")
       console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m")

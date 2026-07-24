@@ -6,7 +6,7 @@
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
 export {
   type ApprovalReceipt,
-  canonicalAuthorizationPayload,
+  canonicalIntentPayload,
   verificationCode,
   verifyApprovalReceipt,
   verifyEcdsaP256,
@@ -46,6 +46,12 @@ export interface ApprovalResult {
 
 /** Options for a structured, WYSIWYS-bound approval request. */
 export interface AuthorizeOptions {
+  /**
+   * The intended execution target — a machine-readable identifier of the Relying Party / execution
+   * environment that will run the action (e.g. "prod-db-cluster-01"). Bound into the signed payload so
+   * the approval cannot be replayed against a different target (DIV Target Isolation). Required.
+   */
+  target: string
   /** Action identifier, e.g. "wire_transfer". Bound into the signed payload. */
   actionType?: string
   /** The exact structured variables that will execute — displayed in the wallet AND signed. */
@@ -119,7 +125,7 @@ export class SakraClient {
 
   async authorize(
     actionDescription: string,
-    opts: AuthorizeOptions = {},
+    opts: AuthorizeOptions = { target: "global" },
   ): Promise<{ nonce: string; status: ApprovalStatus }> {
     const token = await this.token()
     const res = await fetch(`${this.opts.gatewayUrl}/authorize`, {
@@ -129,10 +135,11 @@ export class SakraClient {
         "content-type": "application/json",
       },
       body: JSON.stringify({
+        target: opts?.target ?? "global",
         actionDescription,
-        actionType: opts.actionType,
-        params: opts.params ?? {},
-        timeout: opts.timeout,
+        actionType: opts?.actionType,
+        params: opts?.params ?? {},
+        timeout: opts?.timeout,
       }),
     })
     if (!res.ok) throw new Error(`authorize failed: ${res.status} ${await res.text()}`)
@@ -145,7 +152,7 @@ export class SakraClient {
    */
   async consume(
     nonce: string,
-    what: { actionType: string; params?: Record<string, unknown> },
+    what: { target: string; actionType: string; params?: Record<string, unknown> },
   ): Promise<{ ok: boolean; reason?: string }> {
     const token = await this.token()
     const res = await fetch(`${this.opts.gatewayUrl}/authorize/verify`, {
@@ -156,6 +163,7 @@ export class SakraClient {
       },
       body: JSON.stringify({
         nonce,
+        target: what.target,
         actionType: what.actionType,
         params: what.params ?? {},
       }),
@@ -192,13 +200,14 @@ export class SakraClient {
    */
   async requireApproval(
     actionDescription: string,
-    opts: AuthorizeOptions & { timeoutMs?: number; intervalMs?: number } = {},
+    opts: AuthorizeOptions & { timeoutMs?: number; intervalMs?: number },
   ): Promise<ApprovalResult> {
     // One source of truth for the wait window: the local deadline and the backend TTL must agree, or we
     // either abandon a still-live challenge (returning a false EXPIRED after the human already approved)
     // or keep polling a nonce the gateway has already dropped. `!= null` so `timeout: 0` isn't swallowed.
     const timeoutMs = opts.timeoutMs ?? (opts.timeout != null ? opts.timeout * 1000 : 120_000)
     const { nonce } = await this.authorize(actionDescription, {
+      target: opts.target,
       actionType: opts.actionType,
       params: opts.params,
       timeout: Math.ceil(timeoutMs / 1000),

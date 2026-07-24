@@ -142,6 +142,7 @@ test("authorize posts the action and defaults params to an empty object", async 
   assert.equal(f.calls[0]!.url, `${GW}/authorize`)
   assert.equal(f.calls[0]!.headers.authorization, "Bearer t")
   assert.deepEqual(f.calls[0]!.body, {
+    target: "global",
     actionDescription: "Wire $500 to ACME",
     params: {},
   })
@@ -158,6 +159,7 @@ test("authorize binds actionType and params into the request", async (t) => {
     timeout: 60,
   })
   assert.deepEqual(f.calls[0]!.body, {
+    target: "global",
     actionDescription: "Wire",
     actionType: "payments.wire",
     params: { amount: 500 },
