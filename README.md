@@ -1,178 +1,196 @@
-# SÄKRA — Cryptographic Governance for Critical Infrastructure
+# @sakra-trust/sdk — Universal Governance for Automated Operations
 
-This repository contains the public-facing client SDKs and offline verification libraries for the SÄKRA action-governance protocol. The Model Context Protocol (MCP) tooling for AI agents lives in its own repository: [`SAKRA-trust/mcp`](https://github.com/SAKRA-trust/mcp).
+One SDK for every SÄKRA use case. SÄKRA is agent-agnostic: the primitive is uniform — **request a challenge → a human approves with a passkey or security key → poll until resolved** — so the same client works for scripts, pipelines, and AI agents. Plus off-platform **zero-knowledge** policy encryption.
 
-SÄKRA is a general **action-governance and witness primitive**: no high-risk operation (database mutations, treasury commands, deployments, or AI agent tool calls) runs without a cryptographically-signed human approval and a tamper-evident record.
+This TypeScript package is the reference client. The same primitive is also available for **Go** and **Rust** backends (see [Other languages](#other-languages-go--rust)), and offline receipt verification ships in **four** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
 
-**MFA verifies who you are. SÄKRA verifies what you are doing.**
+> Status: publish-ready, **not yet published** to npm. The Go and Rust packages currently live in-repo.
 
----
+## Require a human approval before a high-risk action
 
-## Packages in this Repository
-
-| Package | Purpose | Version |
-| :--- | :--- | :--- |
-| [`@sakra-trust/sdk`](#sakra-sdk) | The main client SDK for Node.js / TypeScript. | `0.1.0` |
-| [`sakra-sdk` (Python)](#sakra-sdk-python) | SÄKRA client SDK for Python applications & pipelines. | `0.1.0` |
-| [`@sakra-trust/verify`](#sakra-verify) | Zero-dependency offline cryptographic receipt verifier. | `0.1.0` |
-
----
-
-## 1. Quickstart: Gating a Blast-Radius Operation
-
-Add `@sakra-trust/sdk` to your backend service to prevent fat-fingered scripts, prompt-injected AI models, or compromised API keys from executing critical operations without human sign-off.
-
-### Install
-```bash
-npm install @sakra-trust/sdk
-```
-
-### Integration Example
-Wrap any irreversible call in your backend with `requireApproval` and verify the cryptographic signature receipt offline:
-
-```typescript
-import { SakraClient, verifyApprovalReceipt } from "@sakra-trust/sdk";
+```ts
+import { SakraClient } from "@sakra-trust/sdk";
 
 const sakra = new SakraClient({
-  gatewayUrl: process.env.SAKRA_GATEWAY_URL!,      // Your SÄKRA gateway or cloud endpoint
-  clientId: process.env.SAKRA_CLIENT_ID!,          // Service or human API key
-  clientSecret: process.env.SAKRA_CLIENT_SECRET!,
+  gatewayUrl: "https://api.sakra.com",
+  clientId: process.env.SAKRA_CLIENT_ID,      // a human or agent API key
+  clientSecret: process.env.SAKRA_CLIENT_SECRET,
 });
 
-async function wipeDatabase(targetDatabase: string) {
-  const action = { 
-    actionType: "wipe_production", 
-    params: { target: targetDatabase } 
-  };
-
-  // 1. Block and request human verification.
-  // Raises a FIDO2/WebAuthn challenge the approver signs in their browser
-  // (Touch ID, Windows Hello, YubiKey). Nothing to install.
-  const approval = await sakra.requireApproval(
-    `Wipe production database: ${targetDatabase}`, 
-    action
-  );
-  
-  if (approval.status !== "APPROVED") {
-    throw new Error(`Unauthorized operation status: ${approval.status}`);
-  }
-
-  // 2. Offline Verification (Defense-in-depth)
-  // Prove in your own codebase that the human signed off on THIS exact payload.
-  // This step requires NO connection to the SÄKRA gateway and uses no secrets.
-  const check = verifyApprovalReceipt(approval.receipt!, action);
-  if (!check.ok) {
-    throw new Error(`Receipt verification failed: ${check.reason}`);
-  }
-
-  // 3. Safe to proceed
-  await executeWipeCommand(targetDatabase);
-}
+// Blocks until the human approves with their passkey / security key (or times out):
+const r = await sakra.requireApproval("Delete production database");
+if (r.status !== "APPROVED") throw new Error("not authorized");
+// …safe to proceed; r.signatureHash is your non-repudiable receipt.
 ```
 
-### Python Quickstart
+Works identically whether the token is a **human key** (backend/service) or an **agent key**. This
+is SÄKRA as a general zero-trust gate for *any* backend action, not just agents.
 
-Install the Python SDK:
+## Verify a witnessed document/policy
+
+```ts
+const w = await sakra.verify(sha256Hex);   // { verified, signerDid, signedAt, ... }
+```
+
+## Zero-knowledge policy (off-platform)
+
+Encrypt policies on **your** machine so SÄKRA never sees plaintext or your private key — the
+strongest ZK posture (no trust in SÄKRA-served code):
+
 ```bash
-pip install sakra-sdk
+sakra keygen --out org                       # → org.public.key (upload) + org.private.key (keep!)
+sakra policy-encrypt policy.json --pubkey org.public.key --out blob.json
+# publish blob.json (encryptedBlob + blobHash); SÄKRA stores only ciphertext + hash
 ```
 
-Wrap critical operations and verify the signature receipt:
-```python
-import asyncio
-from sakra_sdk import SakraClient, verify_approval_receipt
+```ts
+import { policy } from "@sakra-trust/sdk";
+const blob = policy.encryptPolicy(orgPublicKey, JSON.stringify(manifest));
+const hash = policy.blobHash(blob);          // matches the gateway's check
+```
 
-sakra = SakraClient(
-    gateway_url="https://api.sakra.com",
-    client_id="your-client-id",
-    client_secret="your-client-secret"
+## CLI
+
+```
+sakra keygen [--out <prefix>]
+sakra policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]
+sakra login --did <did> [--gateway <url>]
+sakra authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]
+sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]
+sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]
+sakra verify <documentHash> --gateway <url>
+sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]
+```
+
+Invoke it as `npx @sakra-trust/sdk <command>`, or `npm i -g @sakra-trust/sdk` and then `sakra <command>`.
+(`npx sakra` resolves to an unrelated package — the binary is `sakra`, but it ships inside this package.)
+
+**Headless / CI:** split the flow so the approver is pinged where they already are —
+`authorize --no-wait` returns the deep-link immediately, `notify` posts an interactive Approve
+button to Slack/Teams, and `await <nonce> --consume` blocks until signed, verifies the receipt, and
+exits non-zero on failure. See [`examples/ci-cd-github-action`](../../examples/ci-cd-github-action).
+
+Node ≥18 (global `fetch` + `node:crypto`); the only dependency is the zero-dep [`@sakra-trust/verify`](../verify/README.md).
+
+## Verify approvals independently
+
+Every APPROVED result carries a **receipt**. Confirm — in your own code, with no SÄKRA secret — that a
+human signed off on the *exact* instruction you're about to run:
+
+```ts
+import { verifyApprovalReceipt } from "@sakra-trust/sdk"; // re-exported from @sakra-trust/verify
+
+const r = await sakra.requireApproval("Delete production database", {
+  actionType: "wipe_production", params: { target: "prod-db-1" },
+});
+if (r.status !== "APPROVED") throw new Error("not authorized");
+// `nonce` names the challenge you are redeeming — required, so you can enforce single-use yourself.
+const ok = verifyApprovalReceipt(r.receipt!, {
+  actionType: "wipe_production", params: { target: "prod-db-1" }, nonce: r.nonce!,
+});
+if (!ok.ok) throw new Error(`refusing to proceed: ${ok.reason}`);
+```
+
+## Other languages (Go & Rust)
+
+The same **request → approve → poll** primitive is available for Go and Rust backends — the languages that run most payments, ledger, and infrastructure services. Each SDK re-exports its language's offline verifier, so you can verify the receipt in the same process.
+
+### Go — [`github.com/sakra-trust/sdk-go`](../sdk-go)
+
+```go
+import (
+	"context"
+
+	sakra "github.com/sakra-trust/sdk-go"
+	verify "github.com/sakra-trust/verify-go"
 )
 
-async def wipe_database(target_database: str):
-    action = {
-        "actionType": "wipe_production",
-        "params": { "target": target_database }
-    }
+client := sakra.NewClient(sakra.ClientOptions{
+	GatewayURL:   "https://api.sakra.com",
+	ClientID:     os.Getenv("SAKRA_CLIENT_ID"),
+	ClientSecret: os.Getenv("SAKRA_CLIENT_SECRET"),
+})
 
-    # 1. Block and request human verification
-    approval = await sakra.require_approval(
-        f"Wipe production database: {target_database}",
-        action_type=action["actionType"],
-        params=action["params"]
-    )
-    if approval["status"] != "APPROVED":
-        raise Exception(f"Unauthorized: {approval['status']}")
+// Blocks until the human approves with their passkey / security key (or times out):
+r, err := client.RequireApproval(context.Background(), "Delete production database",
+	sakra.RequireApprovalOptions{
+		AuthorizeOptions: sakra.AuthorizeOptions{
+			ActionType: "wipe_production",
+			Params:     map[string]interface{}{"target": "prod-db-1"},
+		},
+	})
+if err != nil || r.Status != sakra.StatusApproved {
+	log.Fatal("not authorized")
+}
 
-    # 2. Offline cryptographic verification (no connection or secret required)
-    check = verify_approval_receipt(approval["receipt"], action)
-    if not check["ok"]:
-        raise Exception(f"Verification failed: {check['reason']}")
-
-    # 3. Safe to proceed
-    await execute_wipe_command(target_database)
+// Optional hard binding before executing — no SÄKRA secret involved:
+res := verify.VerifyApprovalReceipt(*r.Receipt, verify.Expected{
+	Nonce: r.Nonce, ActionType: "wipe_production",
+	Params: map[string]interface{}{"target": "prod-db-1"},
+}, verify.VerifyOptions{})
+if !res.OK {
+	log.Fatalf("refusing to proceed: %s", res.Reason)
+}
 ```
 
----
+### Rust — [`sakra-sdk`](../sdk-rust)
 
-## 2. Independent Cryptographic Verification (`@sakra-trust/verify`)
+```rust
+use sakra_sdk::{
+    verify_approval_receipt_with_options, ApprovalStatus, AuthorizeOptions, Client, ClientOptions,
+    Expected, RequireApprovalOptions, VerifyOptions,
+};
+use serde_json::json;
 
-If you are running in highly secure environments (like enclave execution or regulated services), you can use `@sakra-trust/verify` with **zero runtime dependencies** (relying only on Node's native `crypto` module).
-
-You check SÄKRA's math yourself:
-
-```typescript
-import { verifyApprovalReceipt } from "@sakra-trust/verify";
-
-// Verify a receipt returned from the SÄKRA gateway offline
-const result = verifyApprovalReceipt(receipt, {
-  actionType: "wipe_production",
-  params: { target: "prod-db-1" }
+let mut client = Client::new(ClientOptions {
+    gateway_url: "https://api.sakra.com".into(),
+    client_id: std::env::var("SAKRA_CLIENT_ID").ok(),
+    client_secret: std::env::var("SAKRA_CLIENT_SECRET").ok(),
+    ..Default::default()
 });
 
-if (!result.ok) {
-  throw new Error(`Security Violation: human signature verification failed (${result.reason})`);
+// Blocks until the human approves with their passkey / security key (or times out):
+let r = client.require_approval("Delete production database", &RequireApprovalOptions {
+    authorize: AuthorizeOptions {
+        action_type: Some("wipe_production".into()),
+        params: Some(json!({ "target": "prod-db-1" })),
+        ..Default::default()
+    },
+    ..Default::default()
+})?;
+if r.status != ApprovalStatus::Approved {
+    return Err("not authorized".into());
 }
-// Signature is valid and bound strictly to the provided parameters.
+
+// Optional hard binding before executing — no SÄKRA secret involved:
+let expected = Expected {
+    nonce: r.nonce.clone().unwrap(),
+    action_type: "wipe_production".into(),
+    params: json!({ "target": "prod-db-1" }),
+};
+verify_approval_receipt_with_options(&r.receipt.unwrap(), &expected, &VerifyOptions::default())?;
 ```
 
-### Policy Auto-Approvals
-If a policy was evaluated and auto-approved during a break-glass window, the receipt will have `sigAlg: "AUTO_APPROVED"`. Because no human signature exists to check, `@sakra-trust/verify` **refuses this by default**. To explicitly opt in to policy auto-approvals, pass the allowance option:
+The Rust client is generic over a pluggable `Transport` (default: a built-in blocking `ureq` transport), so you can supply your own async/instrumented HTTP client.
 
-```typescript
-verifyApprovalReceipt(receipt, expectedAction, { allowAutoApproved: true });
-```
+## Multi-language offline verifiers
 
----
+Every APPROVED result carries a **receipt** you can verify in your own process, with no SÄKRA secret and no network. The verifier is available in four languages; all four verify both **ES256** (service-key) and **WebAuthn** (passkey) receipts, and are held byte-identical by shared cross-language test vectors.
 
-## 3. Zero-Knowledge Policies (Off-Platform Encryption)
+| Language | Package | Dependencies |
+| :--- | :--- | :--- |
+| TypeScript | [`@sakra-trust/verify`](../verify/README.md) | none (Node built-in `crypto`) |
+| Python | [`sakra-sdk`](../sdk-python) (PyPI) | `cryptography` |
+| Go | [`github.com/sakra-trust/verify-go`](../verify-go) | none (standard library) |
+| Rust | [`sakra-verify`](../verify-rust) | `p256` / `sha2` |
 
-Ensure your security policies remain entirely confidential. Under SÄKRA's ZK policy design, you author policies locally, encrypt them using an organization public key, and publish the encrypted blob. The SÄKRA gateway only stores the ciphertext and enforces policy version hash freshness—it never decrypts or views the rules.
+For **WebAuthn** receipts, verification requires you to pin the expected origin and RP ID (a passkey assertion harvested at any relying party would otherwise verify) — pass them via the verifier's options (`VerifyReceiptOptions` in TS, `VerifyOptions` in Go/Rust, `expected_origin`/`expected_rp_id` in Python). ES256 receipts need no such context.
 
-### Using the CLI
-The `@sakra-trust/sdk` publishes a standalone CLI utility `sakra`:
-
-```bash
-# 1. Generate local key pair
-npx sakra keygen --out org
-
-# 2. Encrypt a policy manifest JSON
-npx sakra policy-encrypt policy.json --pubkey org.public.key --out encrypted_policy.json
-
-# 3. Verify a document receipt
-npx sakra verify <documentHash> --gateway https://api.sakra.com
-```
-
----
-
-## 4. Governing AI Agent Tool Calls (MCP)
-
-For gating an AI agent's Model Context Protocol tool calls behind human approval — either by
-connecting to SÄKRA's hosted MCP endpoint or by wrapping your own MCP server — see the dedicated
-repository and packages: **[`SAKRA-trust/mcp`](https://github.com/SAKRA-trust/mcp)**
-(`@sakra-trust/mcp-sdk`, `@sakra-trust/mcp-proxy`).
-
----
+## Start here
+- **Quickstart** (gate a prod DB deletion in an afternoon): [`docs/quickstart.md`](../../docs/quickstart.md)
+- **Runnable examples**: [`examples/gate-prod-delete`](../../examples/gate-prod-delete), [`examples/ci-cd-github-action`](../../examples/ci-cd-github-action)
+- **Independent verification library**: [`@sakra-trust/verify`](../verify/README.md) (TypeScript) · also [Go](../verify-go), [Rust](../verify-rust), [Python](../sdk-python)
 
 ## License
 
-Apache-2.0. See each package's `LICENSE`.
+Apache-2.0 — see [`LICENSE`](./LICENSE).
