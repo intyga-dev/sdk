@@ -104,4 +104,19 @@ describe("canonical payload parity across packages", () => {
       })
     assert.notEqual(mk("https://good.example"), mk("https://evil.example"))
   })
+
+  it("v3 payload with expiresAt is byte-identical across packages", () => {
+    const input = {
+      nonce: "c_8f91a2",
+      actionType: "deleteDatabase",
+      actionDescription: "Delete staging database",
+      params: { environment: "staging" },
+      requester: { did: "did:sakra:service:deploy-pipeline", attestation: null },
+      expiresAt: "2026-07-23T19:30:00Z",
+    }
+    const fromSchemas = schemasV3(input)
+    const fromVerify = verifyV3(input)
+    assert.equal(fromSchemas, fromVerify)
+    assert.match(fromSchemas, /,"expiresAt":"2026-07-23T19:30:00Z"\}$/)
+  })
 })

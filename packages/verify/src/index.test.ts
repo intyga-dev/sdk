@@ -43,15 +43,25 @@ function es256Receipt(input: {
   }
 }
 
-const EXPECTED = {
+/** The action half of an expectation — spread into the receipt builders, which add the nonce. */
+const ACTION = {
   actionType: "wipe_production",
   params: { target: "prod-db-1", region: "eu-north-1" },
 }
+/** Full expectation for receipts built with nonce "nonce-1" (es256Receipt / webauthnReceipt). */
+const EXPECTED = { ...ACTION, nonce: "nonce-1" }
+/** Full expectation for the hand-built receipts below, which use nonce "n". */
+const EXPECTED_N = { ...ACTION, nonce: "n" }
+
+/** WebAuthn pinning the test authenticator answers for. */
+const RP_ID = "wallet.example"
+const ORIGIN = "https://wallet.example"
+const WEBAUTHN_OPTS = { expectedOrigin: ORIGIN, expectedRpId: RP_ID }
 
 test("verifies a genuine ES256 approval receipt", () => {
   const { receipt } = es256Receipt({
     actionDescription: "Wipe production database",
-    ...EXPECTED,
+    ...ACTION,
   })
   assert.deepEqual(verifyApprovalReceipt(receipt, EXPECTED), { ok: true })
 })
@@ -59,11 +69,12 @@ test("verifies a genuine ES256 approval receipt", () => {
 test("rejects when params differ from what was approved", () => {
   const { receipt } = es256Receipt({
     actionDescription: "Wipe production database",
-    ...EXPECTED,
+    ...ACTION,
   })
   const r = verifyApprovalReceipt(receipt, {
     actionType: "wipe_production",
     params: { target: "prod-db-2", region: "eu-north-1" },
+    nonce: "nonce-1",
   })
   assert.equal(r.ok, false)
   assert.match(r.reason!, /do not match/)
@@ -72,19 +83,27 @@ test("rejects when params differ from what was approved", () => {
 test("rejects when actionType differs", () => {
   const { receipt } = es256Receipt({
     actionDescription: "Wipe production database",
-    ...EXPECTED,
+    ...ACTION,
   })
   const r = verifyApprovalReceipt(receipt, {
     actionType: "read_only_report",
-    params: EXPECTED.params,
+    params: ACTION.params,
+    nonce: "nonce-1",
   })
   assert.equal(r.ok, false)
+})
+
+test("rejects a receipt issued for a different challenge nonce", () => {
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  const r = verifyApprovalReceipt(receipt, { ...ACTION, nonce: "some-other-nonce" })
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /different challenge/)
 })
 
 test("rejects a signature from a different key", () => {
   const { receipt } = es256Receipt({
     actionDescription: "Wipe production database",
-    ...EXPECTED,
+    ...ACTION,
   })
   const other = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
   receipt.signerPublicKey = other.publicKey.export({ format: "der", type: "spki" }).toString("base64")
@@ -97,20 +116,20 @@ test("AUTO_APPROVED is REFUSED by default (no human signature to verify), accept
   const canonical = canonicalAuthorizationPayload({
     nonce: "n",
     actionDescription: "deploy",
-    ...EXPECTED,
+    ...ACTION,
   })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
     actionDescription: "deploy",
-    params: EXPECTED.params,
+    params: ACTION.params,
     sigAlg: "AUTO_APPROVED",
     verificationCode: verificationCode(canonical),
   }
-  const denied = verifyApprovalReceipt(receipt, EXPECTED)
+  const denied = verifyApprovalReceipt(receipt, EXPECTED_N)
   assert.equal(denied.ok, false)
   assert.equal(denied.autoApproved, true)
 
-  const allowed = verifyApprovalReceipt(receipt, EXPECTED, {
+  const allowed = verifyApprovalReceipt(receipt, EXPECTED_N, {
     allowAutoApproved: true,
   })
   assert.deepEqual(allowed, { ok: true, autoApproved: true })
@@ -120,16 +139,16 @@ test("rejects a receipt missing signature material", () => {
   const canonical = canonicalAuthorizationPayload({
     nonce: "n",
     actionDescription: "deploy",
-    ...EXPECTED,
+    ...ACTION,
   })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
     actionDescription: "deploy",
-    params: EXPECTED.params,
+    params: ACTION.params,
     sigAlg: "ES256",
     verificationCode: verificationCode(canonical),
   }
-  assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, false)
+  assert.equal(verifyApprovalReceipt(receipt, EXPECTED_N).ok, false)
 })
 
 // ─── WebAuthn / COSE ─────────────────────────────────────────────────────────
@@ -162,10 +181,30 @@ function coseKey(
   return Buffer.concat([cborHead(5, entries.length), ...entries])
 }
 
+const FLAG_UP = 0x01
+const FLAG_UV = 0x04
+
+/**
+ * Build REAL authenticatorData: SHA-256(rpId) ‖ flags ‖ signCount. Random bytes would leave the
+ * rpIdHash and the presence/verification flags unconstrained, which is exactly the bug these tests
+ * now guard — the verifier must reject an assertion made for another RP or without user verification.
+ */
+function authData(over: { rpId?: string; flags?: number; signCount?: number } = {}): Buffer {
+  const rpIdHash = crypto
+    .createHash("sha256")
+    .update(over.rpId ?? RP_ID, "utf8")
+    .digest()
+  const rest = Buffer.alloc(5)
+  rest.writeUInt8(over.flags ?? FLAG_UP | FLAG_UV, 0)
+  rest.writeUInt32BE(over.signCount ?? 1, 1)
+  return Buffer.concat([rpIdHash, rest])
+}
+
 /** A genuinely-signed WebAuthn receipt, built the way an authenticator + the gateway would. */
 function webauthnReceipt(
   input: { actionType: string; actionDescription: string; params: Record<string, unknown> },
   mutateCose?: (x: Buffer, y: Buffer) => Buffer,
+  over: { authenticatorData?: Buffer; type?: string; origin?: string } = {},
 ): ApprovalReceipt {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
   const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string }
@@ -176,13 +215,13 @@ function webauthnReceipt(
   // The authenticator signs authenticatorData || SHA-256(clientDataJSON); the challenge is the payload.
   const clientDataJSON = Buffer.from(
     JSON.stringify({
-      type: "webauthn.get",
+      type: over.type ?? "webauthn.get",
       challenge: Buffer.from(canonical, "utf-8").toString("base64url"),
-      origin: "https://wallet.example",
+      origin: over.origin ?? ORIGIN,
     }),
     "utf-8",
   )
-  const authenticatorData = crypto.randomBytes(37)
+  const authenticatorData = over.authenticatorData ?? authData()
   const signature = crypto.sign(
     "sha256",
     Buffer.concat([authenticatorData, crypto.createHash("sha256").update(clientDataJSON).digest()]),
@@ -203,11 +242,11 @@ function webauthnReceipt(
   }
 }
 
-const WEBAUTHN_INPUT = { actionDescription: "Wipe production database", ...EXPECTED }
+const WEBAUTHN_INPUT = { actionDescription: "Wipe production database", ...ACTION }
 
 test("verifies a genuine WebAuthn receipt end to end", () => {
   const receipt = webauthnReceipt(WEBAUTHN_INPUT)
-  assert.deepEqual(verifyApprovalReceipt(receipt, EXPECTED), { ok: true })
+  assert.deepEqual(verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS), { ok: true })
 })
 
 test("WebAuthn verification tolerates trailing bytes after the COSE key", () => {
@@ -215,7 +254,7 @@ test("WebAuthn verification tolerates trailing bytes after the COSE key", () => 
   const receipt = webauthnReceipt(WEBAUTHN_INPUT, (x, y) =>
     Buffer.concat([coseKey(x, y), crypto.randomBytes(16)]),
   )
-  assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, true)
+  assert.equal(verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS).ok, true)
 })
 
 test("WebAuthn verification is not fooled by coordinate byte patterns inside another field", () => {
@@ -226,12 +265,12 @@ test("WebAuthn verification is not fooled by coordinate byte patterns inside ano
     cborBytes(Buffer.concat([Buffer.from([0x21, 0x58, 0x20]), crypto.randomBytes(32)])),
   ])
   const receipt = webauthnReceipt(WEBAUTHN_INPUT, (x, y) => coseKey(x, y, { extra: decoy }))
-  assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, true)
+  assert.equal(verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS).ok, true)
 })
 
 test("WebAuthn rejects a COSE key with a short coordinate rather than silently truncating", () => {
   const receipt = webauthnReceipt(WEBAUTHN_INPUT, (x, y) => coseKey(x.subarray(0, 31), y))
-  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
   assert.equal(r.ok, false)
   assert.match(r.reason!, /must be 32 bytes/)
 })
@@ -241,7 +280,7 @@ test("WebAuthn rejects a truncated COSE key", () => {
     const full = coseKey(x, y)
     return full.subarray(0, full.length - 10)
   })
-  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
   assert.equal(r.ok, false)
   assert.match(r.reason!, /truncated/)
 })
@@ -250,6 +289,7 @@ test("WebAuthn rejects a COSE key pinned to another curve or key type", () => {
   const wrongCrv = verifyApprovalReceipt(
     webauthnReceipt(WEBAUTHN_INPUT, (x, y) => coseKey(x, y, { crv: 2 })),
     EXPECTED,
+    WEBAUTHN_OPTS,
   )
   assert.equal(wrongCrv.ok, false)
   assert.match(wrongCrv.reason!, /crv P-256/)
@@ -257,6 +297,7 @@ test("WebAuthn rejects a COSE key pinned to another curve or key type", () => {
   const wrongKty = verifyApprovalReceipt(
     webauthnReceipt(WEBAUTHN_INPUT, (x, y) => coseKey(x, y, { kty: 1 })),
     EXPECTED,
+    WEBAUTHN_OPTS,
   )
   assert.equal(wrongKty.ok, false)
   assert.match(wrongKty.reason!, /kty EC2/)
@@ -268,7 +309,7 @@ test("WebAuthn rejects a signature made by a different key", () => {
   const receipt = webauthnReceipt(WEBAUTHN_INPUT, () =>
     coseKey(Buffer.from(jwk.x, "base64url"), Buffer.from(jwk.y, "base64url")),
   )
-  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
   assert.equal(r.ok, false)
   assert.match(r.reason!, /does not verify/)
 })
@@ -276,10 +317,10 @@ test("WebAuthn rejects a signature made by a different key", () => {
 test("WebAuthn rejects a clientDataJSON challenge that is not the canonical payload", () => {
   const receipt = webauthnReceipt(WEBAUTHN_INPUT)
   receipt.clientDataJSON = Buffer.from(
-    JSON.stringify({ type: "webauthn.get", challenge: "c29tZXRoaW5nLWVsc2U" }),
+    JSON.stringify({ type: "webauthn.get", challenge: "c29tZXRoaW5nLWVsc2U", origin: ORIGIN }),
     "utf-8",
   ).toString("base64")
-  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
   assert.equal(r.ok, false)
   assert.match(r.reason!, /challenge does not match/)
 })
@@ -288,18 +329,159 @@ test("WebAuthn receipt missing assertion components is rejected", () => {
   const canonical = canonicalAuthorizationPayload({
     nonce: "n",
     actionDescription: "deploy",
-    ...EXPECTED,
+    ...ACTION,
   })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
     actionDescription: "deploy",
-    params: EXPECTED.params,
+    params: ACTION.params,
     signerPublicKey: "AAAA",
     signature: "BBBB",
     sigAlg: "WEBAUTHN",
     verificationCode: verificationCode(canonical),
   }
-  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  const r = verifyApprovalReceipt(receipt, EXPECTED_N, WEBAUTHN_OPTS)
   assert.equal(r.ok, false)
   assert.match(r.reason!, /authenticatorData or clientDataJSON/)
+})
+
+// ─── WebAuthn assertion binding (origin / RP ID / user verification) ──────────
+// authenticatorData is signed but used to be accepted unread, so an assertion produced at ANY relying
+// party — or without the user ever touching the authenticator — verified. These pin it down.
+
+test("WebAuthn refuses to verify without expectedOrigin / expectedRpId", () => {
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT)
+  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /expectedOrigin and expectedRpId/)
+
+  const missingRpId = verifyApprovalReceipt(receipt, EXPECTED, { expectedOrigin: ORIGIN })
+  assert.equal(missingRpId.ok, false)
+})
+
+test("WebAuthn rejects an assertion made for a different RP ID", () => {
+  // A genuine, correctly-signed assertion — but the authenticator answered for attacker.example.
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, {
+    authenticatorData: authData({ rpId: "attacker.example" }),
+  })
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /rpIdHash does not match/)
+})
+
+test("WebAuthn rejects an assertion collected at a different origin", () => {
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, { origin: "https://attacker.example" })
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /origin does not match/)
+})
+
+test("WebAuthn rejects a registration (webauthn.create) presented as an approval", () => {
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, { type: "webauthn.create" })
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /not a webauthn\.get/)
+})
+
+test("WebAuthn rejects an assertion with the user-present flag clear", () => {
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, {
+    authenticatorData: authData({ flags: FLAG_UV }),
+  })
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /user-present/)
+})
+
+test("WebAuthn requires user verification by default, and can be opted out of explicitly", () => {
+  // UP set, UV clear: mere possession, no biometric/PIN. The gateway demands UV, so the offline
+  // verifier must too — otherwise verifying yourself is weaker than trusting the gateway.
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, {
+    authenticatorData: authData({ flags: FLAG_UP }),
+  })
+  const strict = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(strict.ok, false)
+  assert.match(strict.reason!, /user-verified/)
+
+  const relaxed = verifyApprovalReceipt(receipt, EXPECTED, {
+    ...WEBAUTHN_OPTS,
+    requireUserVerification: false,
+  })
+  assert.equal(relaxed.ok, true)
+})
+
+test("WebAuthn rejects authenticatorData shorter than the fixed 37-byte header", () => {
+  const receipt = webauthnReceipt(WEBAUTHN_INPUT, undefined, {
+    authenticatorData: authData().subarray(0, 20),
+  })
+  const r = verifyApprovalReceipt(receipt, EXPECTED, WEBAUTHN_OPTS)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /too short/)
+})
+
+// ─── Key-type pinning (ES256 must mean P-256 + SHA-256) ──────────────────────
+
+test("ES256 verification rejects a non-EC key even when the signature is valid for it", () => {
+  // An RSA keypair signs the canonical payload correctly. createPublicKey accepts the SPKI and
+  // crypto.verify would happily verify under RSA — but the receipt claims ES256, so it must fail.
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
+  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+  const receipt: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    actionDescription: "deploy",
+    params: ACTION.params,
+    signerPublicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    signature: crypto.sign("sha256", Buffer.from(canonical, "utf8"), privateKey).toString("base64"),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  }
+  const r = verifyApprovalReceipt(receipt, EXPECTED_N)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /does not verify/)
+})
+
+test("ES256 verification rejects an EC key on a curve other than P-256", () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "secp384r1" })
+  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+  const receipt: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    actionDescription: "deploy",
+    params: ACTION.params,
+    signerPublicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    signature: crypto
+      .sign("sha256", Buffer.from(canonical, "utf8"), { key: privateKey, dsaEncoding: "der" })
+      .toString("base64"),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  }
+  const r = verifyApprovalReceipt(receipt, EXPECTED_N)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /does not verify/)
+})
+
+test("ES256 accepts both DER and raw IEEE-P1363 signatures over the same payload", () => {
+  // The wallet may emit either encoding (WebCrypto/Expo produce raw r||s; node:crypto defaults to
+  // DER). The verifier tries both rather than inferring from length: a DER signature is USUALLY 70-72
+  // bytes but can in principle be 64 — the same length as raw r||s — so length is not a discriminator.
+  // (That collision needs r and s to shed three leading zero bytes each, ~2^-48, so it is not
+  // reachable in a test; trying both encodings is what makes the distinction moot.)
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const pubB64 = publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+
+  const receiptWith = (signature: Buffer): ApprovalReceipt => ({
+    canonicalPayload: canonical,
+    actionDescription: "deploy",
+    params: ACTION.params,
+    signerPublicKey: pubB64,
+    signature: signature.toString("base64"),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  })
+  const data = Buffer.from(canonical, "utf8")
+  const der = crypto.sign("sha256", data, { key: privateKey, dsaEncoding: "der" })
+  const p1363 = crypto.sign("sha256", data, { key: privateKey, dsaEncoding: "ieee-p1363" })
+  assert.equal(p1363.length, 64)
+
+  assert.equal(verifyApprovalReceipt(receiptWith(der), EXPECTED_N).ok, true)
+  assert.equal(verifyApprovalReceipt(receiptWith(p1363), EXPECTED_N).ok, true)
 })

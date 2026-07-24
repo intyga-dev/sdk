@@ -25,12 +25,23 @@ export interface SakraClientOptions {
   allowStoredCredentials?: boolean
 }
 
-export type ApprovalStatus = "APPROVED" | "DENIED" | "EXPIRED" | "PENDING"
+/**
+ * CONSUMED means the approval was real but has ALREADY BEEN REDEEMED — single-use is enforced by the
+ * gateway, and this is how you observe it without calling /authorize/verify. Treat it as not
+ * authorized: only APPROVED permits execution.
+ */
+export type ApprovalStatus = "APPROVED" | "CONSUMED" | "DENIED" | "EXPIRED" | "PENDING"
 
 export interface ApprovalResult {
   status: ApprovalStatus
   signatureHash?: string
   receipt?: ApprovalReceipt
+  /**
+   * The challenge nonce this result belongs to. Set by `requireApproval`, which owns the nonce
+   * internally — without it, callers of the one-shot helper have no way to pass `expected.nonce` to
+   * `verifyApprovalReceipt`, and no way to record the nonce as redeemed for their own single-use check.
+   */
+  nonce?: string
 }
 
 /** Options for a structured, WYSIWYS-bound approval request. */
@@ -201,14 +212,14 @@ export class SakraClient {
       try {
         const r = await this.status(nonce)
         consecutiveErrors = 0
-        if (r.status !== "PENDING") return r
+        if (r.status !== "PENDING") return { ...r, nonce }
       } catch (err: unknown) {
         if (++consecutiveErrors >= MAX_POLL_ERRORS) {
           const msg = err instanceof Error ? err.message : String(err)
           throw new Error(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`)
         }
       }
-      if (Date.now() > deadline) return { status: "EXPIRED" }
+      if (Date.now() > deadline) return { status: "EXPIRED", nonce }
       await new Promise((resolve) => setTimeout(resolve, interval))
     }
   }

@@ -133,6 +133,22 @@ export function verifyEvidenceBundle(
     }
   }
 
+  // Check per-tenant sequence contiguity (completeness / omission detection)
+  let lastTenantSeq: bigint | null = null
+  for (const entry of bundle.entries) {
+    const tenantSeqStr = entry.event.canonical?.tenantSeq
+    if (tenantSeqStr != null) {
+      const currentTenantSeq = BigInt(tenantSeqStr)
+      if (lastTenantSeq !== null && currentTenantSeq !== lastTenantSeq + 1n) {
+        failed.push({
+          seq: entry.event.seq,
+          reason: `per-tenant omission detected: sequence gap between tenantSeq ${lastTenantSeq.toString()} and ${currentTenantSeq.toString()}`,
+        })
+      }
+      lastTenantSeq = currentTenantSeq
+    }
+  }
+
   const roots = [...knownRoots.entries()].map(([root, anchorRef]) => ({
     root,
     anchorRef,

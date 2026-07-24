@@ -166,7 +166,9 @@ async function pollVerifyConsume(
   if (!result.receipt) die("Gateway returned APPROVED but no signature receipt.")
 
   const { verifyApprovalReceipt } = await import("./index.js")
-  const v = verifyApprovalReceipt(result.receipt, { actionType, params })
+  // The nonce is asserted too: it binds the receipt to the challenge this call issued, so a receipt
+  // for some other (equally valid) approval cannot be substituted.
+  const v = verifyApprovalReceipt(result.receipt, { actionType, params, nonce })
   // The payload is always checked first, so a tampered action still fails here regardless of mode.
   if (!v.ok && !v.autoApproved) die(`Offline verification FAILED: ${v.reason}`)
   if (v.autoApproved) {
@@ -373,7 +375,7 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: sakra authorize "<action>" --gateway <url> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--web <appUrl>] [--consume]',
+          'usage: sakra authorize "<action>" --gateway <url> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
         )
 
       const client = new SakraClient({
@@ -577,7 +579,7 @@ async function main() {
           "  sakra keygen [--out <prefix>]",
           "  sakra policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
           "  sakra login --did <did> [--gateway <url>]",
-          '  sakra authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--no-wait] [--no-open] [--consume]',
+          '  sakra authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
           "  sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
           '  sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
           "  sakra verify <documentHash> --gateway <url>",

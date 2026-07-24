@@ -11,6 +11,7 @@ import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 function makeLeaf(seq: number): AuditLeaf {
   return {
     seq: String(seq),
+    tenantSeq: String(seq + 1),
     createdAt: "2026-07-15T00:00:00.000Z",
     event: "TEST_EVENT",
     outcome: "SUCCESS",

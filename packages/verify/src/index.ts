@@ -181,16 +181,19 @@ export function canonicalAuthorizationPayloadV3(input: {
   actionDescription: string
   params: Record<string, unknown>
   requester: RequesterIdentity
+  expiresAt?: string | null
 }): string {
   const a = input.requester.attestation
   const attestation = a
     ? `{"method":${JSON.stringify(a.method)},"issuer":${JSON.stringify(a.issuer)},"subject":${JSON.stringify(a.subject)}}`
     : "null"
+  const expiresAtSuffix = input.expiresAt ? `,"expiresAt":${JSON.stringify(input.expiresAt)}` : ""
   return (
     `{"v":3,"type":"agent-authorization","nonce":${JSON.stringify(input.nonce)},` +
     `"actionType":${JSON.stringify(input.actionType)},"action":${JSON.stringify(input.actionDescription)},` +
     `"params":${stableStringify(input.params)},` +
-    `"requester":{"did":${JSON.stringify(input.requester.did)},"attestation":${attestation}}}`
+    `"requester":{"did":${JSON.stringify(input.requester.did)},"attestation":${attestation}}` +
+    `${expiresAtSuffix}}`
   )
 }
 
@@ -213,9 +216,27 @@ export function verifyEcdsaP256(publicKeyB64: string, payload: string, signature
       format: "der",
       type: "spki",
     })
+    // Pin the key to EC / P-256. createPublicKey happily accepts RSA, Ed25519 or P-521 SPKI, and
+    // crypto.verify would then verify under THAT algorithm while the receipt is labelled ES256. The
+    // key is chosen by whoever enrolled the wallet, so the label must be enforced, not trusted.
+    if (keyObject.asymmetricKeyType !== "ec") return false
+    if (keyObject.asymmetricKeyDetails?.namedCurve !== "prime256v1") return false
+
     const signature = Buffer.from(signatureB64, "base64")
-    const dsaEncoding = signature.length === 64 ? "ieee-p1363" : "der"
-    return crypto.verify("sha256", Buffer.from(payload, "utf8"), { key: keyObject, dsaEncoding }, signature)
+    const data = Buffer.from(payload, "utf8")
+    // Raw IEEE-P1363 (r||s) is always exactly 64 bytes for P-256. DER is usually 70-72 but can in
+    // principle also be 64 (r and s each shedding three leading zero bytes — vanishingly rare, ~2^-48,
+    // yet a correctness cliff rather than a graceful one). Try the encodings instead of inferring one
+    // from length, so the distinction stops mattering at all.
+    const tryEncoding = (dsaEncoding: "der" | "ieee-p1363"): boolean => {
+      try {
+        return crypto.verify("sha256", data, { key: keyObject, dsaEncoding }, signature)
+      } catch {
+        return false
+      }
+    }
+    if (signature.length === 64 && tryEncoding("ieee-p1363")) return true
+    return tryEncoding("der")
   } catch {
     return false
   }
@@ -239,20 +260,63 @@ function parseVersion(canonical: string): number {
   }
 }
 
+/** What you assert the receipt must say. `nonce` is required — see the note on replay below. */
+export interface ReceiptExpectation {
+  actionType: string
+  params: Record<string, unknown>
+  /**
+   * The challenge nonce YOU issued and are redeeming. Required: it is what ties this receipt to one
+   * specific request you are tracking. See the replay note on verifyApprovalReceipt.
+   */
+  nonce: string
+  /** Optionally assert WHICH workload the approval was granted to (v3 receipts only). */
+  requesterDid?: string
+}
+
+/** Verification options. The WebAuthn expectations are mandatory for a WEBAUTHN receipt. */
+export interface VerifyReceiptOptions {
+  allowAutoApproved?: boolean
+  /** Exact `origin` the assertion must carry, e.g. "https://app.example.com". Required for WEBAUTHN. */
+  expectedOrigin?: string
+  /** RP ID the authenticatorData must hash to, e.g. "app.example.com". Required for WEBAUTHN. */
+  expectedRpId?: string
+  /** Demand the User-Verified flag (biometric/PIN, not mere possession). Defaults to true. */
+  requireUserVerification?: boolean
+}
+
+// WebAuthn authenticatorData flag bits (WebAuthn L3 §6.1).
+const AUTH_DATA_FLAG_UP = 0x01 // User Present
+const AUTH_DATA_FLAG_UV = 0x04 // User Verified
+
 /**
  * Independently verify an approval receipt against the instruction you are ABOUT to execute. Recomputes
  * the canonical payload from your params, confirms it byte-matches what was signed, and verifies the
- * human's P-256 or WebAuthn signature — with no SÄKRA secret. Defense-in-depth twin of gateway
- * /authorize/verify. Returns `{ ok: false, reason }` on any mismatch.
+ * human's P-256 or WebAuthn signature — with no SÄKRA secret.
+ *
+ * WHAT THIS PROVES: that a specific human key signed exactly this action, with exactly these params,
+ * for exactly the nonce you pass in `expected.nonce`.
+ *
+ * WHAT THIS DOES NOT PROVE: that the approval has not ALREADY BEEN USED. Nothing in a receipt is
+ * time-bound, so a valid receipt verifies forever. Single-use enforcement lives in the gateway's
+ * /authorize/verify (which atomically marks the challenge CONSUMED) — this function is a
+ * defense-in-depth companion to that call, not a replacement for it. If you verify offline and skip
+ * the consume step, YOU must record redeemed nonces yourself; requiring `expected.nonce` here is what
+ * makes that possible, since you cannot call this without having tracked the nonce you issued.
+ *
+ * Returns `{ ok: false, reason }` on any mismatch.
  */
 export function verifyApprovalReceipt(
   receipt: ApprovalReceipt,
-  expected: { actionType: string; params: Record<string, unknown>; requesterDid?: string },
-  opts: { allowAutoApproved?: boolean } = {},
+  expected: ReceiptExpectation,
+  opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; autoApproved?: boolean } {
   const version = parseVersion(receipt.canonicalPayload)
   if (version !== 2 && version !== 3)
     return { ok: false, reason: `unsupported canonical payload version (${version || "unparseable"})` }
+
+  // Bind the receipt to the challenge the caller is redeeming, before anything else.
+  if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
+    return { ok: false, reason: "receipt is for a different challenge" }
 
   // v3 additionally binds the requester, so it must be rebuilt from the receipt's own requester block.
   // That is not circular: the rebuilt string has to byte-match the signed bytes below, so a forged
@@ -315,10 +379,31 @@ export function verifyApprovalReceipt(
         reason: "WebAuthn receipt missing authenticatorData or clientDataJSON",
       }
     }
+    // FAIL CLOSED, same rule as the rest of this package: without an expected origin and RP ID there
+    // is nothing to pin the assertion to, and an assertion harvested at an attacker's relying party
+    // would verify. Refuse rather than check a weaker property.
+    if (!opts.expectedOrigin || !opts.expectedRpId) {
+      return {
+        ok: false,
+        reason:
+          "WebAuthn receipts require expectedOrigin and expectedRpId — without them an assertion from any relying party would verify",
+      }
+    }
     try {
       const clientDataBuf = Buffer.from(receipt.clientDataJSON, "base64")
       const clientDataStr = clientDataBuf.toString("utf-8")
-      const clientData = JSON.parse(clientDataStr) as { challenge: string }
+      const clientData = JSON.parse(clientDataStr) as {
+        challenge: string
+        type?: string
+        origin?: string
+      }
+
+      // An assertion, not a registration: webauthn.create signs a different ceremony over the same
+      // challenge bytes, and must never be accepted as approval.
+      if (clientData.type !== "webauthn.get")
+        return { ok: false, reason: "clientDataJSON is not a webauthn.get assertion" }
+      if (clientData.origin !== opts.expectedOrigin)
+        return { ok: false, reason: "assertion origin does not match expectedOrigin" }
 
       const expectedChallenge = base64url(receipt.canonicalPayload)
       const clientChallengeClean = clientData.challenge.replace(/=/g, "")
@@ -329,6 +414,20 @@ export function verifyApprovalReceipt(
         }
       }
 
+      // authenticatorData is signed but was previously never INSPECTED: it carries the RP ID the
+      // credential answered for and whether the user was actually present/verified. Skipping these
+      // made this verifier strictly weaker than the gateway, which pins both.
+      const authData = Buffer.from(receipt.authenticatorData, "base64")
+      if (authData.length < 37) return { ok: false, reason: "authenticatorData is too short" }
+      const rpIdHash = crypto.createHash("sha256").update(opts.expectedRpId, "utf8").digest()
+      if (!crypto.timingSafeEqual(authData.subarray(0, 32), rpIdHash))
+        return { ok: false, reason: "authenticatorData rpIdHash does not match expectedRpId" }
+      const flags = authData.readUInt8(32)
+      if (!(flags & AUTH_DATA_FLAG_UP))
+        return { ok: false, reason: "authenticatorData user-present flag is not set" }
+      if (opts.requireUserVerification !== false && !(flags & AUTH_DATA_FLAG_UV))
+        return { ok: false, reason: "authenticatorData user-verified flag is not set" }
+
       const coseBuf = Buffer.from(receipt.signerPublicKey, "base64")
       const { x, y } = parseCosePublicKey(coseBuf)
       const keyObject = crypto.createPublicKey({
@@ -336,13 +435,14 @@ export function verifyApprovalReceipt(
         key: { kty: "EC", crv: "P-256", x, y },
       })
 
-      const authDataBuf = Buffer.from(receipt.authenticatorData, "base64")
       const clientDataHash = crypto.createHash("sha256").update(clientDataBuf).digest()
-      const signatureVerifyData = Buffer.concat([authDataBuf, clientDataHash])
+      const signatureVerifyData = Buffer.concat([authData, clientDataHash])
 
       const signatureBuf = Buffer.from(receipt.signature, "base64")
+      // Digest pinned explicitly: ES256 is P-256 + SHA-256 by definition, and leaving it implicit
+      // (`undefined`) makes the algorithm a property of the Node version rather than of this code.
       const verified = crypto.verify(
-        undefined,
+        "sha256",
         signatureVerifyData,
         { key: keyObject, dsaEncoding: "der" },
         signatureBuf,

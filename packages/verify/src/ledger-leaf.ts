@@ -8,6 +8,7 @@ import { hashLeaf } from "./ledger-merkle.js"
 
 export interface AuditLeaf {
   seq: string // stringified bigint — matches producer's row.seq.toString()
+  tenantSeq?: string | null // stringified bigint — matches producer's row.tenantSeq.toString()
   createdAt: string // ISO 8601 — matches row.createdAt.toISOString()
   event: string
   outcome: string
@@ -26,7 +27,7 @@ export interface AuditLeaf {
   challengeId: string | null
 }
 
-/** The 17-field ordered array that gets JSON-stringified into the leaf preimage. Keep in lockstep
+/** The 18-field ordered array that gets JSON-stringified into the leaf preimage. Keep in lockstep
  *  with the producer's `leafHash` (packages/db/src/checkpoint.ts). */
 export function canonicalPreimage(row: AuditLeaf): string {
   return JSON.stringify([
@@ -47,6 +48,7 @@ export function canonicalPreimage(row: AuditLeaf): string {
     row.subjectNodeId,
     row.edgeId,
     row.challengeId,
+    row.tenantSeq ?? null,
   ])
 }
 
