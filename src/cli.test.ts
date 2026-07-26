@@ -1,5 +1,8 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 
@@ -15,6 +18,56 @@ test("no command prints help and exits 0", () => {
   const r = run([])
   assert.equal(r.status, 0)
   assert.match(r.stdout, /SÄKRA CLI/)
+})
+
+test("unknown command prints help and exits 1", () => {
+  const r = run(["unknown-command"])
+  assert.equal(r.status, 1)
+  assert.match(r.stdout, /SÄKRA CLI/)
+})
+
+test("keygen prints org keypair and exits 0", () => {
+  const r = run(["keygen"])
+  assert.equal(r.status, 0)
+  assert.match(r.stdout, /publicKey/)
+  assert.match(r.stdout, /privateKey/)
+})
+
+test("keygen --out writes key files and exits 0", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sakra-keygen-test-"))
+  const prefix = path.join(tmp, "org")
+  try {
+    const r = run(["keygen", "--out", prefix])
+    assert.equal(r.status, 0)
+    assert.ok(fs.existsSync(`${prefix}.public.key`))
+    assert.ok(fs.existsSync(`${prefix}.private.key`))
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("policy-encrypt without args exits non-zero", () => {
+  const r = run(["policy-encrypt"])
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /usage: sakra policy-encrypt/)
+})
+
+test("login without --did exits non-zero", () => {
+  const r = run(["login"])
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /usage: sakra login/)
+})
+
+test("verify without hash exits non-zero", () => {
+  const r = run(["verify"])
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /usage: sakra verify/)
+})
+
+test("audit-verify without bundle exits non-zero", () => {
+  const r = run(["audit-verify"])
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /usage: sakra audit-verify/)
 })
 
 test("authorize without an action description exits non-zero", () => {
