@@ -63,6 +63,64 @@ function _signPayload(privateKeyB64: string, payload: string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Build the DEWP §5.3 anchor-policy options for `verifyBundle` from CLI flags.
+ *
+ * Anchor signatures are only meaningful against keys the AUDITOR trusts. `--anchor-keys` supplies a
+ * JSON map of `{ "issuer#keyId": "<base64 SPKI>" }` (the shape `/.well-known/dewp-anchors.json`
+ * publishes), and `--trusted-issuer` (repeatable, comma-separated) names which issuers count toward
+ * quorum. Supplying neither is not an error: the verifier then reports `anchorVerified` on the weaker
+ * "independent root supplied" basis, and says so, rather than pretending a quorum was evaluated.
+ */
+async function buildAnchorOptions(
+  trustedIssuers: string | undefined,
+  anchorKeysFile: string | undefined,
+  requireAnchors: string | undefined,
+): Promise<Record<string, unknown>> {
+  if (!trustedIssuers) return {}
+  const issuers = trustedIssuers
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (issuers.length === 0) return {}
+
+  const nodeCrypto = await import("node:crypto")
+  let keyMap: Record<string, string> = {}
+  if (anchorKeysFile) {
+    try {
+      keyMap = JSON.parse(fs.readFileSync(anchorKeysFile, "utf8")) as Record<string, string>
+    } catch (err) {
+      die(`cannot read --anchor-keys: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // A required count larger than the keys we can actually resolve would fail confusingly; default to
+  // "every named issuer must agree", which is the conservative reading of §5.3.
+  const required = requireAnchors ? Number(requireAnchors) : issuers.length
+  if (!Number.isFinite(required) || required < 1) die("--require-anchors must be a positive integer")
+
+  return {
+    anchorPolicy: {
+      requiredAnchors: required,
+      trustedIssuers: issuers,
+      quorum: required >= issuers.length ? "ALL_MUST_AGREE" : "N_OF_M",
+    },
+    resolveAnchorKey: (anchor: { issuer: string; keyId: string }) => {
+      const spki = keyMap[`${anchor.issuer}#${anchor.keyId}`] ?? keyMap[anchor.issuer]
+      if (!spki) return null
+      try {
+        return nodeCrypto.createPublicKey({
+          key: Buffer.from(spki, "base64"),
+          format: "der",
+          type: "spki",
+        })
+      } catch {
+        return null // an unparseable key resolves to "unknown", never to "trusted"
+      }
+    },
+  }
+}
+
 /** Pick the published daily root that covers this proof's seq (or matches its anchorRef), from a JSONL
  *  roots file (e.g. a checkout of sakra-trust/ledger's roots/roots.jsonl). Undefined if no file/match. */
 function resolveRootFromFile(
@@ -515,7 +573,10 @@ async function main() {
         await import("@sakra-trust/verify")
       const bundlePath = rest.find((a) => !a.startsWith("--"))
       if (!bundlePath)
-        die("usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]")
+        die(
+          "usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
+            "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--json]",
+        )
 
       let bundle: import("@sakra-trust/verify").ProofBundle
       try {
@@ -559,7 +620,15 @@ async function main() {
       if (arg("roots") && !trustedRoot)
         console.error("warning: no matching root in the roots file for this event.")
 
-      const result = verifyBundle(bundle, { trustedRoot })
+      // DEWP §5.3 anchor quorum. Without --trusted-issuer the verifier has no key to check an anchor
+      // signature against, so `anchorVerified` falls back to the weaker "an independent root was
+      // handed to me" signal — which the report labels honestly rather than calling it anchored.
+      const anchorOpts = await buildAnchorOptions(
+        arg("trusted-issuer"),
+        arg("anchor-keys"),
+        arg("require-anchors"),
+      )
+      const result = verifyBundle(bundle, { trustedRoot, ...anchorOpts })
 
       if (process.argv.indexOf("--json") >= 0) {
         console.log(JSON.stringify(result, null, 2))
@@ -600,7 +669,8 @@ async function main() {
           "  sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
           '  sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
           "  sakra verify <documentHash> --gateway <url>",
-          "  sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--json]",
+          "  sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>]",
+          "                     [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--json]",
         ].join("\n"),
       )
       process.exit(cmd ? 1 : 0)
