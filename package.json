@@ -1,7 +1,7 @@
 {
-  "name": "@sakra-trust/sdk",
+  "name": "@intyga/sdk",
   "version": "0.1.0",
-  "description": "SÄKRA SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption. Publish-ready; not yet published.",
+  "description": "Intyga SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption. Publish-ready; not yet published.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,15 +9,17 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./policy": {
       "types": "./dist/policy.d.ts",
-      "import": "./dist/policy.js"
+      "import": "./dist/policy.js",
+      "default": "./dist/policy.js"
     }
   },
   "bin": {
-    "sakra": "./dist/cli.js"
+    "intyga": "./dist/cli.js"
   },
   "files": [
     "dist",
@@ -31,7 +33,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@sakra-trust/verify": "^0.1.0"
+    "@intyga/verify": "^0.1.0"
   },
   "scripts": {
     "build": "tsc",

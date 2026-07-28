@@ -6,7 +6,7 @@ import { test } from "node:test"
 import { blobHash, decryptPolicy, encryptPolicy, generateOrgKeypair } from "../dist/policy.js"
 
 // Off-platform policy crypto: RSA-OAEP(SHA-256) wrapping an AES-256-GCM key. The security claim is
-// that SÄKRA never sees plaintext, so what matters is that a blob only opens with the org's private
+// that Intyga never sees plaintext, so what matters is that a blob only opens with the org's private
 // key and that any modification to it fails closed rather than yielding altered policy.
 
 // RSA-2048 keygen is the expensive part; generate one pair and reuse it across the suite.
@@ -32,7 +32,7 @@ test("blob has the documented v1.<wrappedKey>.<iv>.<ct> shape", () => {
 
 test("encrypting the same plaintext twice yields different blobs", () => {
   // A fresh AES key + IV per call: identical policy must not produce a recognisable ciphertext,
-  // otherwise SÄKRA could fingerprint which customers run the same manifest.
+  // otherwise Intyga could fingerprint which customers run the same manifest.
   const a = encryptPolicy(org.publicKey, MANIFEST)
   const b = encryptPolicy(org.publicKey, MANIFEST)
   assert.notEqual(a, b)
@@ -40,7 +40,7 @@ test("encrypting the same plaintext twice yields different blobs", () => {
 })
 
 test("round-trips non-ASCII and empty plaintext", () => {
-  for (const text of ["SÄKRA — pålitlig 🔐", ""]) {
+  for (const text of ["Intyga — pålitlig 🔐", ""]) {
     const blob = encryptPolicy(org.publicKey, text)
     assert.equal(decryptPolicy(org.privateKey, blob), text)
   }

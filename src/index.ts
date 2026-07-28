@@ -1,8 +1,8 @@
-// @sakra-trust/sdk — one client for every SÄKRA use case. The primitive is uniform: request a challenge →
+// @intyga/sdk — one client for every Intyga use case. The primitive is uniform: request a challenge →
 // a human approves on their wallet → poll until resolved. Works for AI agents, humans, and any
 // backend service; the only difference is which API key/token you hold.
 
-// Receipt verification + canonical helpers now live in the standalone, zero-dependency @sakra-trust/verify
+// Receipt verification + canonical helpers now live in the standalone, zero-dependency @intyga/verify
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
 export {
   type ApprovalReceipt,
@@ -10,18 +10,18 @@ export {
   verificationCode,
   verifyApprovalReceipt,
   verifyEcdsaP256,
-} from "@sakra-trust/verify"
+} from "@intyga/verify"
 export * as policy from "./policy.js"
 
-import type { ApprovalReceipt } from "@sakra-trust/verify"
+import type { ApprovalReceipt } from "@intyga/verify"
 
-export interface SakraClientOptions {
+export interface IntygaClientOptions {
   gatewayUrl: string
   /** A pre-minted token (agent or human), OR provide clientId/clientSecret to auto-exchange. */
   token?: string
   clientId?: string
   clientSecret?: string
-  /** Allow loading stored bearer token from ~/.sakra/credentials.json (intended for CLI tools). */
+  /** Allow loading stored bearer token from ~/.intyga/credentials.json (intended for CLI tools). */
   allowStoredCredentials?: boolean
 }
 
@@ -73,9 +73,9 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-/** Where `sakra login` caches bearer tokens. Shared with the CLI writer so reader and writer can't desync. */
-export const SAKRA_DIR = path.join(os.homedir(), ".sakra")
-export const CREDENTIALS_FILE = path.join(SAKRA_DIR, "credentials.json")
+/** Where `intyga login` caches bearer tokens. Shared with the CLI writer so reader and writer can't desync. */
+export const INTYGA_DIR = path.join(os.homedir(), ".intyga")
+export const CREDENTIALS_FILE = path.join(INTYGA_DIR, "credentials.json")
 
 /** How many back-to-back polling failures before `requireApproval` declares the gateway unreachable. */
 const MAX_POLL_ERRORS = 5
@@ -90,9 +90,9 @@ function loadStoredToken(gatewayUrl: string): string | undefined {
   return undefined
 }
 
-export class SakraClient {
+export class IntygaClient {
   private cachedToken?: string
-  constructor(private readonly opts: SakraClientOptions) {}
+  constructor(private readonly opts: IntygaClientOptions) {}
 
   /** Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange. */
   async token(): Promise<string> {
@@ -108,7 +108,7 @@ export class SakraClient {
     if (!this.opts.clientId || !this.opts.clientSecret) {
       throw new Error(
         this.opts.allowStoredCredentials
-          ? "provide `token`, or `clientId` + `clientSecret`, or run `sakra login` first"
+          ? "provide `token`, or `clientId` + `clientSecret`, or run `intyga login` first"
           : "provide `token`, or `clientId` + `clientSecret`",
       )
     }
@@ -185,7 +185,7 @@ export class SakraClient {
    * The core zero-trust gate: `await` this immediately before a high-risk action. It creates the
    * challenge and blocks until the human approves/denies on their wallet (or it times out).
    *
-   *   const r = await sakra.requireApproval("Wire $5,000 to Acme Corp", {
+   *   const r = await intyga.requireApproval("Wire $5,000 to Acme Corp", {
    *     actionType: "wire_transfer",
    *     params: { to: "Acme Corp", amount: 5000, currency: "USD" },
    *   });

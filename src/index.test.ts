@@ -5,14 +5,14 @@ import path from "node:path"
 import { test } from "node:test"
 
 // Point HOME at an empty directory BEFORE importing the client: token() falls back to
-// ~/.sakra/credentials.json, so a developer who has run `sakra login` would otherwise get a
+// ~/.intyga/credentials.json, so a developer who has run `intyga login` would otherwise get a
 // different result from CI. node --test gives each file its own process, so this is contained.
-const home = fs.mkdtempSync(path.join(os.tmpdir(), "sakra-sdk-test-"))
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-sdk-test-"))
 process.env.HOME = home
 process.env.USERPROFILE = home
 
 // The BUILT module (run `pnpm build` first), matching cli.test.ts — see policy.test.ts for why.
-const { SakraClient } = await import("../dist/index.js")
+const { IntygaClient } = await import("../dist/index.js")
 
 interface Reply {
   status?: number
@@ -59,7 +59,7 @@ const GW = "https://gw.example"
 test("an explicit token is used verbatim and costs no network call", async (t) => {
   const f = stubFetch(() => ({ body: {} }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "tok-abc" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "tok-abc" })
   assert.equal(await c.token(), "tok-abc")
   assert.equal(f.calls.length, 0)
 })
@@ -67,7 +67,7 @@ test("an explicit token is used verbatim and costs no network call", async (t) =
 test("without a token or client credentials it refuses rather than calling anonymously", async (t) => {
   const f = stubFetch(() => ({ body: {} }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW })
+  const c = new IntygaClient({ gatewayUrl: GW })
   await assert.rejects(() => c.token(), /provide `token`/)
   assert.equal(f.calls.length, 0)
 })
@@ -75,7 +75,7 @@ test("without a token or client credentials it refuses rather than calling anony
 test("client credentials are exchanged as HTTP Basic and the result is cached", async (t) => {
   const f = stubFetch(() => ({ body: { access_token: "tok-exchanged" } }))
   t.after(f.restore)
-  const c = new SakraClient({
+  const c = new IntygaClient({
     gatewayUrl: GW,
     clientId: "id",
     clientSecret: "secret",
@@ -98,7 +98,7 @@ test("client credentials are exchanged as HTTP Basic and the result is cached", 
 test("a failed exchange throws and surfaces the status", async (t) => {
   const f = stubFetch(() => ({ status: 401, text: "bad credentials" }))
   t.after(f.restore)
-  const c = new SakraClient({
+  const c = new IntygaClient({
     gatewayUrl: GW,
     clientId: "id",
     clientSecret: "nope",
@@ -106,28 +106,28 @@ test("a failed exchange throws and surfaces the status", async (t) => {
   await assert.rejects(() => c.token(), /token exchange failed: 401 bad credentials/)
 })
 
-test("a stored credential from `sakra login` is picked up per gateway", async (t) => {
-  fs.mkdirSync(path.join(home, ".sakra"), { recursive: true })
+test("a stored credential from `intyga login` is picked up per gateway", async (t) => {
+  fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
   fs.writeFileSync(
-    path.join(home, ".sakra", "credentials.json"),
+    path.join(home, ".intyga", "credentials.json"),
     JSON.stringify({
       [GW]: "tok-stored",
       "https://other.example": "tok-other",
     }),
   )
-  t.after(() => fs.rmSync(path.join(home, ".sakra"), { recursive: true, force: true }))
+  t.after(() => fs.rmSync(path.join(home, ".intyga"), { recursive: true, force: true }))
   const f = stubFetch(() => ({ body: {} }))
   t.after(f.restore)
 
-  assert.equal(await new SakraClient({ gatewayUrl: GW, allowStoredCredentials: true }).token(), "tok-stored")
+  assert.equal(await new IntygaClient({ gatewayUrl: GW, allowStoredCredentials: true }).token(), "tok-stored")
   // Without explicit allowStoredCredentials, stored tokens are ignored to prevent server-side identity borrowing.
   await assert.rejects(
-    () => new SakraClient({ gatewayUrl: GW }).token(),
+    () => new IntygaClient({ gatewayUrl: GW }).token(),
     /provide `token`, or `clientId` \+ `clientSecret`/,
   )
   // A gateway with no stored entry must not silently borrow another gateway's token even when enabled.
   await assert.rejects(() =>
-    new SakraClient({ gatewayUrl: "https://third.example", allowStoredCredentials: true }).token(),
+    new IntygaClient({ gatewayUrl: "https://third.example", allowStoredCredentials: true }).token(),
   )
   assert.equal(f.calls.length, 0)
 })
@@ -135,7 +135,7 @@ test("a stored credential from `sakra login` is picked up per gateway", async (t
 test("authorize posts the action and defaults params to an empty object", async (t) => {
   const f = stubFetch(() => ({ body: { nonce: "n-1", status: "PENDING" } }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const r = await c.authorize("Wire $500 to ACME")
   assert.deepEqual(r, { nonce: "n-1", status: "PENDING" })
@@ -151,7 +151,7 @@ test("authorize posts the action and defaults params to an empty object", async 
 test("authorize binds actionType and params into the request", async (t) => {
   const f = stubFetch(() => ({ body: { nonce: "n-2", status: "PENDING" } }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   await c.authorize("Wire", {
     actionType: "payments.wire",
@@ -170,7 +170,7 @@ test("authorize binds actionType and params into the request", async (t) => {
 test("authorize throws on a non-2xx rather than returning a falsy nonce", async (t) => {
   const f = stubFetch(() => ({ status: 403, text: "forbidden" }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
   await assert.rejects(() => c.authorize("x"), /authorize failed: 403 forbidden/)
 })
 
@@ -179,7 +179,7 @@ test("status url-encodes the nonce", async (t) => {
   // slash — a lookup that silently hit a different route would be worse than a 404.
   const f = stubFetch(() => ({ body: { status: "APPROVED" } }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   await c.status("a/b c")
   assert.equal(f.calls[0]!.url, `${GW}/authorize/a%2Fb%20c`)
@@ -188,14 +188,14 @@ test("status url-encodes the nonce", async (t) => {
 test("status throws on a non-2xx", async (t) => {
   const f = stubFetch(() => ({ status: 500 }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
   await assert.rejects(() => c.status("n"), /status failed: 500/)
 })
 
 test("consume re-binds the exact action at execution time", async (t) => {
   const f = stubFetch(() => ({ body: { ok: true } }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const r = await c.consume("n-1", {
     actionType: "payments.wire",
@@ -218,7 +218,7 @@ test("consume returns the gateway's refusal instead of throwing", async (t) => {
     body: { ok: false, reason: "already consumed" },
   }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
   assert.deepEqual(await c.consume("n", { actionType: "a" }), {
     ok: false,
     reason: "already consumed",
@@ -235,7 +235,7 @@ test("requireApproval polls until the challenge resolves", async (t) => {
       : { body: { status: "APPROVED", signatureHash: "deadbeef" } }
   })
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 5000 })
   assert.equal(r.status, "APPROVED")
@@ -250,7 +250,7 @@ test("requireApproval surfaces a denial without waiting for the deadline", async
       : { body: { status: "DENIED" } },
   )
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   // Fails closed and fails fast: a denied action must never look like a timeout.
   const r = await c.requireApproval("Wire", {
@@ -267,7 +267,7 @@ test("requireApproval gives up as EXPIRED and converts timeoutMs to whole second
       : { body: { status: "PENDING" } },
   )
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 1500 })
   assert.equal(r.status, "EXPIRED")
@@ -285,7 +285,7 @@ test("requireApproval derives its deadline from opts.timeout", { timeout: 20_000
       : { body: { status: "PENDING" } },
   )
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const started = Date.now()
   const r = await c.requireApproval("Wire", { intervalMs: 10, timeout: 1 })
@@ -305,7 +305,7 @@ test("requireApproval rides out a transient polling failure", async (t) => {
     return { body: { status: "APPROVED" } }
   })
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   // A momentary 502 must not throw away a wait the human may already have acted on.
   const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 5_000 })
@@ -317,7 +317,7 @@ test("requireApproval gives up when the gateway is persistently unreachable", as
     call.url.endsWith("/authorize") ? { body: { nonce: "n-14", status: "PENDING" } } : { status: 503 },
   )
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW, token: "t" })
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   // Tolerating blips is not the same as hanging forever: sustained failure must surface, not
   // masquerade as EXPIRED, so the caller can tell "no answer" from "the human said no".
@@ -332,7 +332,7 @@ test("verify url-encodes the document hash and needs no token", async (t) => {
     body: { verified: true, status: "SIGNED", documentHash: "ab/cd" },
   }))
   t.after(f.restore)
-  const c = new SakraClient({ gatewayUrl: GW })
+  const c = new IntygaClient({ gatewayUrl: GW })
 
   const r = await c.verify("ab/cd")
   assert.equal(r.verified, true)

@@ -1,14 +1,14 @@
 import crypto from "node:crypto"
 
-// Off-platform zero-knowledge policy crypto. Run this on YOUR machine (CLI/CI) so SÄKRA never sees
-// the plaintext or the private key — the strongest ZK posture (no trust in SÄKRA-served code).
+// Off-platform zero-knowledge policy crypto. Run this on YOUR machine (CLI/CI) so Intyga never sees
+// the plaintext or the private key — the strongest ZK posture (no trust in Intyga-served code).
 // Blob format is byte-compatible with the browser console: `v1.<rsaWrappedAesKey>.<iv>.<ct+gcmTag>`
 // (standard base64), RSA-OAEP(SHA-256) + AES-256-GCM.
 
 const b64 = (b: Buffer) => b.toString("base64")
 const unb64 = (s: string) => Buffer.from(s, "base64")
 
-/** Generate an org keypair. Keep the private key OFF SÄKRA; upload only the public key. */
+/** Generate an org keypair. Keep the private key OFF Intyga; upload only the public key. */
 export function generateOrgKeypair(): {
   publicKey: string
   privateKey: string

@@ -2,12 +2,36 @@
 import crypto from "node:crypto"
 import fs from "node:fs"
 // Paths come from the SDK so this writer and the `token()` reader can never drift apart.
-import { type ApprovalResult, CREDENTIALS_FILE, SAKRA_DIR, SakraClient } from "./index.js"
+import { type ApprovalResult, CREDENTIALS_FILE, INTYGA_DIR, IntygaClient } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
   return i >= 0 ? process.argv[i + 1] : undefined
+}
+
+/**
+ * The approver keys THIS caller trusts, from --approver-key (repeatable) or INTYGA_APPROVER_KEYS
+ * (comma-separated). Base64 SPKI for a raw P-256 approver, base64 COSE for a passkey.
+ *
+ * There is deliberately no default and no fallback to the key inside the receipt. Verifying a receipt
+ * against its own embedded key proves only that the receipt is self-consistent: anyone who can hand
+ * you one could have generated that keypair, signed the exact payload your command is about to run,
+ * and called themselves anything. Resolving the key yourself is the entire security property
+ * (DIV §3 Invariant 3), so the CLI refuses rather than verify something weaker.
+ */
+function approverKeys(): string[] {
+  const flags: string[] = []
+  for (let i = 0; i < process.argv.length; i++) {
+    if (process.argv[i] === "--approver-key" && process.argv[i + 1]) {
+      flags.push(process.argv[i + 1] as string)
+    }
+  }
+  const fromEnv = (process.env.INTYGA_APPROVER_KEYS ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean)
+  return [...flags, ...fromEnv]
 }
 
 function die(msg: string): never {
@@ -25,7 +49,7 @@ function parseTimeout(val: string | undefined): { timeoutSec?: number; timeoutMs
 }
 
 /** Best-effort permission tightening — `chmod` throws on Windows/exotic filesystems and must never
- *  break `sakra login`. The `mode` options on mkdir/writeFile are no-ops when the target already
+ *  break `intyga login`. The `mode` options on mkdir/writeFile are no-ops when the target already
  *  exists, so these calls are also what repairs a 0644 credentials file from an earlier install. */
 function restrictPermissions(target: string, mode: number) {
   try {
@@ -34,10 +58,10 @@ function restrictPermissions(target: string, mode: number) {
 }
 
 function saveStoredToken(gatewayUrl: string, token: string) {
-  if (!fs.existsSync(SAKRA_DIR)) {
-    fs.mkdirSync(SAKRA_DIR, { recursive: true, mode: 0o700 })
+  if (!fs.existsSync(INTYGA_DIR)) {
+    fs.mkdirSync(INTYGA_DIR, { recursive: true, mode: 0o700 })
   }
-  restrictPermissions(SAKRA_DIR, 0o700)
+  restrictPermissions(INTYGA_DIR, 0o700)
   let data: Record<string, string> = {}
   if (fs.existsSync(CREDENTIALS_FILE)) {
     try {
@@ -71,11 +95,19 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  * publishes), and `--trusted-issuer` (repeatable, comma-separated) names which issuers count toward
  * quorum. Supplying neither is not an error: the verifier then reports `anchorVerified` on the weaker
  * "independent root supplied" basis, and says so, rather than pretending a quorum was evaluated.
+ *
+ * A REKOR anchor is verified differently: it carries no DEWP signature, so instead of a key from
+ * `--anchor-keys` it needs Sigstore's LOG key (`--rekor-key`), against which its Signed Entry
+ * Timestamp is checked. Without that key a Rekor anchor cannot be verified and therefore does NOT
+ * count toward quorum — deliberately, because counting an unverifiable anchor is how "independently
+ * anchored" becomes a claim rather than a fact. Get the key from Sigstore's TUF root, not from the
+ * bundle you are checking.
  */
 async function buildAnchorOptions(
   trustedIssuers: string | undefined,
   anchorKeysFile: string | undefined,
   requireAnchors: string | undefined,
+  rekorKeyFile?: string,
 ): Promise<Record<string, unknown>> {
   if (!trustedIssuers) return {}
   const issuers = trustedIssuers
@@ -99,7 +131,17 @@ async function buildAnchorOptions(
   const required = requireAnchors ? Number(requireAnchors) : issuers.length
   if (!Number.isFinite(required) || required < 1) die("--require-anchors must be a positive integer")
 
+  let rekorKey: string | undefined
+  if (rekorKeyFile) {
+    try {
+      rekorKey = fs.readFileSync(rekorKeyFile, "utf8").trim()
+    } catch (err) {
+      die(`cannot read --rekor-key: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   return {
+    ...(rekorKey ? { externalKeys: { rekor: rekorKey } } : {}),
     anchorPolicy: {
       requiredAnchors: required,
       trustedIssuers: issuers,
@@ -122,7 +164,7 @@ async function buildAnchorOptions(
 }
 
 /** Pick the published daily root that covers this proof's seq (or matches its anchorRef), from a JSONL
- *  roots file (e.g. a checkout of sakra-trust/ledger's roots/roots.jsonl). Undefined if no file/match. */
+ *  roots file (e.g. a checkout of intyga-dev/ledger's roots/roots.jsonl). Undefined if no file/match. */
 function resolveRootFromFile(
   rootsPath: string | undefined,
   bundle: { proof: { seq: string; anchorRef: string | null } },
@@ -197,7 +239,7 @@ function ghOutput(kv: Record<string, string>) {
 
 /** Poll a pending challenge to resolution, verify the receipt offline, optionally single-use consume. */
 async function pollVerifyConsume(
-  client: SakraClient,
+  client: IntygaClient,
   nonce: string,
   target: string,
   actionType: string,
@@ -225,9 +267,23 @@ async function pollVerifyConsume(
   if (!result.receipt) die("Gateway returned APPROVED but no signature receipt.")
 
   const { verifyApprovalReceipt } = await import("./index.js")
+  const approvers = approverKeys()
+  if (approvers.length === 0) {
+    die(
+      "no trusted approver key configured — pass --approver-key <base64> (repeatable) or set " +
+        "INTYGA_APPROVER_KEYS. Verification must use a key YOU resolved; a receipt cannot vouch " +
+        "for its own signer, so there is no safe default.",
+    )
+  }
   // The nonce is asserted too: it binds the receipt to the challenge this call issued, so a receipt
   // for some other (equally valid) approval cannot be substituted.
-  const v = verifyApprovalReceipt(result.receipt, { target, actionType, params, nonce })
+  const v = verifyApprovalReceipt(result.receipt, {
+    target,
+    actionType,
+    params,
+    nonce,
+    approvers: { publicKeys: approvers },
+  })
   // The payload is always checked first, so a tampered action still fails here regardless of mode.
   if (!v.ok && !v.autoApproved) die(`Offline verification FAILED: ${v.reason}`)
   if (v.autoApproved) {
@@ -259,7 +315,7 @@ async function pollVerifyConsume(
 /**
  * Post an interactive Slack / Teams message with the approval context and an "Approve" button that
  * deep-links to the /approve page. Run from the CALLER's CI to the CALLER's own webhook — so the rich
- * context stays in the customer's trust boundary (SÄKRA's own gateway webhook remains opaque).
+ * context stays in the customer's trust boundary (Intyga's own gateway webhook remains opaque).
  * Notification failures are non-fatal: the `await` step is the actual gate, not the ping.
  */
 async function postNotifications(input: {
@@ -277,7 +333,7 @@ async function postNotifications(input: {
         headers: { "content-type": "application/json" },
         signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
-          text: `🔒 SÄKRA approval required: ${input.context}`,
+          text: `🔒 Intyga approval required: ${input.context}`,
           blocks: [
             {
               type: "section",
@@ -315,10 +371,10 @@ async function postNotifications(input: {
           "@type": "MessageCard",
           "@context": "http://schema.org/extensions",
           themeColor: "4f46e5",
-          summary: "SÄKRA approval required",
+          summary: "Intyga approval required",
           sections: [
             {
-              activityTitle: "🔒 SÄKRA approval required",
+              activityTitle: "🔒 Intyga approval required",
               activitySubtitle: input.context,
               text: codeLine,
               markdown: true,
@@ -341,7 +397,7 @@ async function postNotifications(input: {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2)
-  const gatewayUrl = (arg("gateway") ?? process.env.SAKRA_GATEWAY_URL ?? "http://localhost:8787").replace(
+  const gatewayUrl = (arg("gateway") ?? process.env.INTYGA_GATEWAY_URL ?? "http://localhost:8787").replace(
     /\/+$/,
     "",
   )
@@ -355,11 +411,11 @@ async function main() {
         fs.writeFileSync(`${out}.private.key`, kp.privateKey)
         console.log(`wrote ${out}.public.key and ${out}.private.key`)
         console.log(
-          "Upload the PUBLIC key to SÄKRA. Keep the PRIVATE key off SÄKRA — it decrypts your policies.",
+          "Upload the PUBLIC key to Intyga. Keep the PRIVATE key off Intyga — it decrypts your policies.",
         )
       } else {
         console.log(JSON.stringify(kp, null, 2))
-        console.error("\nKeep the private key secret — SÄKRA must never receive it.")
+        console.error("\nKeep the private key secret — Intyga must never receive it.")
       }
       return
     }
@@ -367,7 +423,7 @@ async function main() {
       const manifestPath = rest.find((a) => !a.startsWith("--"))
       const pubkeyPath = arg("pubkey")
       if (!manifestPath || !pubkeyPath)
-        die("usage: sakra policy-encrypt <manifest.json> --pubkey <public.key>")
+        die("usage: intyga policy-encrypt <manifest.json> --pubkey <public.key>")
       const plaintext = fs.readFileSync(manifestPath, "utf8")
       JSON.parse(plaintext) // fail fast on invalid JSON
       const pub = fs.readFileSync(pubkeyPath, "utf8").trim()
@@ -376,7 +432,9 @@ async function main() {
       const result = { encryptedBlob: blob, blobHash: blobHash(blob) }
       if (out) {
         fs.writeFileSync(out, JSON.stringify(result, null, 2))
-        console.log(`wrote ${out} (encryptedBlob + blobHash) — publish these; SÄKRA never sees the plaintext`)
+        console.log(
+          `wrote ${out} (encryptedBlob + blobHash) — publish these; Intyga never sees the plaintext`,
+        )
       } else {
         console.log(JSON.stringify(result, null, 2))
       }
@@ -384,7 +442,7 @@ async function main() {
     }
     case "login": {
       const did = arg("did")
-      if (!did) die("usage: sakra login --did <did> [--gateway <url>]")
+      if (!did) die("usage: intyga login --did <did> [--gateway <url>]")
 
       console.log(`Initiating passwordless OIDC login challenge for ${did}...`)
       const reqRes = await fetch(`${gatewayUrl}/cli/login`, {
@@ -400,7 +458,7 @@ async function main() {
       const { nonce } = (await reqRes.json()) as { nonce: string }
       console.log(`\n------------------------------------------------------------`)
       console.log(`Challenge Nonce: ${nonce}`)
-      console.log(`PLEASE APPROVE this login in your SÄKRA Wallet or Console.`)
+      console.log(`PLEASE APPROVE this login in your Intyga Wallet or Console.`)
       console.log(`------------------------------------------------------------\n`)
 
       console.log("Polling for biometric wallet signature...")
@@ -420,7 +478,7 @@ async function main() {
           }
           if (checkData.status === "APPROVED" && checkData.token) {
             saveStoredToken(gatewayUrl, checkData.token)
-            console.log("🎉 Successfully authenticated! Token saved to ~/.sakra/credentials.json.")
+            console.log("🎉 Successfully authenticated! Token saved to ~/.intyga/credentials.json.")
             return
           } else if (checkData.status === "DENIED" || checkData.status === "EXPIRED") {
             die(`Login request was ${checkData.status.toLowerCase()}.`)
@@ -434,18 +492,18 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: sakra authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
+          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
         )
       const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
       const params = parseParamsArg()
       const target = arg("target") ?? ""
       if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
 
-      const client = new SakraClient({
+      const client = new IntygaClient({
         gatewayUrl,
-        token: arg("token") ?? process.env.SAKRA_TOKEN,
-        clientId: arg("client-id") ?? process.env.SAKRA_CLIENT_ID,
-        clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
+        token: arg("token") ?? process.env.INTYGA_TOKEN,
+        clientId: arg("client-id") ?? process.env.INTYGA_CLIENT_ID,
+        clientSecret: arg("client-secret") ?? process.env.INTYGA_CLIENT_SECRET,
         allowStoredCredentials: true,
       })
 
@@ -458,7 +516,7 @@ async function main() {
         timeout: timeoutSec,
       })
 
-      const webUrl = arg("web") || process.env.SAKRA_APP_URL || "http://localhost:3999"
+      const webUrl = arg("web") || process.env.INTYGA_APP_URL || "http://localhost:3999"
       const approvalUrl = `${webUrl.replace(/\/+$/, "")}/approve?nonce=${nonce}`
 
       // Machine-readable so a CI runner can grab the deep-link and notify the approver's chat tool.
@@ -473,7 +531,7 @@ async function main() {
       }
 
       // --no-wait: create the challenge and hand back the deep-link immediately (don't block). The caller
-      // sends the interactive notification, then blocks separately with `sakra await <nonce>`.
+      // sends the interactive notification, then blocks separately with `intyga await <nonce>`.
       if (process.argv.indexOf("--no-wait") >= 0) {
         printApprovalBanner()
         console.log(JSON.stringify({ nonce, approvalUrl }))
@@ -515,16 +573,16 @@ async function main() {
       const nonce = rest.find((a) => !a.startsWith("--"))
       if (!nonce)
         die(
-          "usage: sakra await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
+          "usage: intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
         )
       const { timeoutMs } = parseTimeout(arg("timeout"))
       const target = arg("target") ?? ""
       if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
-      const client = new SakraClient({
+      const client = new IntygaClient({
         gatewayUrl,
-        token: arg("token") ?? process.env.SAKRA_TOKEN,
-        clientId: arg("client-id") ?? process.env.SAKRA_CLIENT_ID,
-        clientSecret: arg("client-secret") ?? process.env.SAKRA_CLIENT_SECRET,
+        token: arg("token") ?? process.env.INTYGA_TOKEN,
+        clientId: arg("client-id") ?? process.env.INTYGA_CLIENT_ID,
+        clientSecret: arg("client-secret") ?? process.env.INTYGA_CLIENT_SECRET,
         allowStoredCredentials: true,
       })
       await pollVerifyConsume(
@@ -543,22 +601,22 @@ async function main() {
       const approvalUrl = arg("url")
       if (!approvalUrl)
         die(
-          'usage: sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
+          'usage: intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
         )
       await postNotifications({
         approvalUrl,
         context: arg("context") ?? "A high-risk action requires human approval.",
         code: arg("code"),
-        slack: arg("slack") ?? process.env.SAKRA_SLACK_WEBHOOK,
-        teams: arg("teams") ?? process.env.SAKRA_TEAMS_WEBHOOK,
+        slack: arg("slack") ?? process.env.INTYGA_SLACK_WEBHOOK,
+        teams: arg("teams") ?? process.env.INTYGA_TEAMS_WEBHOOK,
       })
       console.log("notification sent (best-effort).")
       return
     }
     case "verify": {
       const hash = rest.find((a) => !a.startsWith("--"))
-      if (!hash) die("usage: sakra verify <documentHash> --gateway <url>")
-      const client = new SakraClient({ gatewayUrl })
+      if (!hash) die("usage: intyga verify <documentHash> --gateway <url>")
+      const client = new IntygaClient({ gatewayUrl })
       console.log(JSON.stringify(await client.verify(hash), null, 2))
       return
     }
@@ -567,29 +625,27 @@ async function main() {
       // Offline, no-secret verification of an audit inclusion proof exported from the dashboard.
       // For a trustworthy verdict, supply the daily root from an independent source: --root <hex>
       // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
-      // a checkout of the sakra-trust/ledger repo). Without one, the bundle is only checked against its
+      // a checkout of the intyga-dev/ledger repo). Without one, the bundle is only checked against its
       // own asserted root. Exit code 0 = verified, 1 = not.
-      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND, EVIDENCE_BUNDLE_KIND_ALIASES } =
-        await import("@sakra-trust/verify")
+      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND } = await import("@intyga/verify")
       const bundlePath = rest.find((a) => !a.startsWith("--"))
       if (!bundlePath)
         die(
-          "usage: sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
+          "usage: intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
             "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--json]",
         )
 
-      let bundle: import("@sakra-trust/verify").ProofBundle
+      let bundle: import("@intyga/verify").ProofBundle
       try {
-        bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8")) as import("@sakra-trust/verify").ProofBundle
+        bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8")) as import("@intyga/verify").ProofBundle
       } catch (err) {
         die(`cannot read bundle: ${err instanceof Error ? err.message : String(err)}`)
       }
 
-      // Multi-entry evidence bundle (date-range export): its own verifier + report shape. Accept the
-      // canonical dewp.* kind and its legacy sakra.* alias (DEWP §6.5).
+      // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
       const bundleKind = (bundle as { kind?: string }).kind
-      if (bundleKind === EVIDENCE_BUNDLE_KIND || EVIDENCE_BUNDLE_KIND_ALIASES.includes(bundleKind as never)) {
-        const evidence = bundle as unknown as import("@sakra-trust/verify").EvidenceBundle
+      if (bundleKind === EVIDENCE_BUNDLE_KIND) {
+        const evidence = bundle as unknown as import("@intyga/verify").EvidenceBundle
         const root = arg("root")
         const rootArgs = root ? [root] : undefined
         const result = verifyEvidenceBundle(evidence, {
@@ -600,7 +656,7 @@ async function main() {
           process.exit(result.ok ? 0 : 1)
         }
         console.log(
-          `SÄKRA evidence bundle — ${result.total} entries (${evidence.range.from} → ${evidence.range.to})`,
+          `Intyga evidence bundle — ${result.total} entries (${evidence.range.from} → ${evidence.range.to})`,
         )
         console.log(`  content-verified  ${result.contentVerified}`)
         console.log(
@@ -627,6 +683,7 @@ async function main() {
         arg("trusted-issuer"),
         arg("anchor-keys"),
         arg("require-anchors"),
+        arg("rekor-key"),
       )
       const result = verifyBundle(bundle, { trustedRoot, ...anchorOpts })
 
@@ -637,7 +694,7 @@ async function main() {
       const c = result.checks
       const m = (x: { pass: boolean | null }) =>
         x.pass === true ? "PASS" : x.pass === false ? "FAIL" : "n/a "
-      console.log(`SÄKRA inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`)
+      console.log(`Intyga inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`)
       console.log(`  root source     ${result.rootSource}`)
       console.log(`  [${m(c.inclusion)}] inclusion       ${c.inclusion.detail}`)
       console.log(`  [${m(c.rootConsistency)}] root match      ${c.rootConsistency.detail}`)
@@ -659,18 +716,29 @@ async function main() {
     default:
       console.log(
         [
-          "SÄKRA CLI",
+          "Intyga CLI",
           "",
           "Commands:",
-          "  sakra keygen [--out <prefix>]",
-          "  sakra policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
-          "  sakra login --did <did> [--gateway <url>]",
-          '  sakra authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
-          "  sakra await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
-          '  sakra notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
-          "  sakra verify <documentHash> --gateway <url>",
-          "  sakra audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>]",
-          "                     [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--json]",
+          "  intyga keygen [--out <prefix>]",
+          "  intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
+          "  intyga login --did <did> [--gateway <url>]",
+          '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
+          "  intyga await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
+          "",
+          "  `authorize` and `await` verify the approval receipt offline and REQUIRE the approver keys",
+          "  you trust — the receipt's own key is never used, or it would vouch for its own signer:",
+          "    --approver-key <base64>   repeatable; base64 SPKI (raw P-256) or base64 COSE (passkey)",
+          "    INTYGA_APPROVER_KEYS      comma-separated, same values",
+          '  intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
+          "  intyga verify <documentHash> --gateway <url>",
+          "  intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>]",
+          "                     [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>]",
+          "                     [--rekor-key <sigstore-log-key.pem>] [--json]",
+          "",
+          "  A Rekor anchor is checked against Sigstore's LOG key (--rekor-key), not --anchor-keys:",
+          "  it carries no DEWP signature, only its Signed Entry Timestamp. Without that key it",
+          "  cannot be verified and does NOT count toward quorum. Take the key from Sigstore's TUF",
+          "  root — never from the bundle you are checking.",
         ].join("\n"),
       )
       process.exit(cmd ? 1 : 0)

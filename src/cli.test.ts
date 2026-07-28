@@ -17,13 +17,13 @@ function run(args: string[]) {
 test("no command prints help and exits 0", () => {
   const r = run([])
   assert.equal(r.status, 0)
-  assert.match(r.stdout, /SÄKRA CLI/)
+  assert.match(r.stdout, /Intyga CLI/)
 })
 
 test("unknown command prints help and exits 1", () => {
   const r = run(["unknown-command"])
   assert.equal(r.status, 1)
-  assert.match(r.stdout, /SÄKRA CLI/)
+  assert.match(r.stdout, /Intyga CLI/)
 })
 
 test("keygen prints org keypair and exits 0", () => {
@@ -34,7 +34,7 @@ test("keygen prints org keypair and exits 0", () => {
 })
 
 test("keygen --out writes key files and exits 0", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sakra-keygen-test-"))
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-keygen-test-"))
   const prefix = path.join(tmp, "org")
   try {
     const r = run(["keygen", "--out", prefix])
@@ -49,31 +49,31 @@ test("keygen --out writes key files and exits 0", () => {
 test("policy-encrypt without args exits non-zero", () => {
   const r = run(["policy-encrypt"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra policy-encrypt/)
+  assert.match(r.stderr, /usage: intyga policy-encrypt/)
 })
 
 test("login without --did exits non-zero", () => {
   const r = run(["login"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra login/)
+  assert.match(r.stderr, /usage: intyga login/)
 })
 
 test("verify without hash exits non-zero", () => {
   const r = run(["verify"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra verify/)
+  assert.match(r.stderr, /usage: intyga verify/)
 })
 
 test("audit-verify without bundle exits non-zero", () => {
   const r = run(["audit-verify"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra audit-verify/)
+  assert.match(r.stderr, /usage: intyga audit-verify/)
 })
 
 test("authorize without an action description exits non-zero", () => {
   const r = run(["authorize"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra authorize/)
+  assert.match(r.stderr, /usage: intyga authorize/)
 })
 
 test("authorize with invalid --params JSON exits non-zero", () => {
@@ -113,13 +113,13 @@ for (const bad of ["null", "[1,2]", "42", '"hello"']) {
 test("await without a nonce exits non-zero", () => {
   const r = run(["await"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra await/)
+  assert.match(r.stderr, /usage: intyga await/)
 })
 
 test("notify without --url exits non-zero", () => {
   const r = run(["notify", "--context", "x"])
   assert.notEqual(r.status, 0)
-  assert.match(r.stderr, /usage: sakra notify/)
+  assert.match(r.stderr, /usage: intyga notify/)
 })
 
 for (const badTimeout of ["abc", "-10", "0"]) {
