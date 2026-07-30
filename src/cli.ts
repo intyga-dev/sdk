@@ -467,9 +467,18 @@ async function main() {
         die(`Failed to request login challenge: ${reqRes.status} - ${await reqRes.text()}`)
       }
 
-      const { nonce } = (await reqRes.json()) as { nonce: string }
+      // `pollSecret` is what authorises collecting the token; the gateway returns it exactly once,
+      // here, and stores only its hash. Never print it — the nonce below is a correlation id and is
+      // safe on screen, but this value is a bearer credential for the next two minutes.
+      const { nonce, pollSecret } = (await reqRes.json()) as { nonce: string; pollSecret?: string }
+      if (!pollSecret) {
+        die(
+          "This gateway did not issue a poll secret. It is running a build from before CLI login was " +
+            "bound to the initiating process; upgrade the gateway, or upgrade this CLI to match it.",
+        )
+      }
       console.log(`\n------------------------------------------------------------`)
-      console.log(`Challenge Nonce: ${nonce}`)
+      console.log(`Challenge: ${nonce.slice(0, 8)}…`)
       console.log(`PLEASE APPROVE this login in your Intyga Wallet or Console.`)
       console.log(`------------------------------------------------------------\n`)
 
@@ -482,7 +491,11 @@ async function main() {
         await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
         attempts++
 
-        const checkRes = await fetch(`${gatewayUrl}/cli/login/${nonce}`)
+        // Bearer header, not a query parameter: the gateway's access log redacts the authorization
+        // header, and a secret in a URL is a secret in every log and proxy along the path.
+        const checkRes = await fetch(`${gatewayUrl}/cli/login/${nonce}`, {
+          headers: { authorization: `Bearer ${pollSecret}` },
+        })
         if (checkRes.ok) {
           const checkData = (await checkRes.json()) as {
             status: string
