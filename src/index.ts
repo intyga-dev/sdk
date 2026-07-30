@@ -12,8 +12,46 @@ export {
   verifyEcdsaP256,
 } from "@intyga/verify"
 export * as policy from "./policy.js"
+export {
+  assembleOfflineReceipt,
+  CHALLENGE_ENVELOPE_PREFIX,
+  clearPendingApproval,
+  createOfflineChallenge,
+  decodeChallengeEnvelope,
+  decodeSignatureEnvelope,
+  DEFAULT_OFFLINE_WINDOW_MINUTES,
+  encodeSignatureEnvelope,
+  FileRedemptionStore,
+  type OfflineApprovalOptions,
+  type OfflineApprovalResult,
+  type OfflineChallenge,
+  type PendingApproval,
+  pendingApprovals,
+  type RedemptionStore,
+  SIGNATURE_ENVELOPE_PREFIX,
+  useOfflineApproval,
+} from "./offline.js"
+export {
+  approverAnchor,
+  type BundleApprover,
+  type BundlePolicy,
+  DIV_TRUST_BUNDLE_TYPE,
+  loadTrustBundle,
+  MAX_TRUST_BUNDLE_AGE_DAYS,
+  requirementFor,
+  saveTrustBundle,
+  type TrustBundle,
+  type TrustBundleFiles,
+  verifyTrustBundle,
+} from "./trust-bundle.js"
 
 import type { ApprovalReceipt } from "@intyga/verify"
+import {
+  clearPendingApproval,
+  type OfflineApprovalOptions,
+  pendingApprovals,
+  useOfflineApproval,
+} from "./offline.js"
 
 export interface IntygaClientOptions {
   gatewayUrl: string
@@ -30,7 +68,21 @@ export interface IntygaClientOptions {
  * gateway, and this is how you observe it without calling /authorize/verify. Treat it as not
  * authorized: only APPROVED permits execution.
  */
-export type ApprovalStatus = "APPROVED" | "CONSUMED" | "DENIED" | "EXPIRED" | "PENDING"
+export type ApprovalStatus =
+  | "APPROVED"
+  | "CONSUMED"
+  | "DENIED"
+  | "EXPIRED"
+  | "PENDING"
+  /**
+   * An OFFLINE APPROVAL authorized this — real human signatures, collected out of band at incident
+   * time because the gateway could not be reached (docs/DIV.md §5a).
+   *
+   * Deliberately NOT "APPROVED". The usual caller guard is `if (r.status !== "APPROVED") throw`, so a
+   * distinct status means adding offline approval to an existing service cannot silently start
+   * permitting things — handling it has to be a conscious code change at the call site.
+   */
+  | "OFFLINE_APPROVED"
 
 export interface ApprovalResult {
   status: ApprovalStatus
@@ -200,18 +252,56 @@ export class IntygaClient {
    */
   async requireApproval(
     actionDescription: string,
-    opts: AuthorizeOptions & { timeoutMs?: number; intervalMs?: number },
+    opts: AuthorizeOptions & {
+      timeoutMs?: number
+      intervalMs?: number
+      /**
+       * Opt in to the OFFLINE APPROVAL fallback for THIS call (docs/DIV.md §5a).
+       *
+       * Omitted means no fallback, ever. Pass it only at the specific call sites permitted to run
+       * under an offline approval — a process-wide default would make every gated action in the
+       * service accept an out-of-band approval, which is the difference between an emergency
+       * mechanism and a hole.
+       */
+      offline?: OfflineApprovalOptions
+    },
   ): Promise<ApprovalResult> {
     // One source of truth for the wait window: the local deadline and the backend TTL must agree, or we
     // either abandon a still-live challenge (returning a false EXPIRED after the human already approved)
     // or keep polling a nonce the gateway has already dropped. `!= null` so `timeout: 0` isn't swallowed.
     const timeoutMs = opts.timeoutMs ?? (opts.timeout != null ? opts.timeout * 1000 : 120_000)
-    const { nonce } = await this.authorize(actionDescription, {
-      target: opts.target,
-      actionType: opts.actionType,
-      params: opts.params,
-      timeout: Math.ceil(timeoutMs / 1000),
-    })
+
+    // The fallback is reachable ONLY from a transport failure. Every other outcome below returns
+    // normally: a DENIED or EXPIRED result means a human was reached and did not approve, and letting
+    // an out-of-band approval override that would be worse than having no gate at all.
+    const tryOffline = async (cause: string): Promise<ApprovalResult> => {
+      if (!opts.offline) throw new Error(cause)
+      const offline = await useOfflineApproval(
+        {
+          target: opts.target,
+          actionType: opts.actionType ?? "",
+          display: actionDescription,
+          params: opts.params ?? {},
+        },
+        opts.offline,
+      )
+      if (!offline.ok)
+        throw new Error(`${cause} — and the offline approval did not complete: ${offline.reason}`)
+      return { status: "OFFLINE_APPROVED", receipt: offline.receipt, nonce: offline.nonce }
+    }
+
+    let nonce: string
+    try {
+      ;({ nonce } = await this.authorize(actionDescription, {
+        target: opts.target,
+        actionType: opts.actionType,
+        params: opts.params,
+        timeout: Math.ceil(timeoutMs / 1000),
+      }))
+    } catch (err) {
+      // Could not even raise the challenge — the clearest "gateway is unreachable" signal there is.
+      return tryOffline(`could not reach Intyga to request approval: ${(err as Error).message}`)
+    }
     const deadline = Date.now() + timeoutMs
     const interval = opts.intervalMs ?? 2_000
     let consecutiveErrors = 0
@@ -225,12 +315,65 @@ export class IntygaClient {
       } catch (err: unknown) {
         if (++consecutiveErrors >= MAX_POLL_ERRORS) {
           const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`)
+          // The gateway went away mid-wait. Same situation as failing to raise the challenge, so the
+          // same fallback applies — and, as there, only because we could not ASK, not because we were
+          // told no.
+          return tryOffline(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`)
         }
       }
       if (Date.now() > deadline) return { status: "EXPIRED", nonce }
       await new Promise((resolve) => setTimeout(resolve, interval))
     }
+  }
+
+  /**
+   * Report offline approvals that happened while the gateway was unreachable (DIV §5a.7).
+   *
+   * Call this on reconnect — a scheduled retry, a health-check hook, or service start. Until an
+   * approval is reported it exists only on the relying party's disk, and an unreported approval is
+   * indistinguishable from an unauthorized action.
+   *
+   * A buffered record is cleared ONLY on a definite acknowledgement. A network failure leaves it
+   * queued for the next attempt rather than silently discarding the evidence.
+   */
+  async reconcileOfflineApprovals(
+    opts: Pick<OfflineApprovalOptions, "bundleDir" | "bufferDir">,
+  ): Promise<{ reported: number; failed: number; reasons: string[] }> {
+    const token = await this.token()
+    const reasons: string[] = []
+    let reported = 0
+    let failed = 0
+
+    for (const use of pendingApprovals(opts)) {
+      try {
+        const res = await fetch(`${this.opts.gatewayUrl}/offline-approval/reconcile`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            nonce: use.nonce,
+            usedAt: use.usedAt,
+            target: use.target,
+            actionType: use.actionType,
+            display: use.display,
+            // The full receipt travels with the report so the gateway can RE-VERIFY the approval
+            // rather than take the reporter's word for it — we are reporting on ourselves.
+            receipt: use.receipt,
+            delegationNonce: use.delegationNonce,
+          }),
+        })
+        if (res.ok) {
+          clearPendingApproval(use.nonce, opts)
+          reported++
+        } else {
+          failed++
+          reasons.push(`${use.nonce}: ${res.status} ${await res.text()}`)
+        }
+      } catch (err) {
+        failed++
+        reasons.push(`${use.nonce}: ${(err as Error).message}`)
+      }
+    }
+    return { reported, failed, reasons }
   }
 
   /** Public witness lookup: has this document hash been signed, by whom, and when? */

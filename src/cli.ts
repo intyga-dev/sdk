@@ -3,6 +3,12 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 // Paths come from the SDK so this writer and the `token()` reader can never drift apart.
 import { type ApprovalResult, CREDENTIALS_FILE, INTYGA_DIR, IntygaClient } from "./index.js"
+import {
+  decodeChallengeEnvelope,
+  encodeSignatureEnvelope,
+  loadTrustBundle,
+  saveTrustBundle,
+} from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 
 function arg(name: string): string | undefined {
@@ -249,7 +255,7 @@ async function pollVerifyConsume(
   onPending?: () => void,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  // Peek once before blocking: if policy already resolved it (Discovery Mode / break-glass / pre-approval)
+  // Peek once before blocking: if policy already resolved it (Discovery Mode / pre-approval window)
   // there is nothing for a human to do — skip opening the browser and the "waiting" spinner entirely.
   let result: ApprovalResult | null = await client.status(nonce)
   if (result.status === "PENDING") {
@@ -287,12 +293,12 @@ async function pollVerifyConsume(
   // The payload is always checked first, so a tampered action still fails here regardless of mode.
   if (!v.ok && !v.autoApproved) die(`Offline verification FAILED: ${v.reason}`)
   if (v.autoApproved) {
-    // Policy let this through with NO human signature — Discovery Mode (observe-only) or a break-glass /
+    // Policy let this through with NO human signature — Discovery Mode (observe-only) or a
     // pre-approval window. The action is recorded and governed, but was NOT signed by a human. We proceed
     // (that is the point of observe-mode) but say so loudly so it never reads as a real approval.
     console.log(
       "\x1b[33m%s\x1b[0m",
-      `⚠ Policy-approved without a human signature — Discovery Mode or a break-glass window.`,
+      `⚠ Policy-approved without a human signature — Discovery Mode or a pre-approval window.`,
     )
     console.log(
       "\x1b[33m%s\x1b[0m",
@@ -539,7 +545,7 @@ async function main() {
       }
 
       // Show the approval banner + open the browser ONLY when a human actually needs to sign. In Discovery
-      // Mode (and break-glass / pre-approval windows) the request is already resolved, so we skip both —
+      // Mode (and pre-approval windows) the request is already resolved, so we skip both —
       // pollVerifyConsume invokes this callback only when the challenge is still PENDING.
       const onPending = () => {
         printApprovalBanner()
@@ -713,6 +719,139 @@ async function main() {
       console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m")
       process.exit(result.ok ? 0 : 1)
     }
+    // biome-ignore lint/suspicious/noFallthroughSwitchClause: every exit from this case is a process.exit()/die() (type `never`), so control never reaches `default:`; Biome does not type-analyze.
+    case "sign": {
+      // OFFLINE APPROVER TOOL (docs/DIV.md §5a). Runs with no network, by design: this is what an
+      // approver uses while the gateway is unreachable.
+      //
+      // It refuses anything that is not a `div-offline-intent` challenge. That matters: signing an
+      // ORDINARY intent payload here would mint a live approval outside the gateway's single-use
+      // accounting, and signing a delegation would hand over approval authority. Both are things an
+      // approver could be tricked into if this tool signed whatever it was handed.
+      const envelope = rest.find((a) => !a.startsWith("--")) ?? process.env.INTYGA_CHALLENGE
+      const keyPath = arg("key")
+      const did = arg("did")
+      if (!envelope || !keyPath || !did)
+        die(
+          "usage: intyga sign <DIV1:...> --key <private.pem|private.der> --did <your-did> [--yes]\n" +
+            "  Reads the challenge, shows you the action, and prints a SIG1: envelope to send back.\n" +
+            "  Works entirely offline — no gateway, no network.",
+        )
+
+      const decoded = decodeChallengeEnvelope(envelope)
+      if (!decoded.ok || !decoded.challenge) die(decoded.reason ?? "unreadable challenge")
+      const c = decoded.challenge
+
+      // Show the human what they are authorizing, in full. An approver who signs an opaque blob has
+      // not approved anything (DIV §5a.8), so this output is a security control, not decoration.
+      const expiresIn = Math.round((Date.parse(c.expiresAt) - Date.now()) / 1000)
+      console.log("")
+      console.log("\x1b[1mOFFLINE APPROVAL REQUEST\x1b[0m")
+      console.log("")
+      console.log(`  Action     ${c.display}`)
+      console.log(`  Type       ${c.actionType}`)
+      console.log(`  Target     ${c.target}`)
+      console.log(`  Params     ${JSON.stringify(c.params)}`)
+      console.log(`  Requested  ${c.requester?.did ?? "(unknown)"}`)
+      console.log(`  Quorum     ${c.requirement?.requiredApprovals ?? "?"} approver(s) required`)
+      console.log(`  Expires    ${c.expiresAt}  (${expiresIn}s from now)`)
+      console.log("")
+      console.log(`  \x1b[1mVerification code: ${c.verificationCode}\x1b[0m`)
+      console.log("  Read this back to the operator. If it does not match their screen, STOP.")
+      console.log("")
+      if (expiresIn <= 0) die("this challenge has already expired — ask for a fresh one")
+
+      if (arg("yes") === undefined && !process.argv.includes("--yes")) {
+        // Interactive confirmation on purpose. The whole value of this mechanism is that a human looks
+        // at the actual incident, so the default path makes them type something.
+        const answer = await new Promise<string>((resolve) => {
+          process.stdout.write("Sign this approval? [y/N] ")
+          process.stdin.setEncoding("utf8")
+          process.stdin.once("data", (d) => resolve(String(d).trim().toLowerCase()))
+        })
+        if (answer !== "y" && answer !== "yes") {
+          console.log("Not signed.")
+          process.exit(1)
+        }
+      }
+
+      const raw = fs.readFileSync(keyPath)
+      let privateKey: crypto.KeyObject
+      try {
+        // Accept a PEM or a raw DER PKCS#8 — an approver's key comes from wherever they keep it.
+        privateKey = raw.includes("-----BEGIN")
+          ? crypto.createPrivateKey(raw.toString("utf8"))
+          : crypto.createPrivateKey({ key: raw, format: "der", type: "pkcs8" })
+      } catch (err) {
+        die(`could not read the private key: ${(err as Error).message}`)
+      }
+      const signature = crypto
+        .sign("sha256", Buffer.from(c.canonicalPayload, "utf8"), {
+          key: privateKey,
+          dsaEncoding: "ieee-p1363",
+        })
+        .toString("base64")
+      // Derived via PEM rather than by passing the private KeyObject straight in: createPublicKey
+      // accepts one at runtime, but @types/node does not declare that overload.
+      const publicKey = crypto
+        .createPublicKey(privateKey.export({ format: "pem", type: "pkcs8" }) as string)
+        .export({ format: "der", type: "spki" })
+        .toString("base64")
+
+      console.log("")
+      console.log("Send this back to the operator:")
+      console.log("")
+      console.log(
+        encodeSignatureEnvelope({
+          signerDid: did,
+          signerPublicKey: publicKey,
+          signature,
+          sigAlg: "ES256",
+        }),
+      )
+      console.log("")
+      process.exit(0)
+    }
+    // biome-ignore lint/suspicious/noFallthroughSwitchClause: every exit from this case is a process.exit()/die() (type `never`), so control never reaches `default:`; Biome does not type-analyze.
+    case "trust-bundle": {
+      // Export (online) or inspect (offline) the trust bundle that makes offline approval possible.
+      const sub = rest.find((a) => !a.startsWith("--"))
+      const dir = arg("dir") ?? ".intyga-offline"
+      if (sub === "export") {
+        const token = arg("token") ?? process.env.INTYGA_METRICS_TOKEN
+        const tenantId = arg("tenant")
+        if (!token || !tenantId)
+          die(
+            "usage: intyga trust-bundle export --tenant <uuid> --token <internal-token> [--dir <dir>] [--gateway <url>]",
+          )
+        const res = await fetch(`${gatewayUrl}/trust-bundle/export`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ tenantId }),
+        })
+        const out = (await res.json()) as {
+          ok?: boolean
+          reason?: string
+          jws?: string
+          gatewayJwk?: JsonWebKey
+        }
+        if (!res.ok || !out.ok || !out.jws || !out.gatewayJwk)
+          die(out.reason ?? `export failed (${res.status})`)
+        saveTrustBundle(dir, { jws: out.jws, gatewayJwk: out.gatewayJwk })
+        console.log(`wrote ${dir}/trust-bundle.jws and ${dir}/gateway-key.jwk.json`)
+        console.log(
+          "Keep these where your service can read them BEFORE an outage — it cannot fetch them during one.",
+        )
+        process.exit(0)
+      }
+      if (sub === "show") {
+        const loaded = loadTrustBundle(dir)
+        if (!loaded.ok || !loaded.bundle) die(loaded.reason ?? "could not load the bundle")
+        console.log(JSON.stringify(loaded.bundle, null, 2))
+        process.exit(0)
+      }
+      die("usage: intyga trust-bundle <export|show> [--dir <dir>]")
+    }
     default:
       console.log(
         [
@@ -731,6 +870,16 @@ async function main() {
           "    INTYGA_APPROVER_KEYS      comma-separated, same values",
           '  intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
           "  intyga verify <documentHash> --gateway <url>",
+          "",
+          "  Offline approval (docs/DIV.md §5a) — for when the gateway is unreachable:",
+          "  intyga trust-bundle export --tenant <uuid> --token <internal> [--dir <dir>] [--gateway <url>]",
+          "  intyga trust-bundle show [--dir <dir>]",
+          "  intyga sign <DIV1:...> --key <private.pem> --did <your-did> [--yes]",
+          "",
+          "  `trust-bundle export` is run BEFORE an outage: it stores your approvers' public keys and",
+          "  the approval policy, signed, so a service can verify offline. `sign` is run DURING one, by",
+          "  an approver, with no network at all — it shows the action and a verification code you must",
+          "  read back to the operator before signing.",
           "  intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>]",
           "                     [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>]",
           "                     [--rekor-key <sigstore-log-key.pem>] [--json]",
