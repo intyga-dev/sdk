@@ -31,6 +31,7 @@
 import crypto from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
+import { createPrivateMarker, ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import {
   type ApprovalReceipt,
   type ApprovalRequirementAttestation,
@@ -321,7 +322,7 @@ export interface RedemptionStore {
  */
 export class FileRedemptionStore implements RedemptionStore {
   constructor(private readonly dir: string) {
-    fs.mkdirSync(dir, { recursive: true })
+    ensurePrivateDir(dir)
   }
 
   redeem(nonce: string): boolean {
@@ -329,8 +330,7 @@ export class FileRedemptionStore implements RedemptionStore {
     // could traverse out of the directory rather than trusting the upstream shape.
     if (!/^[A-Za-z0-9._-]{1,200}$/.test(nonce)) return false
     try {
-      fs.writeFileSync(path.join(this.dir, `${nonce}.used`), new Date().toISOString(), { flag: "wx" })
-      return true
+      return createPrivateMarker(path.join(this.dir, `${nonce}.used`), new Date().toISOString())
     } catch {
       return false
     }
@@ -564,8 +564,8 @@ function bufferForReconciliation(
     delegationNonce: delegation?.nonce,
   }
   try {
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(path.join(dir, `${challenge.nonce}.json`), `${JSON.stringify(record, null, 2)}\n`)
+    ensurePrivateDir(dir)
+    writePrivateFile(path.join(dir, `${challenge.nonce}.json`), `${JSON.stringify(record, null, 2)}\n`)
   } catch (err) {
     ;(opts.warn ?? ((m: string) => console.error(m)))(
       `⚠ OFFLINE APPROVAL: could not buffer ${challenge.nonce} for reconciliation (${(err as Error).message}). ` +

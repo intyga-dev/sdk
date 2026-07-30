@@ -17,6 +17,7 @@
 import crypto from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
+import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import type { ApproverTrustAnchor, ApprovalRequirementAttestation } from "@intyga/verify"
 
 /** Bundle `type` discriminator, inside the signed JWS payload. */
@@ -157,9 +158,9 @@ export function verifyTrustBundle(
 
 /** Write a bundle and its pinned verification key into `dir`, for use during a later outage. */
 export function saveTrustBundle(dir: string, files: TrustBundleFiles): void {
-  fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, BUNDLE_FILE), files.jws)
-  fs.writeFileSync(path.join(dir, KEY_FILE), `${JSON.stringify(files.gatewayJwk, null, 2)}\n`)
+  ensurePrivateDir(dir)
+  writePrivateFile(path.join(dir, BUNDLE_FILE), files.jws)
+  writePrivateFile(path.join(dir, KEY_FILE), `${JSON.stringify(files.gatewayJwk, null, 2)}\n`)
 }
 
 /**

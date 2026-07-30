@@ -26,11 +26,10 @@ test("unknown command prints help and exits 1", () => {
   assert.match(r.stdout, /Intyga CLI/)
 })
 
-test("keygen prints org keypair and exits 0", () => {
+test("keygen refuses to print an organization private key", () => {
   const r = run(["keygen"])
-  assert.equal(r.status, 0)
-  assert.match(r.stdout, /publicKey/)
-  assert.match(r.stdout, /privateKey/)
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /--out <private-key-prefix>/)
 })
 
 test("keygen --out writes key files and exits 0", () => {
@@ -41,9 +40,24 @@ test("keygen --out writes key files and exits 0", () => {
     assert.equal(r.status, 0)
     assert.ok(fs.existsSync(`${prefix}.public.key`))
     assert.ok(fs.existsSync(`${prefix}.private.key`))
+    assert.equal(fs.statSync(tmp).mode & 0o777, 0o700)
+    assert.equal(fs.statSync(`${prefix}.private.key`).mode & 0o777, 0o600)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
+})
+
+test("trust-bundle export refuses an internal token passed on the command line", () => {
+  const r = run([
+    "trust-bundle",
+    "export",
+    "--tenant",
+    "00000000-0000-0000-0000-000000000000",
+    "--token",
+    "secret",
+  ])
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /--token is not accepted/)
 })
 
 test("policy-encrypt without args exits non-zero", () => {

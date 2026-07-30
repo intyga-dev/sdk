@@ -10,6 +10,7 @@ import {
   saveTrustBundle,
 } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
+import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
@@ -54,20 +55,30 @@ function parseTimeout(val: string | undefined): { timeoutSec?: number; timeoutMs
   return { timeoutSec: num, timeoutMs: Math.round(num * 1000) }
 }
 
-/** Best-effort permission tightening — `chmod` throws on Windows/exotic filesystems and must never
- *  break `intyga login`. The `mode` options on mkdir/writeFile are no-ops when the target already
- *  exists, so these calls are also what repairs a 0644 credentials file from an earlier install. */
-function restrictPermissions(target: string, mode: number) {
-  try {
-    fs.chmodSync(target, mode)
-  } catch {}
+/** Read a privileged internal token without leaking it into shell history/process listings. */
+function internalToken(): string {
+  if (arg("token"))
+    die(
+      "--token is not accepted for internal credentials; use INTYGA_INTERNAL_TOKEN, --token-file, or --token-stdin",
+    )
+  const file = arg("token-file")
+  const stdin = process.argv.includes("--token-stdin")
+  const env = process.env.INTYGA_INTERNAL_TOKEN
+  const sources = Number(Boolean(file)) + Number(stdin) + Number(Boolean(env))
+  if (sources !== 1) {
+    die("provide exactly one of INTYGA_INTERNAL_TOKEN, --token-file <0600 file>, or --token-stdin")
+  }
+  if (env) return env.trim()
+  if (stdin) return fs.readFileSync(0, "utf8").trim()
+  const stat = fs.lstatSync(file as string)
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+    die("--token-file must be a regular owner-only (0600) file")
+  }
+  return fs.readFileSync(file as string, "utf8").trim()
 }
 
 function saveStoredToken(gatewayUrl: string, token: string) {
-  if (!fs.existsSync(INTYGA_DIR)) {
-    fs.mkdirSync(INTYGA_DIR, { recursive: true, mode: 0o700 })
-  }
-  restrictPermissions(INTYGA_DIR, 0o700)
+  ensurePrivateDir(INTYGA_DIR)
   let data: Record<string, string> = {}
   if (fs.existsSync(CREDENTIALS_FILE)) {
     try {
@@ -76,8 +87,7 @@ function saveStoredToken(gatewayUrl: string, token: string) {
   }
   data[gatewayUrl] = token
   // This file holds a live bearer token — never leave it at the default umask (0644) on a shared host.
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 })
-  restrictPermissions(CREDENTIALS_FILE, 0o600)
+  writePrivateFile(CREDENTIALS_FILE, JSON.stringify(data, null, 2))
 }
 
 function _signPayload(privateKeyB64: string, payload: string): string {
@@ -410,19 +420,15 @@ async function main() {
 
   switch (cmd) {
     case "keygen": {
-      const kp = generateOrgKeypair()
       const out = arg("out")
-      if (out) {
-        fs.writeFileSync(`${out}.public.key`, kp.publicKey)
-        fs.writeFileSync(`${out}.private.key`, kp.privateKey)
-        console.log(`wrote ${out}.public.key and ${out}.private.key`)
-        console.log(
-          "Upload the PUBLIC key to Intyga. Keep the PRIVATE key off Intyga — it decrypts your policies.",
-        )
-      } else {
-        console.log(JSON.stringify(kp, null, 2))
-        console.error("\nKeep the private key secret — Intyga must never receive it.")
-      }
+      if (!out) die("usage: intyga keygen --out <private-key-prefix> (private keys are never printed)")
+      const kp = generateOrgKeypair()
+      writePrivateFile(`${out}.public.key`, kp.publicKey)
+      writePrivateFile(`${out}.private.key`, kp.privateKey)
+      console.log(`wrote ${out}.public.key and ${out}.private.key`)
+      console.log(
+        "Upload the PUBLIC key to Intyga. Keep the PRIVATE key off Intyga — it decrypts your policies.",
+      )
       return
     }
     case "policy-encrypt": {
@@ -818,12 +824,12 @@ async function main() {
       const sub = rest.find((a) => !a.startsWith("--"))
       const dir = arg("dir") ?? ".intyga-offline"
       if (sub === "export") {
-        const token = arg("token") ?? process.env.INTYGA_METRICS_TOKEN
         const tenantId = arg("tenant")
-        if (!token || !tenantId)
+        if (!tenantId)
           die(
-            "usage: intyga trust-bundle export --tenant <uuid> --token <internal-token> [--dir <dir>] [--gateway <url>]",
+            "usage: intyga trust-bundle export --tenant <uuid> (INTYGA_INTERNAL_TOKEN | --token-file <0600-file> | --token-stdin) [--dir <dir>] [--gateway <url>]",
           )
+        const token = internalToken()
         const res = await fetch(`${gatewayUrl}/trust-bundle/export`, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
@@ -858,7 +864,7 @@ async function main() {
           "Intyga CLI",
           "",
           "Commands:",
-          "  intyga keygen [--out <prefix>]",
+          "  intyga keygen --out <prefix>",
           "  intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
           "  intyga login --did <did> [--gateway <url>]",
           '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
@@ -872,7 +878,7 @@ async function main() {
           "  intyga verify <documentHash> --gateway <url>",
           "",
           "  Offline approval (docs/DIV.md §5a) — for when the gateway is unreachable:",
-          "  intyga trust-bundle export --tenant <uuid> --token <internal> [--dir <dir>] [--gateway <url>]",
+          "  intyga trust-bundle export --tenant <uuid> (INTYGA_INTERNAL_TOKEN | --token-file <0600-file> | --token-stdin) [--dir <dir>] [--gateway <url>]",
           "  intyga trust-bundle show [--dir <dir>]",
           "  intyga sign <DIV1:...> --key <private.pem> --did <your-did> [--yes]",
           "",
