@@ -137,6 +137,27 @@ export function createOfflineChallenge(input: {
   const expiresAt = new Date(now.getTime() + windowMinutes * 60_000).toISOString()
   const nonce = `off_${crypto.randomUUID()}`
 
+  // "Narrows who may approve, never the policy" has to be enforced, not merely intended. DIV §5a.5:
+  // a Delegation's requirement MUST be at least as strict as the ordinary requirement for the
+  // delegated action — "delegating authority is never the cheaper path".
+  //
+  // Without this the swap below silently *lowers* the quorum. §5a.6 step 2 compares only target,
+  // actionType and params, so `display` is free to differ between sealing and use — and `display` is
+  // what requirementFor matches on. A delegation sealed against a permissive rule ("routine cache
+  // restart" → 1-of-1) could then be presented against a strict one ("wire $1M" → 3-of-N), overwrite
+  // its quorum with 1, and verify perfectly: the signed requiredApprovals equals delegatedQuorum,
+  // exactly as §5a.6 step 3 requires. The gateway's max() at issuance checks the runbook's own label,
+  // not the policy the relying party holds and is about to apply.
+  if (input.delegation && input.delegation.delegatedQuorum < resolved.requirement.requiredApprovals) {
+    return {
+      ok: false,
+      reason:
+        `this delegation would lower the quorum for "${input.actionType}" from ` +
+        `${resolved.requirement.requiredApprovals} to ${input.delegation.delegatedQuorum}. A delegation ` +
+        `may narrow WHO approves, never HOW MANY (DIV §5a.5)`,
+    }
+  }
+
   // Under a delegation the eligible set and the quorum are the DELEGATED ones. Everything else in the
   // requirement still comes from the bundle: a delegation narrows who may approve, never the policy.
   const requirement: ApprovalRequirementAttestation = input.delegation

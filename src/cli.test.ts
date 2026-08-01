@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -167,3 +167,121 @@ for (const badTimeout of ["abc", "-10", "0"]) {
     assert.match(r.stderr, /Invalid --timeout value/)
   })
 }
+
+// ─── AUTO_APPROVED must not be accepted implicitly ───────────────────────────
+//
+// `sigAlg: "AUTO_APPROVED"` means policy let the action through with NO human signature. It is a
+// plain receipt field, not part of the signed bytes, and @intyga/verify deliberately returns
+// `{ ok: false, autoApproved: true }` for it so that `if (!ok) die` blocks unsigned approvals.
+//
+// The CLI used to read `if (!v.ok && !v.autoApproved) die(...)` and then proceed on the autoApproved
+// branch — inverting that refusal at every call site, with no flag to turn it off. Anything that
+// could answer the status poll could authorize any action, and no approver key was ever consulted:
+// a $1,000,000 wire with zero signatures against a signed 3-of-3 hardware-key requirement exited 0.
+
+test("authorize refuses an AUTO_APPROVED receipt by default, and accepts it only on opt-in", async () => {
+  const { canonicalIntentPayload, verificationCode } = (await import(
+    "../dist/index.js"
+  )) as typeof import("./index.ts")
+
+  const NONCE = "11111111-1111-1111-1111-111111111111"
+  const TARGET = "prod-payments"
+  const ACTION_TYPE = "wire_transfer"
+  const PARAMS = { amount: 1_000_000 }
+  const DISPLAY = "Wire $1,000,000 to Attacker"
+  const requester = { did: "did:intyga:agent:test", attestation: null }
+
+  const canonicalPayload = canonicalIntentPayload({
+    target: TARGET,
+    actionType: ACTION_TYPE,
+    display: DISPLAY,
+    params: PARAMS,
+    requester,
+    // The strictest requirement the product can express — and none of it was enforced.
+    requirement: {
+      requiredApprovals: 3,
+      requireHardwareKey: true,
+      allowedAaguids: [],
+      requesterCannotApprove: true,
+    },
+    nonce: NONCE,
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+  })
+
+  const receipt = {
+    canonicalPayload,
+    target: TARGET,
+    actionDescription: DISPLAY,
+    params: PARAMS,
+    requester,
+    sigAlg: "AUTO_APPROVED",
+    verificationCode: verificationCode(canonicalPayload),
+    signatures: [], // no human signed anything
+  }
+
+  const http = await import("node:http")
+  const server = http.createServer((req, res) => {
+    res.setHeader("content-type", "application/json")
+    req.resume()
+    if (req.url === "/authorize" && req.method === "POST") {
+      res.end(JSON.stringify({ nonce: NONCE, status: "PENDING" }))
+      return
+    }
+    if (req.url === "/authorize/verify") {
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    res.end(JSON.stringify({ status: "APPROVED", receipt }))
+  })
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r))
+  const { port } = server.address() as { port: number }
+
+  const baseArgs = [
+    "authorize",
+    DISPLAY,
+    "--gateway",
+    `http://127.0.0.1:${port}`,
+    "--target",
+    TARGET,
+    "--type",
+    ACTION_TYPE,
+    "--params",
+    JSON.stringify(PARAMS),
+    "--approver-key",
+    "AAAA", // never consulted on this path — that is the point
+    "--token",
+    "t",
+    "--no-open",
+  ]
+
+  // Async spawn, not the spawnSync `run` helper above: spawnSync blocks this process's event loop,
+  // so the stub gateway living in it could never answer and the CLI would hang until killed.
+  const runAsync = (args: string[]) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn("node", [cli, ...args], { encoding: "utf8" })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (d: Buffer) => {
+        stdout += d.toString()
+      })
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString()
+      })
+      child.on("error", reject)
+      child.on("close", (status) => resolve({ status, stdout, stderr }))
+    })
+
+  try {
+    const refused = await runAsync(baseArgs)
+    assert.notEqual(refused.status, 0, "an unsigned AUTO_APPROVED receipt was accepted")
+    assert.match(refused.stderr, /NO human signature/)
+    assert.doesNotMatch(refused.stdout, /CONSUMED/)
+
+    const optedIn = await runAsync([...baseArgs, "--allow-auto-approved"])
+    assert.equal(optedIn.status, 0, optedIn.stderr)
+    assert.match(optedIn.stdout, /without a human signature/)
+  } finally {
+    server.closeAllConnections()
+    server.close()
+  }
+})

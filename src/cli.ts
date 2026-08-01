@@ -46,6 +46,25 @@ function die(msg: string): never {
   process.exit(1)
 }
 
+/**
+ * Render a requester-controlled field for a human who is about to sign it.
+ *
+ * `display`, `actionType`, `target` and `requester.did` all come from whoever built the challenge.
+ * Interpolated raw into a terminal, a newline lets them print convincing extra lines above the real
+ * ones, and an ANSI cursor/erase sequence (`\x1b[A`, `\x1b[2K`) removes the real ones outright — so
+ * the approver reads one action and signs a different one. The signature still covers the true
+ * bytes, so the approval verifies perfectly at the relying party.
+ *
+ * That is precisely the outcome DIV §5a.8 says a compromised requester must not be able to reach:
+ * "it cannot obtain a signature over an action the Approvers decline". Stripping C0/C1 controls and
+ * capping length keeps this pane a faithful view of the signed payload.
+ */
+function approverSafe(value: string, max = 300): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
+  const stripped = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+  return stripped.length > max ? `${stripped.slice(0, max)}… (truncated, ${stripped.length} chars)` : stripped
+}
+
 function parseTimeout(val: string | undefined): { timeoutSec?: number; timeoutMs: number } {
   if (!val) return { timeoutMs: 120_000 }
   const num = Number(val)
@@ -179,32 +198,46 @@ async function buildAnchorOptions(
   }
 }
 
-/** Pick the published daily root that covers this proof's seq (or matches its anchorRef), from a JSONL
- *  roots file (e.g. a checkout of intyga-dev/ledger's roots/roots.jsonl). Undefined if no file/match. */
-function resolveRootFromFile(
-  rootsPath: string | undefined,
-  bundle: { proof: { seq: string; anchorRef: string | null } },
-): string | undefined {
-  if (!rootsPath) return undefined
+/** One line of a published roots.jsonl. v2 lines carry the §5.4 chain; hand-built minimal lists may not. */
+interface RootsFileEntry {
+  seqStart?: string
+  seqEnd?: string
+  entryCount?: number
+  root: string
+  anchorRef?: string
+  anchoredAt?: string
+  prevChainHash?: string
+  chainHash?: string
+}
+
+/** Read and parse a JSONL roots file (e.g. a checkout of intyga-dev/ledger's roots/roots.jsonl).
+ *  A malformed line is fatal — silently skipping one would lose a published root without saying so. */
+function parseRootsEntries(rootsPath: string): RootsFileEntry[] {
   let raw: string
   try {
     raw = fs.readFileSync(rootsPath, "utf8")
   } catch (err) {
     die(`cannot read roots file: ${err instanceof Error ? err.message : String(err)}`)
   }
-  const entries = raw
+  return raw
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
-    .map(
-      (l) =>
-        JSON.parse(l) as {
-          seqStart?: string
-          seqEnd?: string
-          root: string
-          anchorRef?: string
-        },
-    )
+    .map((l, i): RootsFileEntry => {
+      try {
+        return JSON.parse(l) as RootsFileEntry
+      } catch {
+        return die(`roots file line ${i + 1} is not valid JSON`)
+      }
+    })
+}
+
+/** Pick the published daily root that covers this proof's seq (or matches its anchorRef).
+ *  Undefined if no match. */
+function pickRoot(
+  entries: RootsFileEntry[],
+  bundle: { proof: { seq: string; anchorRef: string | null } },
+): string | undefined {
   const seq = BigInt(bundle.proof.seq)
   const byAnchor = bundle.proof.anchorRef
     ? entries.find((e) => e.anchorRef && e.anchorRef === bundle.proof.anchorRef)
@@ -282,7 +315,7 @@ async function pollVerifyConsume(
     die(`Authorization failed with status: ${result ? result.status : "TIMEOUT"}`)
   if (!result.receipt) die("Gateway returned APPROVED but no signature receipt.")
 
-  const { verifyApprovalReceipt } = await import("./index.js")
+  const { verifyApprovalReceipt, verificationCode } = await import("./index.js")
   const approvers = approverKeys()
   if (approvers.length === 0) {
     die(
@@ -291,21 +324,44 @@ async function pollVerifyConsume(
         "for its own signer, so there is no safe default.",
     )
   }
+  // Accepting a receipt that carries no human signature is an explicit, per-invocation decision.
+  // `sigAlg: "AUTO_APPROVED"` is a plain receipt field, not part of the signed bytes, and the
+  // verifier deliberately returns `ok: false` for it so that `if (!ok) die` blocks unsigned
+  // approvals by default. Reading the `autoApproved` marker as permission to continue — which is
+  // what this did — let anything that can answer the status poll authorize any action, with no
+  // approver key ever consulted.
+  const allowAutoApproved = process.argv.includes("--allow-auto-approved")
+
   // The nonce is asserted too: it binds the receipt to the challenge this call issued, so a receipt
   // for some other (equally valid) approval cannot be substituted.
-  const v = verifyApprovalReceipt(result.receipt, {
-    target,
-    actionType,
-    params,
-    nonce,
-    approvers: { publicKeys: approvers },
-  })
-  // The payload is always checked first, so a tampered action still fails here regardless of mode.
-  if (!v.ok && !v.autoApproved) die(`Offline verification FAILED: ${v.reason}`)
+  const v = verifyApprovalReceipt(
+    result.receipt,
+    {
+      target,
+      actionType,
+      params,
+      nonce,
+      approvers: { publicKeys: approvers },
+    },
+    { allowAutoApproved },
+  )
+  // `ok` alone, always. The payload is checked before the signature, so a tampered action fails here
+  // regardless of mode; and an offline approval that claims to be auto-approved stays `ok: false`
+  // even under --allow-auto-approved, because that combination is a contradiction the flag must not
+  // rescue.
+  if (!v.ok) {
+    if (v.autoApproved && !allowAutoApproved) {
+      die(
+        "this authorization carries NO human signature — it was auto-approved by policy " +
+          "(Discovery Mode or a pre-approval window). Refusing by default. If your deployment " +
+          "intends observe-only runs, re-run with --allow-auto-approved.",
+      )
+    }
+    die(`Offline verification FAILED: ${v.reason}`)
+  }
   if (v.autoApproved) {
-    // Policy let this through with NO human signature — Discovery Mode (observe-only) or a
-    // pre-approval window. The action is recorded and governed, but was NOT signed by a human. We proceed
-    // (that is the point of observe-mode) but say so loudly so it never reads as a real approval.
+    // Opted in above. The action is recorded and governed, but was NOT signed by a human — say so
+    // loudly so it never reads as a real approval.
     console.log(
       "\x1b[33m%s\x1b[0m",
       `⚠ Policy-approved without a human signature — Discovery Mode or a pre-approval window.`,
@@ -315,9 +371,11 @@ async function pollVerifyConsume(
       `  The action was recorded and is visible in Governance, but no human signed it. Proceeding.`,
     )
   } else {
+    // Derived from the canonical bytes, not read from the receipt's echoed field: this is the value
+    // the operator reads back to the approver, and an echoed one is not something either side computed.
     console.log(
       "\x1b[32m%s\x1b[0m",
-      `✓ Offline verification SUCCESSFUL (Code: ${result.receipt.verificationCode})`,
+      `✓ Offline verification SUCCESSFUL (Code: ${verificationCode(result.receipt.canonicalPayload)})`,
     )
   }
 
@@ -517,7 +575,7 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
+          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
         )
       const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
       const params = parseParamsArg()
@@ -598,7 +656,7 @@ async function main() {
       const nonce = rest.find((a) => !a.startsWith("--"))
       if (!nonce)
         die(
-          "usage: intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
+          "usage: intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved]",
         )
       const { timeoutMs } = parseTimeout(arg("timeout"))
       const target = arg("target") ?? ""
@@ -652,12 +710,16 @@ async function main() {
       // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
       // a checkout of the intyga-dev/ledger repo). Without one, the bundle is only checked against its
       // own asserted root. Exit code 0 = verified, 1 = not.
-      const { verifyBundle, verifyEvidenceBundle, EVIDENCE_BUNDLE_KIND } = await import("@intyga/verify")
+      const { verifyBundle, verifyEvidenceBundle, verifyRootsChain, EVIDENCE_BUNDLE_KIND } = await import(
+        "@intyga/verify"
+      )
       const bundlePath = rest.find((a) => !a.startsWith("--"))
       if (!bundlePath)
         die(
           "usage: intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
-            "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--json]",
+            "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] " +
+            "[--rekor-key <pem>] [--json]\n" +
+            "  Works for both single inclusion proofs and multi-entry evidence bundles.",
         )
 
       let bundle: import("@intyga/verify").ProofBundle
@@ -667,17 +729,62 @@ async function main() {
         die(`cannot read bundle: ${err instanceof Error ? err.message : String(err)}`)
       }
 
+      // A supplied roots file is the ROOT SOURCE for everything below, so its own integrity comes
+      // first: verify the §5.4 continuity chain over the whole file before trusting any line in it.
+      // A broken chain is tamper-shaped (an edited or truncated file poisons every later verdict) and
+      // is fatal; a file with no chain fields at all is a legitimate hand-built minimal list, so it
+      // only warns — the published file is always chained.
+      const rootsPath = arg("roots")
+      const rootsEntries = rootsPath ? parseRootsEntries(rootsPath) : undefined
+      /** Carried into the --json output for BOTH bundle kinds: the stderr warning is invisible to a
+       *  JSON consumer and to the exit code, so without this a CI pipeline cannot distinguish
+       *  "chain verified over N entries" from "the file carried no chain at all". */
+      let rootsChain: { ok: boolean; unchained: boolean; verifiedEntries: number } | undefined
+      if (rootsEntries && rootsEntries.length > 0) {
+        const chain = verifyRootsChain(rootsEntries as import("@intyga/verify").RootsChainEntry[])
+        rootsChain = { ok: chain.ok, unchained: chain.unchained, verifiedEntries: chain.verifiedCount }
+        if (chain.unchained) {
+          console.error(
+            "warning: roots file carries no §5.4 chain hashes — continuity NOT checked. (A hand-built " +
+              "minimal root list is fine for a one-off lookup; the published file is always chained.)",
+          )
+        } else if (!chain.ok) {
+          die(
+            `roots file FAILED §5.4 chain verification: ${chain.reason}\n` +
+              "The file may have been edited, truncated or spliced — refusing to trust any root in it. " +
+              "Re-fetch it from the published source and compare copies.",
+          )
+        } else {
+          console.error(`roots chain verified (${chain.verifiedCount} entries)`)
+        }
+      }
+
+      // DEWP §5.3 anchor quorum flags apply to BOTH bundle kinds. Without --trusted-issuer the
+      // verifier has no key to check an anchor signature against, so `anchorVerified` falls back to
+      // the weaker "an independent root was handed to me" signal (single proof) or stays unchecked
+      // (evidence bundle) — which the report labels honestly rather than calling it anchored.
+      const anchorOpts = await buildAnchorOptions(
+        arg("trusted-issuer"),
+        arg("anchor-keys"),
+        arg("require-anchors"),
+        arg("rekor-key"),
+      )
+
       // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
       const bundleKind = (bundle as { kind?: string }).kind
       if (bundleKind === EVIDENCE_BUNDLE_KIND) {
         const evidence = bundle as unknown as import("@intyga/verify").EvidenceBundle
+        // An evidence bundle can legitimately span several daily roots, so EVERY published root is a
+        // trusted candidate — each entry still has to chain to one of them to verify.
         const root = arg("root")
-        const rootArgs = root ? [root] : undefined
+        const fromFile = rootsEntries?.map((e) => e.root) ?? []
+        const trustedRoots = [...new Set([...(root ? [root] : []), ...fromFile])]
         const result = verifyEvidenceBundle(evidence, {
-          trustedRoots: rootArgs,
+          trustedRoots: trustedRoots.length > 0 ? trustedRoots : undefined,
+          ...anchorOpts,
         })
         if (process.argv.indexOf("--json") >= 0) {
-          console.log(JSON.stringify(result, null, 2))
+          console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
           process.exit(result.ok ? 0 : 1)
         }
         console.log(
@@ -689,31 +796,29 @@ async function main() {
         )
         console.log(`  failed            ${result.failed.length}`)
         for (const f of result.failed.slice(0, 20)) console.log(`    seq ${f.seq}: ${f.reason}`)
-        for (const r of result.roots)
-          console.log(`  root ${r.root.slice(0, 16)}… anchor: ${r.anchorRef ?? "(none)"}`)
+        for (const r of result.roots) {
+          const quorum =
+            r.anchorVerified === null
+              ? "unchecked"
+              : r.anchorVerified
+                ? `VERIFIED (${r.verifiedIssuers.join(", ")})`
+                : "NOT MET"
+          console.log(`  root ${r.root.slice(0, 16)}… anchor: ${r.anchorRef ?? "(none)"}  quorum: ${quorum}`)
+        }
         for (const n of result.notes) console.log(`  note: ${n}`)
         console.log("")
         console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m")
         process.exit(result.ok ? 0 : 1)
       }
 
-      const trustedRoot = arg("root") ?? resolveRootFromFile(arg("roots"), bundle)
-      if (arg("roots") && !trustedRoot)
+      const trustedRoot = arg("root") ?? (rootsEntries ? pickRoot(rootsEntries, bundle) : undefined)
+      if (rootsEntries && !trustedRoot)
         console.error("warning: no matching root in the roots file for this event.")
 
-      // DEWP §5.3 anchor quorum. Without --trusted-issuer the verifier has no key to check an anchor
-      // signature against, so `anchorVerified` falls back to the weaker "an independent root was
-      // handed to me" signal — which the report labels honestly rather than calling it anchored.
-      const anchorOpts = await buildAnchorOptions(
-        arg("trusted-issuer"),
-        arg("anchor-keys"),
-        arg("require-anchors"),
-        arg("rekor-key"),
-      )
       const result = verifyBundle(bundle, { trustedRoot, ...anchorOpts })
 
       if (process.argv.indexOf("--json") >= 0) {
-        console.log(JSON.stringify(result, null, 2))
+        console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
         process.exit(result.ok ? 0 : 1)
       }
       const c = result.checks
@@ -724,7 +829,9 @@ async function main() {
       console.log(`  [${m(c.inclusion)}] inclusion       ${c.inclusion.detail}`)
       console.log(`  [${m(c.rootConsistency)}] root match      ${c.rootConsistency.detail}`)
       console.log(`  [${m(c.leafBinding)}] leaf binding    ${c.leafBinding.detail}`)
-      console.log(`  [${m(c.anchored)}] anchored        ${c.anchored.detail}`)
+      // A producer CLAIM, not this verifier's finding — the real check is `anchor` in the DEWP
+      // property line below. Printing it as "[PASS] anchored" for self-signed-only roots was the bug.
+      console.log(`  [${m(c.anchored)}] anchor claim    ${c.anchored.detail}`)
       // DEWP §7.1 property model + summary level.
       const p = result.properties
       const yn = (b: boolean) => (b ? "yes" : "no ")
@@ -762,20 +869,25 @@ async function main() {
       const c = decoded.challenge
 
       // Show the human what they are authorizing, in full. An approver who signs an opaque blob has
-      // not approved anything (DIV §5a.8), so this output is a security control, not decoration.
-      const expiresIn = Math.round((Date.parse(c.expiresAt) - Date.now()) / 1000)
+      // not approved anything (DIV §5a.8), so this output is a security control, not decoration —
+      // which is exactly why every requester-controlled field goes through `approverSafe`.
+      const expiryMs = Date.parse(c.expiresAt)
+      // A timestamp we cannot read is not a timestamp we can say is still valid. `NaN <= 0` is false,
+      // so an unparseable expiresAt used to sail past the guard below and get signed (DIV §6.2).
+      if (!Number.isFinite(expiryMs)) die("expiresAt is not a valid RFC3339 timestamp — refusing to sign")
+      const expiresIn = Math.round((expiryMs - Date.now()) / 1000)
       console.log("")
       console.log("\x1b[1mOFFLINE APPROVAL REQUEST\x1b[0m")
       console.log("")
-      console.log(`  Action     ${c.display}`)
-      console.log(`  Type       ${c.actionType}`)
-      console.log(`  Target     ${c.target}`)
-      console.log(`  Params     ${JSON.stringify(c.params)}`)
-      console.log(`  Requested  ${c.requester?.did ?? "(unknown)"}`)
+      console.log(`  Action     ${approverSafe(c.display)}`)
+      console.log(`  Type       ${approverSafe(c.actionType)}`)
+      console.log(`  Target     ${approverSafe(c.target)}`)
+      console.log(`  Params     ${approverSafe(JSON.stringify(c.params))}`)
+      console.log(`  Requested  ${approverSafe(c.requester?.did ?? "(unknown)")}`)
       console.log(`  Quorum     ${c.requirement?.requiredApprovals ?? "?"} approver(s) required`)
-      console.log(`  Expires    ${c.expiresAt}  (${expiresIn}s from now)`)
+      console.log(`  Expires    ${approverSafe(c.expiresAt)}  (${expiresIn}s from now)`)
       console.log("")
-      console.log(`  \x1b[1mVerification code: ${c.verificationCode}\x1b[0m`)
+      console.log(`  \x1b[1mVerification code: ${approverSafe(c.verificationCode)}\x1b[0m`)
       console.log("  Read this back to the operator. If it does not match their screen, STOP.")
       console.log("")
       if (expiresIn <= 0) die("this challenge has already expired — ask for a fresh one")
@@ -880,8 +992,8 @@ async function main() {
           "  intyga keygen --out <prefix>",
           "  intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
           "  intyga login --did <did> [--gateway <url>]",
-          '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume]',
-          "  intyga await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume]",
+          '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
+          "  intyga await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved]",
           "",
           "  `authorize` and `await` verify the approval receipt offline and REQUIRE the approver keys",
           "  you trust — the receipt's own key is never used, or it would vouch for its own signer:",

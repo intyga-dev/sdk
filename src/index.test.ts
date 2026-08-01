@@ -13,6 +13,7 @@ process.env.USERPROFILE = home
 
 // The BUILT module (run `pnpm build` first), matching cli.test.ts — see policy.test.ts for why.
 const { IntygaClient } = await import("../dist/index.js")
+type GatewayRefused = import("./index.ts").GatewayRefused
 
 interface Reply {
   status?: number
@@ -137,15 +138,39 @@ test("authorize posts the action and defaults params to an empty object", async 
   t.after(f.restore)
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
-  const r = await c.authorize("Wire $500 to ACME")
+  const r = await c.authorize("Wire $500 to ACME", { target: "test-rp" })
   assert.deepEqual(r, { nonce: "n-1", status: "PENDING" })
   assert.equal(f.calls[0]!.url, `${GW}/authorize`)
   assert.equal(f.calls[0]!.headers.authorization, "Bearer t")
   assert.deepEqual(f.calls[0]!.body, {
-    target: "global",
+    target: "test-rp",
     actionDescription: "Wire $500 to ACME",
     params: {},
   })
+})
+
+// `target` used to default to "global" here — and this was the only one of the four SDKs that did.
+// sdk-go, sdk-rust and sdk-python all trim and hard-refuse a missing or blank target, each citing
+// DIV §3 Invariant 5 (Target Isolation). A "global" target binds no execution environment into the
+// signed intent, so the approval verifies at every other relying party in the tenant that also
+// asserts "global" — an approval a human granted for staging is replayable against production. The
+// gateway has its own `?? "global"` fallback; the sibling ports exist so nobody relies on it, and
+// this SDK was sending the value explicitly instead. Two assertions above previously pinned
+// `target: "global"` as expected output, which is how it survived.
+test("authorize refuses a missing or blank target rather than defaulting it", async (t) => {
+  const f = stubFetch(() => ({ body: { nonce: "n", status: "PENDING" } }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+
+  for (const opts of [undefined, {}, { target: "" }, { target: "   " }]) {
+    await assert.rejects(
+      // biome-ignore lint/suspicious/noExplicitAny: exercising the untyped-caller path on purpose
+      () => c.authorize("Wire $1M", opts as any),
+      /target is required/,
+      `authorize accepted ${JSON.stringify(opts)}`,
+    )
+  }
+  assert.equal(f.calls.length, 0, "nothing should reach the gateway without a target")
 })
 
 test("authorize binds actionType and params into the request", async (t) => {
@@ -154,12 +179,13 @@ test("authorize binds actionType and params into the request", async (t) => {
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   await c.authorize("Wire", {
+    target: "test-rp",
     actionType: "payments.wire",
     params: { amount: 500 },
     timeout: 60,
   })
   assert.deepEqual(f.calls[0]!.body, {
-    target: "global",
+    target: "test-rp",
     actionDescription: "Wire",
     actionType: "payments.wire",
     params: { amount: 500 },
@@ -171,7 +197,7 @@ test("authorize throws on a non-2xx rather than returning a falsy nonce", async 
   const f = stubFetch(() => ({ status: 403, text: "forbidden" }))
   t.after(f.restore)
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
-  await assert.rejects(() => c.authorize("x"), /authorize failed: 403 forbidden/)
+  await assert.rejects(() => c.authorize("x", { target: "test-rp" }), /authorize failed: 403 forbidden/)
 })
 
 test("status url-encodes the nonce", async (t) => {
@@ -237,7 +263,7 @@ test("requireApproval polls until the challenge resolves", async (t) => {
   t.after(f.restore)
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
-  const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 5000 })
+  const r = await c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 5000 })
   assert.equal(r.status, "APPROVED")
   assert.equal(r.signatureHash, "deadbeef")
   assert.equal(polls, 3)
@@ -253,10 +279,7 @@ test("requireApproval surfaces a denial without waiting for the deadline", async
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   // Fails closed and fails fast: a denied action must never look like a timeout.
-  const r = await c.requireApproval("Wire", {
-    intervalMs: 1,
-    timeoutMs: 60_000,
-  })
+  const r = await c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 60_000 })
   assert.equal(r.status, "DENIED")
 })
 
@@ -269,7 +292,7 @@ test("requireApproval gives up as EXPIRED and converts timeoutMs to whole second
   t.after(f.restore)
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
-  const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 1500 })
+  const r = await c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 1500 })
   assert.equal(r.status, "EXPIRED")
   // The backend TTL is sent in seconds, rounded up, so the gateway never expires before the client.
   assert.equal(f.calls[0]!.body ? (f.calls[0]!.body as { timeout: number }).timeout : undefined, 2)
@@ -288,7 +311,7 @@ test("requireApproval derives its deadline from opts.timeout", { timeout: 20_000
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   const started = Date.now()
-  const r = await c.requireApproval("Wire", { intervalMs: 10, timeout: 1 })
+  const r = await c.requireApproval("Wire", { target: "test-rp", intervalMs: 10, timeout: 1 })
   assert.equal(r.status, "EXPIRED")
   // Client deadline and backend TTL now come from one value, so neither can outlive the other.
   assert.equal((f.calls[0]!.body as { timeout: number }).timeout, 1)
@@ -308,7 +331,7 @@ test("requireApproval rides out a transient polling failure", async (t) => {
   const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
 
   // A momentary 502 must not throw away a wait the human may already have acted on.
-  const r = await c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 5_000 })
+  const r = await c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 5_000 })
   assert.equal(r.status, "APPROVED")
 })
 
@@ -322,7 +345,7 @@ test("requireApproval gives up when the gateway is persistently unreachable", as
   // Tolerating blips is not the same as hanging forever: sustained failure must surface, not
   // masquerade as EXPIRED, so the caller can tell "no answer" from "the human said no".
   await assert.rejects(
-    c.requireApproval("Wire", { intervalMs: 1, timeoutMs: 60_000 }),
+    c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 60_000 }),
     /5 consecutive errors/,
   )
 })
@@ -339,4 +362,55 @@ test("verify url-encodes the document hash and needs no token", async (t) => {
   assert.equal(f.calls[0]!.url, `${GW}/verify/ab%2Fcd`)
   // Public witness lookup: no Authorization header is required or sent.
   assert.equal(f.calls[0]!.headers.authorization, undefined)
+})
+
+// ─── A refusal is not an outage (DIV §5a.1, §3.4) ────────────────────────────
+//
+// offline.ts states the mechanism's first structural property as "IT ONLY APPLIES WHEN WE COULD NOT
+// ASK". That held only for a 200 body carrying DENIED/EXPIRED. authorize() and status() threw a bare
+// Error on every non-2xx, so a reachable gateway answering 403 SecurityViolation — or 402 Protected
+// Ops exhausted, or 401 on a revoked credential — was indistinguishable from a socket failure, and
+// the client went off and collected local signatures instead.
+
+for (const status of [401, 402, 403, 429]) {
+  test(`requireApproval does NOT fall back offline when the gateway refuses with ${status}`, async (t) => {
+    const f = stubFetch(() => ({ status }))
+    t.after(f.restore)
+    const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+
+    let offlineWasAttempted = false
+    await assert.rejects(
+      c.requireApproval("Wire $1M", {
+        target: "prod",
+        timeoutMs: 5_000,
+        intervalMs: 1,
+        offline: {
+          get bundleDir() {
+            offlineWasAttempted = true
+            return "/nonexistent"
+          },
+        } as never,
+      }),
+      (err: Error) => {
+        assert.equal(err.name, "GatewayRefused", `expected a refusal, got ${err.name}: ${err.message}`)
+        assert.equal((err as GatewayRefused).status, status)
+        return true
+      },
+    )
+    assert.equal(offlineWasAttempted, false, `a ${status} refusal was answered with an offline approval`)
+  })
+}
+
+test("a 5xx still counts as unreachable, because that is what §5a is for", async (t) => {
+  // The distinction is deliberate: a 502 from a load balancer or a 503 from a restarting instance is
+  // infrastructure failing, not the gateway deciding. Only 4xx is a verdict.
+  const f = stubFetch((call) =>
+    call.url.endsWith("/authorize") ? { body: { nonce: "n-5xx", status: "PENDING" } } : { status: 503 },
+  )
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+  await assert.rejects(
+    c.requireApproval("Wire", { target: "test-rp", intervalMs: 1, timeoutMs: 60_000 }),
+    /5 consecutive errors/,
+  )
 })

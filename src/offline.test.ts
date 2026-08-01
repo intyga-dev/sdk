@@ -702,3 +702,51 @@ describe("offline-sign.html signing path", () => {
     assert.equal(`${hex.slice(0, 4)}-${hex.slice(4, 8)}`, verificationCode(canonical))
   })
 })
+
+// ── delegation may narrow WHO, never HOW MANY (DIV §5a.5) ───────────────────────
+describe("delegation quorum floor", () => {
+  const delegationFor = (delegatedQuorum: number) => ({
+    delegatedTo: [ALICE.did, BOB.did],
+    delegatedQuorum,
+    target: ACTION.target,
+    actionType: ACTION.actionType,
+    params: ACTION.params,
+    nonce: "dlg_00000000-0000-4000-8000-000000000000",
+    signers: [ALICE.did, BOB.did],
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  })
+
+  it("REFUSES a delegation that would lower the bundle's quorum", () => {
+    // The bundle requires 2 approvals for db.restart. The delegation branch used to overwrite
+    // `requiredApprovals` with `delegatedQuorum` unconditionally, so 1 replaced 2 and the resulting
+    // receipt verified perfectly — the signed requiredApprovals equalled delegatedQuorum, exactly as
+    // §5a.6 step 3 requires. Nothing at the relying party compared it against the policy it holds.
+    //
+    // §5a.6 step 2 compares only target/actionType/params, so `display` is free to differ between
+    // sealing and use — and `display` is what requirementFor matches on. That is the gap: seal against
+    // a permissive rule, present against a strict one.
+    const r = createOfflineChallenge({
+      bundle: bundleOf(),
+      ...ACTION,
+      requester: { did: "did:intyga:service:oncall", attestation: null },
+      delegation: delegationFor(1),
+    })
+    assert.equal(r.ok, false, "a delegation lowered a 2-of-N action to 1-of-N")
+    assert.match(r.reason!, /narrow WHO approves, never HOW MANY/)
+  })
+
+  it("ALLOWS a delegation that matches the quorum, and one that raises it", () => {
+    for (const quorum of [2, 3]) {
+      const r = createOfflineChallenge({
+        bundle: bundleOf(),
+        ...ACTION,
+        requester: { did: "did:intyga:service:oncall", attestation: null },
+        delegation: delegationFor(quorum),
+      })
+      assert.equal(r.ok, true, `quorum ${quorum} should be permitted: ${r.reason}`)
+      // The delegated quorum is what gets signed, so the delegates sign the policy they are counted
+      // toward — a delegation may still be STRICTER than the bundle.
+      assert.match(r.challenge!.canonicalPayload, new RegExp(`"requiredApprovals":${quorum}`))
+    }
+  })
+})

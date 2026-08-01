@@ -132,6 +132,24 @@ export const CREDENTIALS_FILE = path.join(INTYGA_DIR, "credentials.json")
 /** How many back-to-back polling failures before `requireApproval` declares the gateway unreachable. */
 const MAX_POLL_ERRORS = 5
 
+/**
+ * The gateway answered, and the answer was no.
+ *
+ * Distinct from a transport failure on purpose. Both used to surface as a bare `Error`, so
+ * `requireApproval` could not tell "the gateway is gone" from "the gateway refused" — and routed
+ * both into the DIV §5a offline-approval path. A reachable gateway returning 403 (SecurityViolation,
+ * which `RequirementUnavailable` extends), 402 (Protected Ops exhausted), 401 or 429 is a verdict,
+ * not an outage, and a verdict must not be answered by collecting signatures out of band.
+ */
+export class GatewayRefused extends Error {
+  readonly status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = "GatewayRefused"
+    this.status = status
+  }
+}
+
 function loadStoredToken(gatewayUrl: string): string | undefined {
   try {
     if (fs.existsSync(CREDENTIALS_FILE)) {
@@ -175,10 +193,28 @@ export class IntygaClient {
     return data.access_token
   }
 
+  /**
+   * `target` is REQUIRED — DIV §3 Invariant 5 (Target Isolation).
+   *
+   * This used to default to `"global"`, and it was the only one of the four SDKs that did:
+   * `sdk-go`, `sdk-rust` and `sdk-python` all trim and hard-refuse a missing or blank target, each
+   * citing this invariant. A `"global"` target binds no execution environment into the signed
+   * intent, so the resulting approval verifies at every other relying party in the tenant that also
+   * asserts `"global"` — an approval a human granted for staging is replayable against production.
+   * The gateway has its own `?? "global"` fallback; the sibling ports exist precisely so nobody
+   * relies on it, and this one was sending the value explicitly instead.
+   */
   async authorize(
     actionDescription: string,
-    opts: AuthorizeOptions = { target: "global" },
+    opts: AuthorizeOptions,
   ): Promise<{ nonce: string; status: ApprovalStatus }> {
+    const target = opts?.target?.trim()
+    if (!target) {
+      throw new Error(
+        "target is required (DIV Target Isolation): name the relying party / execution environment " +
+          "this approval is bound to",
+      )
+    }
     const token = await this.token()
     const res = await fetch(`${this.opts.gatewayUrl}/authorize`, {
       method: "POST",
@@ -187,14 +223,14 @@ export class IntygaClient {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        target: opts?.target ?? "global",
+        target,
         actionDescription,
         actionType: opts?.actionType,
         params: opts?.params ?? {},
         timeout: opts?.timeout,
       }),
     })
-    if (!res.ok) throw new Error(`authorize failed: ${res.status} ${await res.text()}`)
+    if (!res.ok) throw new GatewayRefused(res.status, `authorize failed: ${res.status} ${await res.text()}`)
     return (await res.json()) as { nonce: string; status: ApprovalStatus }
   }
 
@@ -229,7 +265,7 @@ export class IntygaClient {
     const res = await fetch(`${this.opts.gatewayUrl}/authorize/${encodeURIComponent(nonce)}`, {
       headers: { authorization: `Bearer ${token}` },
     })
-    if (!res.ok) throw new Error(`status failed: ${res.status}`)
+    if (!res.ok) throw new GatewayRefused(res.status, `status failed: ${res.status}`)
     return (await res.json()) as ApprovalResult
   }
 
@@ -237,13 +273,22 @@ export class IntygaClient {
    * The core zero-trust gate: `await` this immediately before a high-risk action. It creates the
    * challenge and blocks until the human approves/denies on their wallet (or it times out).
    *
-   *   const r = await intyga.requireApproval("Wire $5,000 to Acme Corp", {
+   *   const action = {
+   *     target: "payments-prod",                    // required — DIV Target Isolation
    *     actionType: "wire_transfer",
    *     params: { to: "Acme Corp", amount: 5000, currency: "USD" },
-   *   });
+   *   };
+   *   const r = await intyga.requireApproval("Wire $5,000 to Acme Corp", action);
    *   if (r.status !== "APPROVED") throw new Error("not authorized");
-   *   // Optional hard binding before executing:
-   *   const ok = verifyApprovalReceipt(r.receipt!, { actionType: "wire_transfer", params: {...} });
+   *   // Hard binding before executing. `nonce` and `approvers` are REQUIRED by
+   *   // verifyApprovalReceipt and have no default: a receipt checked against the key inside
+   *   // itself proves nothing (DIV Invariant 3). Resolve approvers from your own key policy.
+   *   const check = verifyApprovalReceipt(r.receipt!, {
+   *     ...action,
+   *     nonce: r.nonce!,
+   *     approvers: { publicKeys: trustedApproverKeys },
+   *   });
+   *   if (!check.ok) throw new Error(check.reason);
    *
    * Note this always sends an explicit TTL, derived from `timeoutMs`/`timeout` or the 120s default, so
    * the challenge cannot outlive the wait. A deployment that has raised AUTH_CHALLENGE_TIMEOUT_MS above
@@ -274,7 +319,16 @@ export class IntygaClient {
     // The fallback is reachable ONLY from a transport failure. Every other outcome below returns
     // normally: a DENIED or EXPIRED result means a human was reached and did not approve, and letting
     // an out-of-band approval override that would be worse than having no gate at all.
-    const tryOffline = async (cause: string): Promise<ApprovalResult> => {
+    const tryOffline = async (cause: string, err?: unknown): Promise<ApprovalResult> => {
+      // DIV §5a exists for the case where we could not ASK. A 4xx means the gateway was reached and
+      // refused — 403 in particular is its own fail-closed "I cannot resolve the approval
+      // requirement" (RequirementUnavailable extends SecurityViolation), and 401/402/429 are equally
+      // deliberate. Treating a refusal as unreachability turns a policy denial into a different
+      // approval route, which is worse than having no gate at all (DIV §3.4).
+      //
+      // 5xx is deliberately NOT included: a 502 from a load balancer or a 503 from a restarting
+      // instance is infrastructure failing, which is exactly the "could not ask" §5a is written for.
+      if (err instanceof GatewayRefused && err.status < 500) throw err
       if (!opts.offline) throw new Error(cause)
       const offline = await useOfflineApproval(
         {
@@ -299,8 +353,9 @@ export class IntygaClient {
         timeout: Math.ceil(timeoutMs / 1000),
       }))
     } catch (err) {
-      // Could not even raise the challenge — the clearest "gateway is unreachable" signal there is.
-      return tryOffline(`could not reach Intyga to request approval: ${(err as Error).message}`)
+      // Could not even raise the challenge — the clearest "gateway is unreachable" signal there is,
+      // unless the gateway in fact answered, which tryOffline rethrows rather than routing offline.
+      return tryOffline(`could not reach Intyga to request approval: ${(err as Error).message}`, err)
     }
     const deadline = Date.now() + timeoutMs
     const interval = opts.intervalMs ?? 2_000
@@ -318,7 +373,7 @@ export class IntygaClient {
           // The gateway went away mid-wait. Same situation as failing to raise the challenge, so the
           // same fallback applies — and, as there, only because we could not ASK, not because we were
           // told no.
-          return tryOffline(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`)
+          return tryOffline(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`, err)
         }
       }
       if (Date.now() > deadline) return { status: "EXPIRED", nonce }
