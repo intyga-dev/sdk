@@ -11,7 +11,20 @@ import { fileURLToPath } from "node:url"
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url))
 
 function run(args: string[]) {
-  return spawnSync("node", [cli, ...args], { encoding: "utf8" })
+  return spawnSync("node", [cli, ...args], { encoding: "utf8", timeout: 60_000 })
+}
+
+function runAuditVerifyWithRoots(roots: string) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-audit-verify-test-"))
+  const bundlePath = path.join(tmp, "bundle.json")
+  const rootsPath = path.join(tmp, "roots.jsonl")
+  try {
+    fs.writeFileSync(bundlePath, JSON.stringify({ proof: { seq: "1", anchorRef: null } }))
+    fs.writeFileSync(rootsPath, roots)
+    return run(["audit-verify", bundlePath, "--roots", rootsPath])
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
 }
 
 test("no command prints help and exits 0", () => {
@@ -82,6 +95,27 @@ test("audit-verify without bundle exits non-zero", () => {
   const r = run(["audit-verify"])
   assert.notEqual(r.status, 0)
   assert.match(r.stderr, /usage: intyga audit-verify/)
+})
+
+test("audit-verify reports malformed roots seqStart without a stack trace", () => {
+  const r = runAuditVerifyWithRoots(JSON.stringify({ seqStart: "abc", seqEnd: "2", root: "0".repeat(64) }))
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /error: .*seqStart/)
+  assert.doesNotMatch(r.stderr, /\n {4}at /)
+})
+
+test("audit-verify reports a non-object roots line without a stack trace", () => {
+  const r = runAuditVerifyWithRoots("null\n")
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /error: roots file line 1 is not an object/)
+  assert.doesNotMatch(r.stderr, /\n {4}at /)
+})
+
+test("audit-verify preserves contextual invalid JSON errors", () => {
+  const r = runAuditVerifyWithRoots("{not-json}\n")
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /error: roots file line 1 is not valid JSON/)
+  assert.doesNotMatch(r.stderr, /\n {4}at /)
 })
 
 test("authorize without an action description exits non-zero", () => {

@@ -128,8 +128,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  * Anchor signatures are only meaningful against keys the AUDITOR trusts. `--anchor-keys` supplies a
  * JSON map of `{ "issuer#keyId": "<base64 SPKI>" }` (the shape `/.well-known/dewp-anchors.json`
  * publishes), and `--trusted-issuer` (repeatable, comma-separated) names which issuers count toward
- * quorum. Supplying neither is not an error: the verifier then reports `anchorVerified` on the weaker
- * "independent root supplied" basis, and says so, rather than pretending a quorum was evaluated.
+ * quorum. Supplying neither is not an error, but it is not an anchor check either: DEWP §3
+ * Invariant 7 makes `anchorVerified` an if-and-only-if on the quorum, so with no policy it stays
+ * false and the report says why. A root supplied via `--root` is provenance, not verification.
  *
  * A REKOR anchor is verified differently: it carries no DEWP signature, so instead of a key from
  * `--anchor-keys` it needs Sigstore's LOG key (`--rekor-key`), against which its Signed Entry
@@ -210,6 +211,14 @@ interface RootsFileEntry {
   chainHash?: string
 }
 
+function rootsDecimal(value: unknown, label: string): bigint {
+  const rendered = JSON.stringify(value) ?? String(value)
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    die(`${label} ${rendered} is not an unsigned decimal integer`)
+  }
+  return BigInt(value)
+}
+
 /** Read and parse a JSONL roots file (e.g. a checkout of intyga-dev/ledger's roots/roots.jsonl).
  *  A malformed line is fatal — silently skipping one would lose a published root without saying so. */
 function parseRootsEntries(rootsPath: string): RootsFileEntry[] {
@@ -224,11 +233,16 @@ function parseRootsEntries(rootsPath: string): RootsFileEntry[] {
     .map((l) => l.trim())
     .filter(Boolean)
     .map((l, i): RootsFileEntry => {
+      let parsed: unknown
       try {
-        return JSON.parse(l) as RootsFileEntry
+        parsed = JSON.parse(l) as unknown
       } catch {
         return die(`roots file line ${i + 1} is not valid JSON`)
       }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return die(`roots file line ${i + 1} is not an object`)
+      }
+      return parsed as RootsFileEntry
     })
 }
 
@@ -238,13 +252,16 @@ function pickRoot(
   entries: RootsFileEntry[],
   bundle: { proof: { seq: string; anchorRef: string | null } },
 ): string | undefined {
-  const seq = BigInt(bundle.proof.seq)
+  const seq = rootsDecimal(bundle.proof.seq, "bundle proof.seq")
   const byAnchor = bundle.proof.anchorRef
     ? entries.find((e) => e.anchorRef && e.anchorRef === bundle.proof.anchorRef)
     : undefined
-  const bySeq = entries.find(
-    (e) => e.seqStart != null && e.seqEnd != null && BigInt(e.seqStart) <= seq && seq <= BigInt(e.seqEnd),
-  )
+  const bySeq = entries.find((e) => {
+    if (e.seqStart == null || e.seqEnd == null) return false
+    const seqStart = rootsDecimal(e.seqStart, "roots file entry seqStart")
+    const seqEnd = rootsDecimal(e.seqEnd, "roots file entry seqEnd")
+    return seqStart <= seq && seq <= seqEnd
+  })
   return (byAnchor ?? bySeq)?.root
 }
 
@@ -760,9 +777,9 @@ async function main() {
       }
 
       // DEWP §5.3 anchor quorum flags apply to BOTH bundle kinds. Without --trusted-issuer the
-      // verifier has no key to check an anchor signature against, so `anchorVerified` falls back to
-      // the weaker "an independent root was handed to me" signal (single proof) or stays unchecked
-      // (evidence bundle) — which the report labels honestly rather than calling it anchored.
+      // verifier has no key to check an anchor signature against, so no quorum is evaluated and
+      // `anchorVerified` stays false for both kinds — which the report labels honestly rather than
+      // letting an out-of-band `--root` read as anchored.
       const anchorOpts = await buildAnchorOptions(
         arg("trusted-issuer"),
         arg("anchor-keys"),
@@ -796,6 +813,15 @@ async function main() {
         )
         console.log(`  failed            ${result.failed.length}`)
         for (const f of result.failed.slice(0, 20)) console.log(`    seq ${f.seq}: ${f.reason}`)
+        // DEWP §9.2 Extended Profile: offline DIV signature verification, per entry. Only ES256 is
+        // checkable from a leaf — see the `signatures` docs on EvidenceVerification.
+        console.log(
+          `  signatures        ${result.signatures.verified} verified, ${result.signatures.invalid.length} invalid, ` +
+            `${result.signatures.notCheckable} not offline-checkable`,
+        )
+        for (const s of result.signatures.invalid.slice(0, 20)) {
+          console.log(`    seq ${s.seq}: committed ES256 proof material does not verify`)
+        }
         for (const r of result.roots) {
           const quorum =
             r.anchorVerified === null

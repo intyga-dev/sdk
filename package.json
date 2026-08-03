@@ -39,7 +39,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --test 'src/**/*.test.ts'",
-    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=46 --test-coverage-branches=67 --test-coverage-functions=54 --test-coverage-exclude='../**' --test-coverage-exclude='dist/cli.js' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=87 --test-coverage-branches=75 --test-coverage-functions=88 --test-coverage-exclude='../**' --test-coverage-exclude='dist/cli.js' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
