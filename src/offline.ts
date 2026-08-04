@@ -335,6 +335,15 @@ export interface RedemptionStore {
 }
 
 /**
+ * Nonces are generated locally, but they become path segments in the redemption store and the
+ * reconciliation buffer — refuse anything that could traverse out of those directories rather than
+ * trusting the upstream shape.
+ */
+function isPathSafeNonce(nonce: string): boolean {
+  return /^[A-Za-z0-9._-]{1,200}$/.test(nonce)
+}
+
+/**
  * Default store: one file per redeemed nonce, created with the exclusive-create flag.
  *
  * `wx` is atomic on POSIX and on Windows — the OS refuses the open if the path exists, so two
@@ -347,9 +356,7 @@ export class FileRedemptionStore implements RedemptionStore {
   }
 
   redeem(nonce: string): boolean {
-    // Nonces are generated locally, but this value becomes a path segment — refuse anything that
-    // could traverse out of the directory rather than trusting the upstream shape.
-    if (!/^[A-Za-z0-9._-]{1,200}$/.test(nonce)) return false
+    if (!isPathSafeNonce(nonce)) return false
     try {
       return createPrivateMarker(path.join(this.dir, `${nonce}.used`), new Date().toISOString())
     } catch {
@@ -585,6 +592,7 @@ function bufferForReconciliation(
     delegationNonce: delegation?.nonce,
   }
   try {
+    if (!isPathSafeNonce(challenge.nonce)) throw new Error("nonce is not a safe path segment")
     ensurePrivateDir(dir)
     writePrivateFile(path.join(dir, `${challenge.nonce}.json`), `${JSON.stringify(record, null, 2)}\n`)
   } catch (err) {
@@ -616,6 +624,9 @@ export function pendingApprovals(opts: { bundleDir: string; bufferDir?: string }
  * make impossible.
  */
 export function clearPendingApproval(nonce: string, opts: { bundleDir: string; bufferDir?: string }): void {
+  // Callers may feed this a nonce echoed back by the gateway during reconciliation — never let it
+  // name a path outside the buffer directory.
+  if (!isPathSafeNonce(nonce)) return
   const dir = opts.bufferDir ?? path.join(opts.bundleDir, ".pending")
   try {
     fs.unlinkSync(path.join(dir, `${nonce}.json`))

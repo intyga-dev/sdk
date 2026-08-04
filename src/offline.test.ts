@@ -15,10 +15,12 @@ import { describe, it } from "node:test"
 // package's `npm test` uses `node --test`, which resolves `.js` specifiers to real files.
 import { canonicalDelegationPayload, canonicalIntentPayload, verificationCode } from "@intyga/verify"
 import {
+  clearPendingApproval,
   createOfflineChallenge,
   decodeChallengeEnvelope,
   decodeSignatureEnvelope,
   encodeSignatureEnvelope,
+  FileRedemptionStore,
   pendingApprovals,
   useOfflineApproval,
 } from "../dist/offline.js"
@@ -748,5 +750,38 @@ describe("delegation quorum floor", () => {
       // toward — a delegation may still be STRICTER than the bundle.
       assert.match(r.challenge!.canonicalPayload, new RegExp(`"requiredApprovals":${quorum}`))
     }
+  })
+})
+
+describe("nonces used as path segments", () => {
+  // In the documented flow every nonce is a locally generated `off_<uuid>`. But clearPendingApproval
+  // is public API, and a reconciliation loop plausibly feeds it a nonce echoed back by the gateway —
+  // so a hostile gateway must not be able to turn it into an arbitrary-unlink primitive.
+  it("clearPendingApproval refuses a traversal nonce", () => {
+    const dir = tmpdir()
+    const bufferDir = path.join(dir, "buf")
+    fs.mkdirSync(bufferDir)
+    const victim = path.join(dir, "victim.json")
+    fs.writeFileSync(victim, "{}")
+
+    clearPendingApproval("../victim", { bundleDir: dir, bufferDir })
+    assert.ok(fs.existsSync(victim), "a traversal nonce escaped the buffer directory")
+  })
+
+  it("clearPendingApproval still removes a legitimately buffered record", () => {
+    const dir = tmpdir()
+    const bufferDir = path.join(dir, "buf")
+    fs.mkdirSync(bufferDir)
+    fs.writeFileSync(path.join(bufferDir, "off_abc123.json"), "{}")
+
+    clearPendingApproval("off_abc123", { bundleDir: dir, bufferDir })
+    assert.equal(fs.existsSync(path.join(bufferDir, "off_abc123.json")), false)
+  })
+
+  it("FileRedemptionStore refuses a traversal nonce", () => {
+    const dir = tmpdir()
+    const store = new FileRedemptionStore(path.join(dir, "used"))
+    assert.equal(store.redeem("../escape"), false)
+    assert.equal(fs.existsSync(path.join(dir, "escape.used")), false)
   })
 })
