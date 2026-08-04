@@ -4,8 +4,6 @@ One SDK for every Intyga use case. Intyga is agent-agnostic: the primitive is un
 
 This TypeScript package is the reference client. The same primitive is also available for **Go** and **Rust** backends (see [Other languages](#other-languages-go--rust)), and offline receipt verification ships in **four** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
 
-> Status: publish-ready, **not yet published** to npm. The Go and Rust packages currently live in-repo.
-
 ## Require a human approval before a high-risk action
 
 ```ts
@@ -13,12 +11,16 @@ import { IntygaClient } from "@intyga/sdk";
 
 const intyga = new IntygaClient({
   gatewayUrl: "https://api.intyga.com",
-  clientId: process.env.INTYGA_CLIENT_ID,      // a human or agent API key
-  clientSecret: process.env.INTYGA_CLIENT_SECRET,
+  clientId: process.env.INTYGA_CLIENT_ID!,      // a human or agent API key
+  clientSecret: process.env.INTYGA_CLIENT_SECRET!,
 });
 
-// Blocks until the human approves with their passkey / security key (or times out):
-const r = await intyga.requireApproval("Delete production database");
+// Blocks until the human approves with their passkey / security key (or times out).
+// `target` is required — it names THIS execution environment, so the approval cannot be
+// replayed against a different service (DIV Target Isolation).
+const r = await intyga.requireApproval("Delete production database", {
+  target: "prod-db-cluster-01",
+});
 if (r.status !== "APPROVED") throw new Error("not authorized");
 // …safe to proceed; r.signatureHash is your non-repudiable receipt.
 ```
@@ -80,14 +82,20 @@ human signed off on the *exact* instruction you're about to run:
 ```ts
 import { verifyApprovalReceipt } from "@intyga/sdk"; // re-exported from @intyga/verify
 
-const r = await intyga.requireApproval("Delete production database", {
-  actionType: "wipe_production", params: { target: "prod-db-1" },
-});
+// One action object, used for BOTH the request and the verification — re-deriving the payload
+// from the same values is what makes a one-byte swap detectable.
+const action = {
+  target: "prod-payments-eu",     // THIS execution environment (DIV Target Isolation)
+  actionType: "wipe_production",
+  params: { database: "prod-db-1" },
+};
+
+const r = await intyga.requireApproval("Delete production database prod-db-1", action);
 if (r.status !== "APPROVED") throw new Error("not authorized");
 // `nonce` names the challenge you are redeeming — required, so you can enforce single-use yourself.
 const ok = verifyApprovalReceipt(r.receipt!, {
-  target: "prod-payments-eu", actionType: "wipe_production",
-  params: { target: "prod-db-1" }, nonce: r.nonce!,
+  ...action,
+  nonce: r.nonce!,
   // REQUIRED: the approver keys YOU trust, from your own config/directory. Verification never uses
   // the key inside the receipt — that would let a receipt vouch for its own signer. Do NOT fetch
   // these from the gateway: a compromised gateway would then supply both the receipt and the key
@@ -117,12 +125,16 @@ client := intyga.NewClient(intyga.ClientOptions{
 	ClientSecret: os.Getenv("INTYGA_CLIENT_SECRET"),
 })
 
-// Blocks until the human approves with their passkey / security key (or times out):
+// Blocks until the human approves with their passkey / security key (or times out).
+// Target is required — it names THIS execution environment (DIV Target Isolation), and the
+// SAME target/actionType/params are re-asserted at verification below.
+params := map[string]interface{}{"database": "prod-db-1"}
 r, err := client.RequireApproval(context.Background(), "Delete production database",
 	intyga.RequireApprovalOptions{
 		AuthorizeOptions: intyga.AuthorizeOptions{
+			Target:     "prod-payments-eu",
 			ActionType: "wipe_production",
-			Params:     map[string]interface{}{"target": "prod-db-1"},
+			Params:     params,
 		},
 	})
 if err != nil || r.Status != intyga.StatusApproved {
@@ -133,7 +145,7 @@ if err != nil || r.Status != intyga.StatusApproved {
 // Approvers is REQUIRED: verification uses keys YOU resolved, never the one in the receipt.
 res := verify.VerifyApprovalReceipt(*r.Receipt, verify.Expected{
 	Nonce: r.Nonce, ActionType: "wipe_production", Target: "prod-payments-eu",
-	Params: map[string]interface{}{"target": "prod-db-1"},
+	Params:    params,
 	Approvers: verify.ApproverTrustAnchor{PublicKeys: []string{alicePubB64}},
 }, verify.VerifyOptions{})
 if !res.OK {
@@ -147,8 +159,8 @@ if !res.OK {
 
 ```rust
 use intyga_sdk::{
-    verify_approval_receipt_with_options, ApprovalStatus, AuthorizeOptions, Client, ClientOptions,
-    Expected, RequireApprovalOptions, VerifyOptions,
+    verify_approval_receipt_with_options, ApprovalStatus, ApproverTrustAnchor, AuthorizeOptions,
+    Client, ClientOptions, Expected, RequireApprovalOptions, VerifyOptions,
 };
 use serde_json::json;
 
@@ -159,11 +171,14 @@ let mut client = Client::new(ClientOptions {
     ..Default::default()
 });
 
-// Blocks until the human approves with their passkey / security key (or times out):
+// Blocks until the human approves with their passkey / security key (or times out).
+// `target` is required — it names THIS execution environment (DIV Target Isolation), and the
+// SAME target/actionType/params are re-asserted at verification below.
 let r = client.require_approval("Delete production database", &RequireApprovalOptions {
     authorize: AuthorizeOptions {
+        target: Some("prod-payments-eu".into()),
         action_type: Some("wipe_production".into()),
-        params: Some(json!({ "target": "prod-db-1" })),
+        params: Some(json!({ "database": "prod-db-1" })),
         ..Default::default()
     },
     ..Default::default()
@@ -172,11 +187,14 @@ if r.status != ApprovalStatus::Approved {
     return Err("not authorized".into());
 }
 
-// Optional hard binding before executing — no Intyga secret involved:
+// Optional hard binding before executing — no Intyga secret involved. `approvers` is REQUIRED:
+// verification uses keys YOU resolved, never the one inside the receipt.
 let expected = Expected {
+    target: "prod-payments-eu".into(),
     nonce: r.nonce.clone().unwrap(),
     action_type: "wipe_production".into(),
-    params: json!({ "target": "prod-db-1" }),
+    params: json!({ "database": "prod-db-1" }),
+    approvers: ApproverTrustAnchor::PublicKeys(vec![alice_pub_b64]),
 };
 verify_approval_receipt_with_options(&r.receipt.unwrap(), &expected, &VerifyOptions::default())?;
 ```

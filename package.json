@@ -1,8 +1,24 @@
 {
   "name": "@intyga/sdk",
   "version": "0.1.0",
-  "description": "Intyga SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption. Publish-ready; not yet published.",
+  "description": "Intyga SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/intyga-dev/intyga-sdk.git"
+  },
+  "homepage": "https://www.intyga.com",
+  "bugs": "https://github.com/intyga-dev/intyga-sdk/issues",
+  "keywords": [
+    "authorization",
+    "human-approval",
+    "webauthn",
+    "passkey",
+    "audit",
+    "receipts",
+    "mcp",
+    "ai-agents"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,7 +40,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"

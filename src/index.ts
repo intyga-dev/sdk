@@ -1,6 +1,6 @@
 // @intyga/sdk — one client for every Intyga use case. The primitive is uniform: request a challenge →
-// a human approves on their wallet → poll until resolved. Works for AI agents, humans, and any
-// backend service; the only difference is which API key/token you hold.
+// a human approves with a passkey or security key → poll until resolved. Works for AI agents, humans,
+// and any backend service; the only difference is which API key/token you hold.
 
 // Receipt verification + canonical helpers now live in the standalone, zero-dependency @intyga/verify
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
@@ -106,7 +106,7 @@ export interface AuthorizeOptions {
   target: string
   /** Action identifier, e.g. "wire_transfer". Bound into the signed payload. */
   actionType?: string
-  /** The exact structured variables that will execute — displayed in the wallet AND signed. */
+  /** The exact structured variables that will execute — displayed to the approver AND signed. */
   params?: Record<string, unknown>
   /** Custom Time-To-Live (TTL) for the approval challenge in seconds. */
   timeout?: number
@@ -271,7 +271,7 @@ export class IntygaClient {
 
   /**
    * The core zero-trust gate: `await` this immediately before a high-risk action. It creates the
-   * challenge and blocks until the human approves/denies on their wallet (or it times out).
+   * challenge and blocks until the human approves/denies with their passkey (or it times out).
    *
    *   const action = {
    *     target: "payments-prod",                    // required — DIV Target Isolation
