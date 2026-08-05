@@ -237,6 +237,7 @@ test("authorize refuses an AUTO_APPROVED receipt by default, and accepts it only
       requireHardwareKey: true,
       allowedAaguids: [],
       requesterCannotApprove: true,
+      signerClass: "human",
     },
     nonce: NONCE,
     expiresAt: new Date(Date.now() + 600_000).toISOString(),

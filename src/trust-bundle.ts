@@ -19,6 +19,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import type { ApproverTrustAnchor, ApprovalRequirementAttestation } from "@intyga/verify"
+import { SIGNER_CLASS_HUMAN } from "@intyga/verify"
 
 /** Bundle `type` discriminator, inside the signed JWS payload. */
 export const DIV_TRUST_BUNDLE_TYPE = "div-trust-bundle"
@@ -243,6 +244,7 @@ export function requirementFor(
       requireHardwareKey: winner.requireHardwareKey,
       allowedAaguids: winner.allowedAaguids ?? [],
       requesterCannotApprove: winner.requesterCannotApprove,
+      signerClass: SIGNER_CLASS_HUMAN,
     },
     approverDids: winner.approverDids ?? [],
   }
