@@ -2,7 +2,7 @@
 
 One SDK for every Intyga use case. Intyga is agent-agnostic: the primitive is uniform — **request a challenge → a human approves with a passkey or security key → poll until resolved** — so the same client works for scripts, pipelines, and AI agents. Plus off-platform **zero-knowledge** policy encryption.
 
-This TypeScript package is the reference client. The same primitive is also available for **Go** and **Rust** backends (see [Other languages](#other-languages-go--rust)), and offline receipt verification ships in **four** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
+This TypeScript package is the reference client. The same primitive is also available for **Go**, **Rust** and **Java** backends (see [Other languages](#other-languages-go-rust--java)), and offline receipt verification ships in **five** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
 
 ## Require a human approval before a high-risk action
 
@@ -105,9 +105,9 @@ const ok = verifyApprovalReceipt(r.receipt!, {
 if (!ok.ok) throw new Error(`refusing to proceed: ${ok.reason}`);
 ```
 
-## Other languages (Go & Rust)
+## Other languages (Go, Rust & Java)
 
-The same **request → approve → poll** primitive is available for Go and Rust backends — the languages that run most payments, ledger, and infrastructure services. Each SDK re-exports its language's offline verifier, so you can verify the receipt in the same process.
+The same **request → approve → poll** primitive is available for Go, Rust and Java backends — the languages that run most payments, ledger, and infrastructure services. Each of those SDKs brings its language's offline verifier with it, so you can verify the receipt in the same process without a second dependency.
 
 ### Go — [`github.com/intyga-dev/sdk-go`](../sdk-go)
 
@@ -201,9 +201,13 @@ verify_approval_receipt_with_options(&r.receipt.unwrap(), &expected, &VerifyOpti
 
 The Rust client is generic over a pluggable `Transport` (default: a built-in blocking `ureq` transport), so you can supply your own async/instrumented HTTP client.
 
+### Java — [`com.intyga:intyga-sdk`](../sdk-java)
+
+The same client (`requireApproval` / `consume`, blocking, `target` required) for JVM backends, plus a one-line `requireApprovalOrThrow` gate for Spring/Quarkus handlers and LangChain4j tool methods. It bundles the Java verifier, so a receipt can be verified in the same process. Not yet published to Maven Central — see [`../sdk-java`](../sdk-java) and [`examples/`](../../examples) for Spring Boot, Quarkus and LangChain4j examples.
+
 ## Multi-language offline verifiers
 
-Every APPROVED result carries a **receipt** you can verify in your own process, with no Intyga secret and no network — against approver keys **you** resolve, never one read out of the receipt. The verifier is available in four languages; all four verify both **ES256** (service-key) and **WebAuthn** (passkey) receipts, and are held byte-identical by shared cross-language test vectors.
+Every APPROVED result carries a **receipt** you can verify in your own process, with no Intyga secret and no network — against approver keys **you** resolve, never one read out of the receipt. The verifier is available in five languages; all five verify both **ES256** (service-key) and **WebAuthn** (passkey) receipts, and are held byte-identical by shared cross-language test vectors.
 
 | Language | Package | Dependencies |
 | :--- | :--- | :--- |
@@ -211,13 +215,16 @@ Every APPROVED result carries a **receipt** you can verify in your own process, 
 | Python | [`intyga-sdk`](../sdk-python) (PyPI) | `cryptography` |
 | Go | [`github.com/intyga-dev/verify-go`](../verify-go) | none (standard library) |
 | Rust | [`intyga-verify`](../verify-rust) | `p256` / `sha2` |
+| Java | [`com.intyga:intyga-verify`](../verify-java) | `jackson-databind` (JDK crypto) |
 
-For **WebAuthn** receipts, verification requires you to pin the expected origin and RP ID (a passkey assertion harvested at any relying party would otherwise verify) — pass them via the verifier's options (`VerifyReceiptOptions` in TS, `VerifyOptions` in Go/Rust, `expected_origin`/`expected_rp_id` in Python). ES256 receipts need no such context.
+TypeScript implements the broadest surface; Python, Go, Rust and Java implement the DEWP **Core Profile** — each README states its own remaining limits precisely.
+
+For **WebAuthn** receipts, verification requires you to pin the expected origin and RP ID (a passkey assertion harvested at any relying party would otherwise verify) — pass them via the verifier's options (`VerifyReceiptOptions` in TS, `VerifyOptions` in Go/Rust/Java, `expected_origin`/`expected_rp_id` in Python). ES256 receipts need no such context.
 
 ## Start here
 - **Quickstart** (gate a prod DB deletion in an afternoon): [`docs/quickstart.md`](../../docs/quickstart.md)
 - **Runnable examples**: [`examples/gate-prod-delete`](../../examples/gate-prod-delete), [`examples/ci-cd-github-action`](../../examples/ci-cd-github-action)
-- **Independent verification library**: [`@intyga/verify`](../verify/README.md) (TypeScript) · also [Go](../verify-go), [Rust](../verify-rust), [Python](../sdk-python)
+- **Independent verification library**: [`@intyga/verify`](../verify/README.md) (TypeScript) · also [Go](../verify-go), [Rust](../verify-rust), [Python](../sdk-python), [Java](../verify-java)
 
 ## License
 
