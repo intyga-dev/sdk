@@ -11,6 +11,8 @@ import {
 } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
+import type { ApproverTrustAnchor } from "@intyga/verify"
+import { parseTrustAnchorFile, trustAnchorApprovers } from "./trust-anchor.js"
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
@@ -39,6 +41,77 @@ function approverKeys(): string[] {
     .map((k) => k.trim())
     .filter(Boolean)
   return [...flags, ...fromEnv]
+}
+
+/**
+ * The trust anchor for receipt verification, from exactly ONE of two sources:
+ *
+ *  - `--approvers-file <path>` / INTYGA_APPROVERS_FILE — a trust-anchor file (DID mode). PREFERRED:
+ *    quorum counts distinct PEOPLE, self-certifying `did:intyga:key:` entries need no key material
+ *    at all, and the file can carry the WebAuthn expectations so one artifact configures the whole
+ *    verification.
+ *  - `--approver-key` / INTYGA_APPROVER_KEYS — a flat key allowlist (key-set mode). Fine for a
+ *    single approver; under a quorum it counts KEYS rather than people (DIV §4.4.6), and a
+ *    delegation cannot be enforced.
+ *
+ * Both at once is refused rather than merged: the two modes disagree about what an identity is, and
+ * a silent merge would leave it unclear which statement the caller actually pinned.
+ */
+function resolveApproverAnchor(): {
+  anchor: ApproverTrustAnchor
+  webauthn?: { origin: string; rpId: string }
+} | null {
+  const filePath = arg("approvers-file") ?? process.env.INTYGA_APPROVERS_FILE
+  const keys = approverKeys()
+  if (filePath && keys.length > 0) {
+    die(
+      "--approvers-file and --approver-key/INTYGA_APPROVER_KEYS are mutually exclusive — the file " +
+        "already names the trusted keys per approver. Configure one or the other.",
+    )
+  }
+  if (filePath) {
+    let text: string
+    try {
+      text = fs.readFileSync(filePath, "utf8")
+    } catch (err) {
+      die(`cannot read approvers file ${filePath}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    try {
+      const file = parseTrustAnchorFile(text)
+      return { anchor: trustAnchorApprovers(file), webauthn: file.webauthn }
+    } catch (err) {
+      die(err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (keys.length > 0) return { anchor: { publicKeys: keys } }
+  return null
+}
+
+/**
+ * WebAuthn receipt expectations — REQUIRED whenever the approver signed with a passkey or security
+ * key, which is the product's normal flow. The verifier fails closed without them (an assertion
+ * harvested at any other relying party would otherwise verify), so a passkey receipt checked with
+ * neither flag nor env set dies with the verifier's own reason. Set them to the origin and RP ID
+ * of the approval console your approvers sign in — the WEBAUTHN_ORIGIN / WEBAUTHN_RP_ID your
+ * Intyga deployment is configured with. Raw-key (ES256) receipts don't carry an assertion, so
+ * these are simply unused there — passing them is always safe.
+ */
+function webauthnExpectations(fallback?: { origin: string; rpId: string }): {
+  expectedOrigin?: string
+  expectedRpId?: string
+} {
+  const flag = (name: string) => {
+    const i = process.argv.indexOf(name)
+    return i >= 0 && process.argv[i + 1] ? (process.argv[i + 1] as string) : undefined
+  }
+  // Flag > env > trust-anchor file. The file's values are the console's own origin/RP ID as it
+  // exported them — correct by construction — but an explicit flag or env always wins.
+  const expectedOrigin = flag("--webauthn-origin") ?? process.env.INTYGA_WEBAUTHN_ORIGIN ?? fallback?.origin
+  const expectedRpId = flag("--webauthn-rp-id") ?? process.env.INTYGA_WEBAUTHN_RP_ID ?? fallback?.rpId
+  return {
+    ...(expectedOrigin ? { expectedOrigin } : {}),
+    ...(expectedRpId ? { expectedRpId } : {}),
+  }
 }
 
 function die(msg: string): never {
@@ -333,12 +406,13 @@ async function pollVerifyConsume(
   if (!result.receipt) die("Gateway returned APPROVED but no signature receipt.")
 
   const { verifyApprovalReceipt, verificationCode } = await import("./index.js")
-  const approvers = approverKeys()
-  if (approvers.length === 0) {
+  const resolved = resolveApproverAnchor()
+  if (!resolved) {
     die(
-      "no trusted approver key configured — pass --approver-key <base64> (repeatable) or set " +
-        "INTYGA_APPROVER_KEYS. Verification must use a key YOU resolved; a receipt cannot vouch " +
-        "for its own signer, so there is no safe default.",
+      "no trusted approver configured — pass --approvers-file <trust-anchor.json> (or set " +
+        "INTYGA_APPROVERS_FILE), or --approver-key <base64> (repeatable) / INTYGA_APPROVER_KEYS. " +
+        "Verification must use identities and keys YOU resolved; a receipt cannot vouch for its " +
+        "own signer, so there is no safe default.",
     )
   }
   // Accepting a receipt that carries no human signature is an explicit, per-invocation decision.
@@ -358,9 +432,9 @@ async function pollVerifyConsume(
       actionType,
       params,
       nonce,
-      approvers: { publicKeys: approvers },
+      approvers: resolved.anchor,
     },
-    { allowAutoApproved },
+    { allowAutoApproved, ...webauthnExpectations(resolved.webauthn) },
   )
   // `ok` alone, always. The payload is checked before the signature, so a tampered action fails here
   // regardless of mode; and an offline approval that claims to be auto-approved stays `ok: false`
@@ -622,12 +696,15 @@ async function main() {
       // Machine-readable so a CI runner can grab the deep-link and notify the approver's chat tool.
       ghOutput({ nonce, approval_url: approvalUrl })
 
+      // stderr, deliberately: in --no-wait mode stdout carries exactly ONE machine-readable JSON
+      // line, so a pipeline can `| jq` it without stripping a banner first. Human-facing status
+      // belongs on stderr in every mode.
       const printApprovalBanner = () => {
-        console.log(`\n============================================================`)
-        console.log(`Approval nonce: ${nonce}`)
-        console.log(`Approve at:`)
-        console.log(`\x1b[36m%s\x1b[0m`, approvalUrl)
-        console.log(`============================================================\n`)
+        console.error(`\n============================================================`)
+        console.error(`Approval nonce: ${nonce}`)
+        console.error(`Approve at:`)
+        console.error(`\x1b[36m%s\x1b[0m`, approvalUrl)
+        console.error(`============================================================\n`)
       }
 
       // --no-wait: create the challenge and hand back the deep-link immediately (don't block). The caller
@@ -1021,10 +1098,19 @@ async function main() {
           '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
           "  intyga await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved]",
           "",
-          "  `authorize` and `await` verify the approval receipt offline and REQUIRE the approver keys",
-          "  you trust — the receipt's own key is never used, or it would vouch for its own signer:",
+          "  `authorize` and `await` verify the approval receipt offline and REQUIRE a trust anchor",
+          "  you resolved yourself — the receipt's own key is never used, or it would vouch for its",
+          "  own signer. Configure exactly ONE of:",
+          "    --approvers-file <path>   or INTYGA_APPROVERS_FILE — trust-anchor file exported from",
+          "                              the console (PREFERRED): DID mode, quorum counts people,",
+          "                              self-certifying did:intyga:key: entries need no key material,",
+          "                              and the file can carry the WebAuthn expectations below",
           "    --approver-key <base64>   repeatable; base64 SPKI (raw P-256) or base64 COSE (passkey)",
-          "    INTYGA_APPROVER_KEYS      comma-separated, same values",
+          "    INTYGA_APPROVER_KEYS      comma-separated, same values (counts keys, not people)",
+          "  Passkey receipts additionally REQUIRE the WebAuthn expectations (the verifier fails",
+          "  closed without them — an assertion from any other site would otherwise verify):",
+          "    --webauthn-origin <url>   or INTYGA_WEBAUTHN_ORIGIN — the approval console's origin",
+          "    --webauthn-rp-id <host>   or INTYGA_WEBAUTHN_RP_ID — its relying-party ID",
           '  intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]',
           "  intyga verify <documentHash> --gateway <url>",
           "",

@@ -244,10 +244,37 @@ export function decodeChallengeEnvelope(envelope: string): {
       ok: false,
       reason: `this is a ${String(parsed.type)} payload, not an offline approval challenge — refusing to sign it`,
     }
-  // Re-serializing must reproduce the input byte-for-byte. If it does not, the envelope carries
-  // non-canonical JSON, and a signature over these bytes would not verify against the payload the
-  // relying party reconstructs. Better to refuse than to produce a signature nobody can use.
   const fields = parsed as unknown as DecodedChallenge
+  // Re-serializing must reproduce the input byte-for-byte. If it does not, the envelope carries
+  // non-canonical or mis-shaped JSON — hand-edited, truncated, or missing fields the review pane
+  // would then render as "?" — and a signature over these bytes would not verify against the
+  // payload the relying party reconstructs. Better to refuse than to produce a signature nobody
+  // can use over a payload the approver could not faithfully read.
+  let rebuilt: string
+  try {
+    rebuilt = canonicalOfflineIntentPayload({
+      target: fields.target,
+      actionType: fields.actionType,
+      display: (parsed.display as string) ?? "",
+      params: fields.params,
+      requester: fields.requester,
+      requirement: fields.requirement,
+      nonce: fields.nonce,
+      challengedAt: fields.challengedAt,
+      expiresAt: fields.expiresAt,
+    })
+  } catch {
+    return {
+      ok: false,
+      reason: "challenge payload carries values that cannot be canonicalized — refusing to sign it",
+    }
+  }
+  if (rebuilt !== canonicalPayload)
+    return {
+      ok: false,
+      reason:
+        "challenge payload is not canonical — re-serializing it produces different bytes, so a signature over it would verify nowhere",
+    }
   return {
     ok: true,
     challenge: {
@@ -485,10 +512,14 @@ export async function useOfflineApproval(
   }
 
   const store = opts.store ?? new FileRedemptionStore(path.join(opts.bundleDir, ".redeemed"))
-  if (!store.redeem(challenge.nonce))
-    return { ok: false, reason: `nonce ${challenge.nonce} has already been redeemed here` }
-
+  // Buffer BEFORE redeeming: a crash between the two steps must leave a pending record behind. A
+  // spurious record reconciles harmlessly (the gateway sees an approval that was never executed);
+  // the old order left a redeemed, executed approval invisible to reconciliation forever.
   bufferForReconciliation(challenge, receipt, delegation, opts)
+  if (!store.redeem(challenge.nonce)) {
+    clearPendingApproval(challenge.nonce, opts)
+    return { ok: false, reason: `nonce ${challenge.nonce} has already been redeemed here` }
+  }
   warn(
     `⚠ OFFLINE APPROVAL USED — "${expected.display}" (${expected.actionType} on ${expected.target}). ` +
       `Approved out of band by ${result.signers?.join(", ") ?? "(unknown)"} because Intyga was unreachable` +

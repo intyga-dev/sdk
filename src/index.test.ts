@@ -414,3 +414,418 @@ test("a 5xx still counts as unreachable, because that is what §5a is for", asyn
     /5 consecutive errors/,
   )
 })
+
+// ─── Token refresh ───────────────────────────────────────────────────────────
+//
+// The exchanged token used to be cached for the life of the process with `expires_in` never read,
+// so a service object older than the token's TTL got a 401 on every call until restart — and the
+// gateway could not shorten its TTLs without making that bite sooner. Now the cache honours
+// `expires_in` (re-exchanging `min(60s, expires_in/10)` early) and a 401 on an exchanged token is
+// retried exactly once with a fresh exchange. Explicit tokens are the caller's to refresh; a stored
+// `intyga login` credential has no secret behind it and can only be re-minted by logging in again.
+
+const BASE_NOW = 1_700_000_000_000
+
+function exchangeStub(expiresIn?: number) {
+  let exchanges = 0
+  const f = stubFetch(() => ({
+    body:
+      expiresIn === undefined
+        ? { access_token: `tok-${++exchanges}` }
+        : { access_token: `tok-${++exchanges}`, expires_in: expiresIn },
+  }))
+  return { ...f, exchanges: () => exchanges }
+}
+
+function paths(calls: Call[]): string[] {
+  return calls.map((c) => new URL(c.url).pathname)
+}
+
+/** A JWT-shaped string whose payload carries `exp` (seconds). Unsigned: the SDK reads it as a hint only. */
+function jwtWithExp(exp: number): string {
+  const payload = Buffer.from(JSON.stringify({ sub: "did:intyga:cli", exp })).toString("base64url")
+  return `eyJhbGciOiJIUzI1NiJ9.${payload}.sig`
+}
+
+test("an exchanged token is re-exchanged shortly before the expires_in the gateway reported", async (t) => {
+  const f = exchangeStub(100)
+  t.after(f.restore)
+  let now = BASE_NOW
+  t.mock.method(Date, "now", () => now)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  assert.equal(await c.token(), "tok-1")
+  // margin = min(60s, 100s / 10) = 10s, so the cache is good until t+90s and not a moment longer.
+  now = BASE_NOW + 89_000
+  assert.equal(await c.token(), "tok-1")
+  assert.equal(f.exchanges(), 1)
+  now = BASE_NOW + 91_000
+  assert.equal(await c.token(), "tok-2")
+  assert.equal(f.exchanges(), 2)
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/oauth/token"])
+})
+
+test("the refresh margin is capped at 60s for long-lived tokens", async (t) => {
+  const f = exchangeStub(3600)
+  t.after(f.restore)
+  let now = BASE_NOW
+  t.mock.method(Date, "now", () => now)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  assert.equal(await c.token(), "tok-1")
+  now = BASE_NOW + 3_539_000
+  assert.equal(await c.token(), "tok-1", "a tenth of an hour is 360s, but the margin stops at 60s")
+  now = BASE_NOW + 3_541_000
+  assert.equal(await c.token(), "tok-2")
+  assert.equal(f.exchanges(), 2)
+})
+
+test("a token response without expires_in is cached for the life of the process (back-compat)", async (t) => {
+  const f = exchangeStub()
+  t.after(f.restore)
+  let now = BASE_NOW
+  t.mock.method(Date, "now", () => now)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  assert.equal(await c.token(), "tok-1")
+  now = BASE_NOW + 10 * 24 * 3_600_000
+  assert.equal(await c.token(), "tok-1", "with no expiry known the old gateway contract still holds")
+  assert.equal(f.exchanges(), 1)
+})
+
+test("a 401 on an exchanged token drops the cache and retries the call exactly once", async (t) => {
+  let exchanges = 0
+  let authorizes = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/oauth/token"))
+      return { body: { access_token: `tok-${++exchanges}`, expires_in: 900 } }
+    authorizes += 1
+    return authorizes === 1
+      ? { status: 401, text: "ERR_JWT_EXPIRED" }
+      : { body: { nonce: "n-r", status: "PENDING" } }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  const r = await c.authorize("Wire", { target: "test-rp" })
+  assert.equal(r.nonce, "n-r")
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/authorize", "/oauth/token", "/authorize"])
+  assert.equal(f.calls[1]!.headers.authorization, "Bearer tok-1")
+  assert.equal(f.calls[3]!.headers.authorization, "Bearer tok-2", "the retry must carry the NEW token")
+  // The request itself is replayed unchanged.
+  assert.deepEqual(f.calls[3]!.body, f.calls[1]!.body)
+})
+
+test("the 401 retry re-exchanges with client credentials, never with a stored `intyga login` token", async (t) => {
+  // SECURITY REGRESSION: the retry used to go back through resolveToken(), which re-reads
+  // ~/.intyga/credentials.json BEFORE the client-credentials branch. A process holding client
+  // credentials on a box where someone ran `intyga login` mid-session (dev box, CI runner) would
+  // retry an AGENT call as the HUMAN: a different principal, a different ceremony shape, and a
+  // different requester on the witness leaf. The retry must be a client-credentials exchange, full stop.
+  const credsDir = path.join(home, ".intyga")
+  t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
+  let exchanges = 0
+  let authorizes = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/oauth/token"))
+      return { body: { access_token: `tok-agent-${++exchanges}`, expires_in: 900 } }
+    authorizes += 1
+    if (authorizes === 1) {
+      // A concurrent `intyga login` lands exactly between the first exchange and its 401.
+      fs.mkdirSync(credsDir, { recursive: true })
+      fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-human" }))
+      return { status: 401, text: "ERR_JWT_EXPIRED" }
+    }
+    return { body: { nonce: "n-r", status: "PENDING" } }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({
+    gatewayUrl: GW,
+    clientId: "id",
+    clientSecret: "secret",
+    allowStoredCredentials: true,
+  })
+
+  const r = await c.authorize("Wire", { target: "test-rp" })
+  assert.equal(r.nonce, "n-r")
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/authorize", "/oauth/token", "/authorize"])
+  assert.equal(f.calls[1]!.headers.authorization, "Bearer tok-agent-1")
+  assert.equal(
+    f.calls[3]!.headers.authorization,
+    "Bearer tok-agent-2",
+    "retry must be the re-exchanged agent token",
+  )
+  assert.equal(exchanges, 2)
+  assert.ok(
+    !f.calls.some((x) => x.headers.authorization === "Bearer tok-human"),
+    "the stored human token must never be sent",
+  )
+})
+
+test("a 401 that survives the one retry is surfaced as GatewayRefused, not retried again", async (t) => {
+  const f = stubFetch((call) =>
+    call.url.endsWith("/oauth/token")
+      ? { body: { access_token: "tok", expires_in: 900 } }
+      : { status: 401, text: "revoked" },
+  )
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  await assert.rejects(
+    () => c.status("n"),
+    (err: Error) => {
+      assert.equal(err.name, "GatewayRefused")
+      assert.equal((err as GatewayRefused).status, 401)
+      return true
+    },
+  )
+  // One retry, then stop: a revoked key must not turn into an exchange loop.
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/authorize/n", "/oauth/token", "/authorize/n"])
+})
+
+test("consume retries a 401 once and still never throws", async (t) => {
+  let verifies = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/oauth/token"))
+      return { body: { access_token: `tok-${verifies + 1}`, expires_in: 900 } }
+    verifies += 1
+    return verifies === 1
+      ? { status: 401, body: { error: { code: "UNAUTHORIZED", message: "expired" } } }
+      : { body: { ok: true } }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  assert.deepEqual(await c.consume("n-1", { target: "test-rp", actionType: "a" }), { ok: true })
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/authorize/verify", "/oauth/token", "/authorize/verify"])
+})
+
+test("an explicit token is never re-exchanged on a 401", async (t) => {
+  const f = stubFetch(() => ({ status: 401, text: "expired" }))
+  t.after(f.restore)
+  // Client credentials are present too, and must still not be used: the caller chose the token.
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t-explicit", clientId: "id", clientSecret: "secret" })
+
+  await assert.rejects(
+    () => c.authorize("Wire", { target: "test-rp" }),
+    (err: Error) => {
+      assert.equal(err.name, "GatewayRefused")
+      assert.equal((err as GatewayRefused).status, 401)
+      return true
+    },
+  )
+  assert.deepEqual(paths(f.calls), ["/authorize"], "no exchange may be attempted for an explicit token")
+})
+
+test("a stored credential is served until its exp, then refused with the one remedy there is", async (t) => {
+  let now = BASE_NOW
+  t.mock.method(Date, "now", () => now)
+  fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, ".intyga", "credentials.json"),
+    JSON.stringify({ [GW]: jwtWithExp(Math.floor(BASE_NOW / 1000) + 600) }),
+  )
+  t.after(() => fs.rmSync(path.join(home, ".intyga"), { recursive: true, force: true }))
+  const f = stubFetch(() => ({ body: {} }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, allowStoredCredentials: true })
+
+  assert.equal(await c.token(), jwtWithExp(Math.floor(BASE_NOW / 1000) + 600))
+  now = BASE_NOW + 599_000
+  assert.equal(await c.token(), jwtWithExp(Math.floor(BASE_NOW / 1000) + 600))
+  now = BASE_NOW + 601_000
+  // No client secret exists for a CLI login, so there is nothing to exchange: say so, and say what to do.
+  await assert.rejects(
+    () => c.token(),
+    (err: Error) => {
+      assert.equal(err.name, "StoredCredentialExpired")
+      assert.equal((err as GatewayRefused).status, 401, "handled exactly like the 401 it stands for")
+      assert.match(err.message, /run `intyga login` again/)
+      return true
+    },
+  )
+  assert.equal(f.calls.length, 0, "an expired stored credential must not be sent, nor anything exchanged")
+})
+
+test("a stored credential expiring mid-wait is a refusal, never an outage to answer offline", async (t) => {
+  // The pre-emptive expiry is raised client-side, without the gateway being asked. It must still be
+  // classified as the 401 it stands in for: a bare Error here would count as "could not ask" and
+  // send a requireApproval wait into the DIV §5a offline path over a credential that merely aged out.
+  let now = BASE_NOW
+  t.mock.method(Date, "now", () => now)
+  fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, ".intyga", "credentials.json"),
+    JSON.stringify({ [GW]: jwtWithExp(Math.floor(BASE_NOW / 1000) + 600) }),
+  )
+  t.after(() => fs.rmSync(path.join(home, ".intyga"), { recursive: true, force: true }))
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/authorize")) return { body: { nonce: "n-mid", status: "PENDING" } }
+    // Every poll is PENDING; the clock, not the gateway, ends this wait.
+    now += 200_000
+    return { body: { status: "PENDING" } }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, allowStoredCredentials: true })
+
+  let offlineWasAttempted = false
+  await assert.rejects(
+    c.requireApproval("Wire", {
+      target: "test-rp",
+      timeoutMs: 10_000_000,
+      intervalMs: 1,
+      offline: {
+        get bundleDir() {
+          offlineWasAttempted = true
+          return "/nonexistent"
+        },
+      } as never,
+    }),
+    (err: Error) => {
+      assert.equal(err.name, "StoredCredentialExpired", `got ${err.name}: ${err.message}`)
+      assert.match(err.message, /run `intyga login` again/)
+      return true
+    },
+  )
+  assert.equal(offlineWasAttempted, false)
+  // The token was sent for the three polls inside its exp hint (t+0, t+200s, t+400s) and not once after.
+  assert.equal(f.calls.filter((call) => call.url.endsWith("/authorize/n-mid")).length, 3)
+})
+
+test("a 401 on a stored credential is not retried and tells the user to log in again", async (t) => {
+  fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, ".intyga", "credentials.json"),
+    JSON.stringify({ [GW]: "tok-stored-opaque" }),
+  )
+  t.after(() => fs.rmSync(path.join(home, ".intyga"), { recursive: true, force: true }))
+  const f = stubFetch(() => ({ status: 401, text: "ERR_JWT_EXPIRED" }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, allowStoredCredentials: true })
+
+  await assert.rejects(
+    () => c.authorize("Wire", { target: "test-rp" }),
+    (err: Error) => {
+      assert.equal(err.name, "StoredCredentialExpired")
+      assert.equal((err as GatewayRefused).status, 401)
+      assert.match(err.message, /run `intyga login` again/)
+      return true
+    },
+  )
+  // An opaque (non-JWT) stored value carries no expiry hint and is simply offered once.
+  assert.deepEqual(paths(f.calls), ["/authorize"])
+})
+
+test("a key revoked between exchange and retry is a refusal on the retry path too, not an outage", async (t) => {
+  // The 401-retry re-exchanges mid-call, so a revoked key now fails at the token endpoint from inside
+  // authorize(). That failure is a verdict from a reachable gateway and must be typed as one, or the
+  // offline fallback would answer a revocation with locally collected signatures.
+  let exchanges = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/oauth/token"))
+      return ++exchanges === 1
+        ? { body: { access_token: "tok-1", expires_in: 900 } }
+        : { status: 401, text: "revoked" }
+    return { status: 401, text: "ERR_JWT_EXPIRED" }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  let offlineWasAttempted = false
+  await assert.rejects(
+    c.requireApproval("Wire", {
+      target: "test-rp",
+      timeoutMs: 5_000,
+      intervalMs: 1,
+      offline: {
+        get bundleDir() {
+          offlineWasAttempted = true
+          return "/nonexistent"
+        },
+      } as never,
+    }),
+    (err: Error) => {
+      assert.equal(err.name, "GatewayRefused", `got ${err.name}: ${err.message}`)
+      assert.equal((err as GatewayRefused).status, 401)
+      assert.match(err.message, /token exchange failed: 401 revoked/)
+      return true
+    },
+  )
+  assert.equal(offlineWasAttempted, false)
+  assert.deepEqual(paths(f.calls), ["/oauth/token", "/authorize", "/oauth/token"])
+})
+
+test("an expired stored credential does not block client credentials supplied alongside it", async (t) => {
+  fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, ".intyga", "credentials.json"),
+    JSON.stringify({ [GW]: jwtWithExp(Math.floor(Date.now() / 1000) - 60) }),
+  )
+  t.after(() => fs.rmSync(path.join(home, ".intyga"), { recursive: true, force: true }))
+  const f = exchangeStub(900)
+  t.after(f.restore)
+  const c = new IntygaClient({
+    gatewayUrl: GW,
+    allowStoredCredentials: true,
+    clientId: "id",
+    clientSecret: "secret",
+  })
+
+  assert.equal(await c.token(), "tok-1")
+  assert.deepEqual(paths(f.calls), ["/oauth/token"])
+})
+
+test("reconcileOfflineApprovals retries a 401 once per report, clears only acknowledged records, and keeps the rest", async (t) => {
+  // The buffer is the only evidence an offline approval happened until the gateway acknowledges it,
+  // so a record is dropped on a 2xx and on nothing else — a refusal stays queued, with its reason.
+  const bufferDir = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-sdk-pending-"))
+  t.after(() => fs.rmSync(bufferDir, { recursive: true, force: true }))
+  const pending = (nonce: string) => ({
+    nonce,
+    target: "test-rp",
+    actionType: "deploy",
+    display: "Deploy",
+    usedAt: "2026-08-23T10:00:00.000Z",
+    receipt: { stub: nonce },
+  })
+  fs.writeFileSync(path.join(bufferDir, "n-ack.json"), JSON.stringify(pending("n-ack")))
+  fs.writeFileSync(path.join(bufferDir, "n-refused.json"), JSON.stringify(pending("n-refused")))
+
+  let exchanges = 0
+  let reports = 0
+  const f = stubFetch((call) => {
+    if (call.url.endsWith("/oauth/token"))
+      return { body: { access_token: `tok-${++exchanges}`, expires_in: 900 } }
+    reports += 1
+    const { nonce } = call.body as { nonce: string }
+    // The very first report meets an expired token; the retry carries a fresh one and is acknowledged.
+    if (reports === 1) return { status: 401, text: "ERR_JWT_EXPIRED" }
+    return nonce === "n-ack" ? { body: { ok: true } } : { status: 409, text: "already reconciled" }
+  })
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+
+  const r = await c.reconcileOfflineApprovals({ bundleDir: "/unused", bufferDir })
+  assert.equal(r.reported, 1)
+  assert.equal(r.failed, 1)
+  assert.deepEqual(r.reasons, ["n-refused: 409 already reconciled"])
+  assert.equal(exchanges, 2, "one up-front exchange plus exactly one re-exchange for the 401")
+  // The receipt travels with the report so the gateway can re-verify rather than take our word for it.
+  const first = f.calls.find((call) => call.url.endsWith("/offline-approval/reconcile"))!
+  assert.deepEqual((first.body as { receipt: unknown }).receipt, {
+    stub: (first.body as { nonce: string }).nonce,
+  })
+  assert.deepEqual(
+    fs.readdirSync(bufferDir).sort(),
+    ["n-refused.json"],
+    "only the acknowledged record is cleared",
+  )
+})
+
+test("reconcileOfflineApprovals with a misconfigured client throws up front rather than failing every record", async (t) => {
+  const f = stubFetch(() => ({ body: {} }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW })
+  await assert.rejects(() => c.reconcileOfflineApprovals({ bundleDir: "/unused" }), /provide `token`/)
+  assert.equal(f.calls.length, 0)
+})

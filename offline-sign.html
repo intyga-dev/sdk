@@ -1,0 +1,405 @@
+<!doctype html>
+<!--
+  Intyga offline approval — approver signing page (docs/DIV.md §5a).
+
+  Open this file directly from disk. It makes NO network requests of any kind: no scripts, styles,
+  fonts or images are fetched, so it works on a laptop with the wifi off and there is nothing for a
+  hostile network to substitute. Keep a copy next to your incident runbook.
+
+  WHY THIS EXISTS ALONGSIDE `intyga sign`
+  The CLI needs Node installed. This page needs a browser. More importantly, both exist to put the
+  action in front of a human in a form they can actually read: an approver who signs an opaque base64
+  blob has not approved anything, so rendering the action, its parameters and the verification code IS
+  the security control here, not decoration.
+
+  WHY THIS DOES NOT USE YOUR PASSKEY
+  It cannot, and no page opened from a file could. WebAuthn requires a secure context and binds each
+  credential to the origin it was registered on, so a passkey enrolled for your Intyga tenant is simply
+  unusable from `file://` — and a page served from localhost would be a different origin, which the
+  authenticator would refuse. This is why an action whose policy sets `requireHardwareKey` has no
+  offline path at all and the verifier rejects one outright (DIV §5a.3 step 4) rather than quietly
+  accepting a weaker signature. Offline signing uses a P-256 key you hold as a file.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Intyga — Offline approval</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --text: #e6e8ec;
+        --muted: #9aa3b2;
+        --line: #262b36;
+        --red: #ff6b6b;
+        --green: #4ade80;
+        --amber: #fbbf24;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f7f8fa;
+          --panel: #ffffff;
+          --text: #16181d;
+          --muted: #5c6370;
+          --line: #e2e5ea;
+          --red: #c0392b;
+          --green: #157f3d;
+          --amber: #8a5a00;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px 16px 64px;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      main { max-width: 720px; margin: 0 auto; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      p.lede { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      h2 { font-size: 14px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+      textarea, input[type="text"] {
+        width: 100%;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 9px 10px;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      textarea { resize: vertical; }
+      button {
+        background: #2563eb;
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        padding: 9px 16px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+      dl { display: grid; grid-template-columns: minmax(90px, auto) 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
+      dt { color: var(--muted); }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      dd code { font: 12px ui-monospace, Menlo, Consolas, monospace; }
+      .code {
+        font: 22px/1.2 ui-monospace, Menlo, Consolas, monospace;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+      }
+      .warn { color: var(--amber); font-size: 12px; }
+      .err { color: var(--red); font-size: 13px; white-space: pre-wrap; }
+      .ok { color: var(--green); font-size: 13px; }
+      .out {
+        width: 100%;
+        background: var(--bg);
+        border: 1px solid var(--green);
+        border-radius: 6px;
+        padding: 10px;
+        font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+      .hidden { display: none; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      footer { color: var(--muted); font-size: 11px; max-width: 720px; margin: 24px auto 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Offline approval</h1>
+      <p class="lede">
+        Works with no network. Paste the request from the operator, read the verification code back to
+        them, then sign with your approver key.
+      </p>
+
+      <div class="panel">
+        <h2>1 — Paste the request</h2>
+        <label for="envelope">The <code>DIV1:</code> string from the operator</label>
+        <textarea id="envelope" rows="4" spellcheck="false" placeholder="DIV1:eyJhY3Rpb25UeXBlIjoi..."></textarea>
+        <div class="row" style="margin-top: 10px">
+          <button id="decode" type="button">Review request</button>
+        </div>
+        <p id="decodeErr" class="err hidden"></p>
+      </div>
+
+      <div class="panel hidden" id="reviewPanel">
+        <h2>2 — Check what you are approving</h2>
+        <dl>
+          <dt>Action</dt><dd id="rDisplay"></dd>
+          <dt>Type</dt><dd><code id="rType"></code></dd>
+          <dt>Target</dt><dd><code id="rTarget"></code></dd>
+          <dt>Parameters</dt><dd><code id="rParams"></code></dd>
+          <dt>Requested by</dt><dd><code id="rRequester"></code></dd>
+          <dt>Quorum</dt><dd id="rQuorum"></dd>
+          <dt>Expires</dt><dd id="rExpires"></dd>
+        </dl>
+        <hr style="border: 0; border-top: 1px solid var(--line); margin: 14px 0" />
+        <label>Verification code — read this back to the operator</label>
+        <div class="code" id="rCode"></div>
+        <p class="warn">
+          If this code does not match what is on the operator's screen, stop. Do not sign.
+        </p>
+      </div>
+
+      <div class="panel hidden" id="signPanel">
+        <h2>3 — Sign</h2>
+        <label for="keyfile">
+          Your approver private key — a PKCS#8 P-256 key, PEM or DER. Never uploaded anywhere; it is
+          read in this tab only.
+        </label>
+        <input id="keyfile" type="file" accept=".pem,.key,.der,.p8,application/x-pem-file" />
+        <label for="did" style="margin-top: 12px">Your approver DID</label>
+        <input id="did" type="text" spellcheck="false" placeholder="did:intyga:human:..." />
+        <div class="row" style="margin-top: 12px">
+          <button id="sign" type="button">Sign this approval</button>
+          <span class="warn">Only if the code matched.</span>
+        </div>
+        <p id="signErr" class="err hidden"></p>
+      </div>
+
+      <div class="panel hidden" id="resultPanel">
+        <h2>4 — Send this back</h2>
+        <div class="out" id="sigOut"></div>
+        <div class="row" style="margin-top: 10px">
+          <button id="copy" type="button" class="secondary">Copy</button>
+          <span id="copied" class="ok hidden">Copied.</span>
+        </div>
+      </div>
+
+      <footer>
+        This page cannot use a passkey: WebAuthn credentials are bound to the origin they were
+        registered on, so one enrolled for your Intyga tenant will not work from a local file. Actions
+        whose policy requires a hardware-backed credential therefore have no offline path, and the
+        verifier rejects such a proof rather than accepting a weaker signature.
+      </footer>
+    </main>
+
+    <script>
+      "use strict"
+      // Everything below is deliberately dependency-free. No imports, no CDN, no fetch.
+
+      const OFFLINE_TYPE = "div-offline-intent"
+      const $ = (id) => document.getElementById(id)
+      let current = null // { canonical, expiresAt }
+
+      function fromB64url(s) {
+        const b64 = s.replace(/-/g, "+").replace(/_/g, "/")
+        const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4))
+        const out = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+        return out
+      }
+      function toB64(bytes) {
+        let s = ""
+        for (const b of bytes) s += String.fromCharCode(b)
+        return btoa(s)
+      }
+      function toB64url(bytes) {
+        return toB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+      }
+
+      function show(el, on) {
+        el.classList.toggle("hidden", !on)
+      }
+      function fail(el, msg) {
+        el.textContent = msg
+        show(el, true)
+      }
+
+      /**
+       * Verification code: first 8 hex of SHA-256 over the canonical payload, grouped XXXX-XXXX.
+       * Must match `verificationCode()` in @intyga/verify byte for byte, or the approver and the
+       * operator would be comparing different things — which would make the check worse than useless.
+       */
+      async function verificationCode(canonical) {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical))
+        const hex = [...new Uint8Array(digest)]
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .slice(0, 8)
+          .toUpperCase()
+        return `${hex.slice(0, 4)}-${hex.slice(4, 8)}`
+      }
+
+      $("decode").addEventListener("click", async () => {
+        show($("decodeErr"), false)
+        show($("reviewPanel"), false)
+        show($("signPanel"), false)
+        show($("resultPanel"), false)
+        current = null
+
+        const raw = $("envelope").value.trim()
+        if (!raw.startsWith("DIV1:")) {
+          fail($("decodeErr"), "That is not an approval request — it should begin with DIV1:")
+          return
+        }
+        let canonical
+        try {
+          canonical = new TextDecoder().decode(fromB64url(raw.slice(5)))
+        } catch {
+          fail($("decodeErr"), "Could not decode the request. Was the paste truncated?")
+          return
+        }
+        let p
+        try {
+          p = JSON.parse(canonical)
+        } catch {
+          fail($("decodeErr"), "The request does not contain valid JSON. Was the paste truncated?")
+          return
+        }
+        // Refuse anything that is not an offline challenge. Signing an ordinary intent payload here
+        // would mint a live approval outside the gateway's single-use accounting; signing a delegation
+        // would hand over approval authority. An approver must not be able to be walked into either.
+        if (p.type !== OFFLINE_TYPE) {
+          fail(
+            $("decodeErr"),
+            `This is a "${p.type}" payload, not an offline approval request.\nRefusing to sign it.`,
+          )
+          return
+        }
+
+        const expiresMs = Date.parse(p.expiresAt)
+        const secondsLeft = Math.round((expiresMs - Date.now()) / 1000)
+
+        $("rDisplay").textContent = p.display ?? "(none given)"
+        $("rType").textContent = p.actionType ?? "?"
+        $("rTarget").textContent = p.target ?? "?"
+        $("rParams").textContent = JSON.stringify(p.params ?? {})
+        $("rRequester").textContent = (p.requester && p.requester.did) || "(unknown)"
+        $("rQuorum").textContent = `${(p.requirement && p.requirement.requiredApprovals) || "?"} approver(s) required`
+        $("rExpires").textContent =
+          secondsLeft > 0
+            ? `${p.expiresAt} — ${secondsLeft}s from now`
+            : `${p.expiresAt} — ALREADY EXPIRED`
+        $("rCode").textContent = await verificationCode(canonical)
+
+        current = { canonical, expiresAt: p.expiresAt }
+        show($("reviewPanel"), true)
+        if (secondsLeft <= 0) {
+          fail($("decodeErr"), "This request has already expired. Ask the operator for a fresh one.")
+          return
+        }
+        show($("signPanel"), true)
+      })
+
+      /** Parse a PEM or raw DER PKCS#8 file into bytes WebCrypto will import. */
+      async function readPkcs8(file) {
+        const buf = new Uint8Array(await file.arrayBuffer())
+        const text = new TextDecoder().decode(buf.slice(0, 40))
+        if (!text.includes("-----BEGIN")) return buf
+        const pem = new TextDecoder().decode(buf)
+        const body = pem
+          .replace(/-----BEGIN [^-]+-----/, "")
+          .replace(/-----END [^-]+-----/, "")
+          .replace(/\s+/g, "")
+        return fromB64url(body.replace(/\+/g, "-").replace(/\//g, "_"))
+      }
+
+      $("sign").addEventListener("click", async () => {
+        show($("signErr"), false)
+        show($("resultPanel"), false)
+        if (!current) return
+
+        // Re-check expiry at SIGN time, not only at decode time: a challenge that lapsed while the
+        // approver was reviewing would otherwise be signed and then refused by every verifier.
+        if (Date.parse(current.expiresAt) < Date.now())
+          return fail(
+            $("signErr"),
+            "This challenge expired while you were reviewing it. Ask the operator for a fresh one.",
+          )
+
+        const file = $("keyfile").files && $("keyfile").files[0]
+        const did = $("did").value.trim()
+        if (!file) return fail($("signErr"), "Choose your private key file.")
+        if (!did) return fail($("signErr"), "Enter your approver DID.")
+
+        let key
+        try {
+          const pkcs8 = await readPkcs8(file)
+          key = await crypto.subtle.importKey(
+            "pkcs8",
+            pkcs8,
+            { name: "ECDSA", namedCurve: "P-256" },
+            true,
+            ["sign"],
+          )
+        } catch (err) {
+          return fail(
+            $("signErr"),
+            `Could not read that key: ${err.message}\nIt must be an unencrypted PKCS#8 P-256 key (PEM or DER).`,
+          )
+        }
+
+        let sigB64
+        try {
+          // ECDSA over SHA-256, raw r||s — the IEEE P1363 form the verifier accepts.
+          const sig = await crypto.subtle.sign(
+            { name: "ECDSA", hash: "SHA-256" },
+            key,
+            new TextEncoder().encode(current.canonical),
+          )
+          sigB64 = toB64(new Uint8Array(sig))
+        } catch (err) {
+          return fail($("signErr"), `Signing failed: ${err.message}`)
+        }
+
+        // The public key travels with the signature for display and telemetry only — the relying party
+        // resolves the key it trusts from its own trust bundle, never from this envelope.
+        let spkiB64 = ""
+        try {
+          const pub = await crypto.subtle.importKey(
+            "pkcs8",
+            await readPkcs8(file),
+            { name: "ECDSA", namedCurve: "P-256" },
+            true,
+            ["sign"],
+          )
+          const jwk = await crypto.subtle.exportKey("jwk", pub)
+          const pubKey = await crypto.subtle.importKey(
+            "jwk",
+            { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y, ext: true },
+            { name: "ECDSA", namedCurve: "P-256" },
+            true,
+            ["verify"],
+          )
+          spkiB64 = toB64(new Uint8Array(await crypto.subtle.exportKey("spki", pubKey)))
+        } catch {
+          // Non-fatal: verification does not depend on this field.
+        }
+
+        const envelope =
+          "SIG1:" +
+          toB64url(
+            new TextEncoder().encode(
+              JSON.stringify({ did, key: spkiB64, sig: sigB64, alg: "ES256" }),
+            ),
+          )
+        $("sigOut").textContent = envelope
+        show($("resultPanel"), true)
+      })
+
+      $("copy").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText($("sigOut").textContent)
+          show($("copied"), true)
+          setTimeout(() => show($("copied"), false), 2000)
+        } catch {
+          // Clipboard access can be denied from file://. The text is selectable, so this is cosmetic.
+        }
+      })
+    </script>
+  </body>
+</html>

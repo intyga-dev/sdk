@@ -6,11 +6,20 @@
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
 export {
   type ApprovalReceipt,
+  type ApproverTrustAnchor,
   canonicalIntentPayload,
+  SELF_CERTIFYING_DID_PREFIX,
+  selfCertifyingDid,
   verificationCode,
   verifyApprovalReceipt,
   verifyEcdsaP256,
 } from "@intyga/verify"
+export {
+  parseTrustAnchorFile,
+  TRUST_ANCHOR_FILE_TYPE,
+  type TrustAnchorFile,
+  trustAnchorApprovers,
+} from "./trust-anchor.js"
 export * as policy from "./policy.js"
 export {
   assembleOfflineReceipt,
@@ -44,6 +53,22 @@ export {
   type TrustBundleFiles,
   verifyTrustBundle,
 } from "./trust-bundle.js"
+// The platform-plane client (DIV §5c): for services embedding Intyga for their own end customers —
+// opaque subjects, relayed WebAuthn on the platform's origin, hash-only receipts. Its offline
+// verifier (verifyPlatformReceipt) is re-exported from @intyga/verify alongside it.
+export {
+  hashPayload,
+  IntygaPlatformClient,
+  type IntygaPlatformClientOptions,
+  type PlatformSignatureResult,
+  type PlatformSubjectView,
+  type SignatureChallenge,
+} from "./platform.js"
+export {
+  type PlatformReceipt,
+  type PlatformReceiptExpectation,
+  verifyPlatformReceipt,
+} from "@intyga/verify"
 
 import type { ApprovalReceipt } from "@intyga/verify"
 import {
@@ -138,8 +163,9 @@ const MAX_POLL_ERRORS = 5
  * Distinct from a transport failure on purpose. Both used to surface as a bare `Error`, so
  * `requireApproval` could not tell "the gateway is gone" from "the gateway refused" — and routed
  * both into the DIV §5a offline-approval path. A reachable gateway returning 403 (SecurityViolation,
- * which `RequirementUnavailable` extends), 402 (Protected Ops exhausted), 401 or 429 is a verdict,
- * not an outage, and a verdict must not be answered by collecting signatures out of band.
+ * which `RequirementUnavailable` extends), 401 or 429 is a verdict, not an outage, and a verdict
+ * must not be answered by collecting signatures out of band. (402 no longer fires for usage —
+ * approvals have no plan allowance — but any 4xx that does arrive is handled the same way.)
  */
 export class GatewayRefused extends Error {
   readonly status: number
@@ -160,21 +186,115 @@ function loadStoredToken(gatewayUrl: string): string | undefined {
   return undefined
 }
 
+/**
+ * Where the bearer token came from. Only an `exchange` can be repeated: an `explicit` token is the
+ * caller's to refresh, and a `stored` one (`intyga login`) is bound to a single passkey ceremony
+ * with no client secret behind it, so when it expires the only remedy is logging in again.
+ */
+type TokenSource = "explicit" | "exchange" | "stored"
+
+interface CachedToken {
+  token: string
+  source: Exclude<TokenSource, "explicit">
+  /** Epoch ms at which the token stops being served from the cache; `undefined` = no expiry known. */
+  refreshAt?: number
+}
+
+/** The furthest ahead of expiry a token is re-exchanged; shorter tokens use a tenth of their TTL. */
+const REFRESH_MARGIN_MS = 60_000
+
+/**
+ * When to stop serving a token with `expires_in` seconds of life. Absent or malformed means "no
+ * expiry known", which keeps the pre-refresh behaviour (cache until the gateway says 401).
+ */
+function refreshAtFor(expiresIn: unknown, now: number): number | undefined {
+  if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0) return undefined
+  const ttlMs = expiresIn * 1000
+  return now + ttlMs - Math.min(REFRESH_MARGIN_MS, ttlMs / 10)
+}
+
+/**
+ * Read `exp` out of a JWT WITHOUT verifying it. This is a hint for when a stored credential should
+ * stop being offered, never a trust decision — the gateway verifies the signature and is the only
+ * authority on whether the token is good. Anything that does not parse simply yields no hint.
+ */
+function jwtExpiryHint(token: string): number | undefined {
+  const parts = token.split(".")
+  if (parts.length !== 3 || !parts[1]) return undefined
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { exp?: unknown }
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp * 1000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const STORED_CREDENTIAL_EXPIRED =
+  "the credential saved by `intyga login` has expired and cannot be refreshed — run `intyga login` again"
+
+/**
+ * The credential saved by `intyga login` is no longer good — the gateway said 401 to it, or its own
+ * `exp` has passed and it was not sent at all. A `GatewayRefused` with status 401 on purpose: there
+ * is no client secret behind a CLI login, so the only refresh path is logging in again, and an
+ * expired credential must be handled as the refusal it stands for — never as an outage that
+ * `requireApproval` may answer by collecting signatures offline.
+ */
+export class StoredCredentialExpired extends GatewayRefused {
+  constructor(message: string) {
+    super(401, message)
+    this.name = "StoredCredentialExpired"
+  }
+}
+
 export class IntygaClient {
-  private cachedToken?: string
+  private cached?: CachedToken
   constructor(private readonly opts: IntygaClientOptions) {}
 
-  /** Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange. */
+  /**
+   * Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange.
+   *
+   * An exchanged token is cached only until shortly before the `expires_in` the gateway reported —
+   * `min(60s, expires_in / 10)` ahead of expiry — and re-exchanged after that, so a long-lived service
+   * object (or a `requireApproval` wait longer than the token's life) keeps working without the caller
+   * managing tokens. A response with no `expires_in` is cached for the life of the process, as before.
+   */
   async token(): Promise<string> {
-    if (this.opts.token) return this.opts.token
-    if (this.cachedToken) return this.cachedToken
+    return (await this.resolveToken()).token
+  }
+
+  private async resolveToken(): Promise<{ token: string; source: TokenSource }> {
+    if (this.opts.token) return { token: this.opts.token, source: "explicit" }
+    const now = Date.now()
+    if (this.cached && (this.cached.refreshAt === undefined || now < this.cached.refreshAt)) {
+      return { token: this.cached.token, source: this.cached.source }
+    }
     if (this.opts.allowStoredCredentials) {
+      // Re-read the file on every miss: a fresh `intyga login` in another terminal should be picked
+      // up by a wait that is still running, instead of that wait dying on the token it started with.
       const stored = loadStoredToken(this.opts.gatewayUrl)
       if (stored) {
-        this.cachedToken = stored
-        return stored
+        const exp = jwtExpiryHint(stored)
+        if (exp === undefined || now < exp) {
+          this.cached = { token: stored, source: "stored", refreshAt: exp }
+          return { token: stored, source: "stored" }
+        }
+        // Expired on disk, and there is nothing here to re-exchange it with — unless the caller ALSO
+        // supplied client credentials, which are still good and should not be blocked by a stale file.
+        if (!this.opts.clientId || !this.opts.clientSecret)
+          throw new StoredCredentialExpired(STORED_CREDENTIAL_EXPIRED)
       }
     }
+    return this.exchange(now)
+  }
+
+  /**
+   * The client-credentials exchange itself, bypassing the stored-credential lookup. The 401 retry in
+   * `authed()` calls this directly: going back through `resolveToken()` would consult
+   * `~/.intyga/credentials.json` first, so a process configured with BOTH a stored `intyga login`
+   * token and client credentials could retry an agent call as the human — a different principal, a
+   * different ceremony shape, and a different requester on the witness leaf.
+   */
+  private async exchange(now: number): Promise<{ token: string; source: "exchange" }> {
     if (!this.opts.clientId || !this.opts.clientSecret) {
       throw new Error(
         this.opts.allowStoredCredentials
@@ -187,10 +307,52 @@ export class IntygaClient {
       method: "POST",
       headers: { authorization: `Basic ${basic}` },
     })
-    if (!res.ok) throw new Error(`token exchange failed: ${res.status} ${await res.text()}`)
-    const data = (await res.json()) as { access_token: string }
-    this.cachedToken = data.access_token
-    return data.access_token
+    // A refused exchange is a verdict from a reachable gateway, like any other 4xx — and since the
+    // 401-retry in `authed()` re-exchanges, a revoked key now gets here mid-call, where a bare Error
+    // would read as an outage and could route a `requireApproval` wait offline.
+    if (!res.ok)
+      throw new GatewayRefused(res.status, `token exchange failed: ${res.status} ${await res.text()}`)
+    const data = (await res.json()) as { access_token: string; expires_in?: unknown }
+    this.cached = {
+      token: data.access_token,
+      source: "exchange",
+      refreshAt: refreshAtFor(data.expires_in, now),
+    }
+    return { token: data.access_token, source: "exchange" }
+  }
+
+  /**
+   * One authenticated request. On a 401 carrying a token WE exchanged, the cache is dropped and the
+   * call retried exactly once with a fresh client-credentials exchange (never a stored credential —
+   * see `exchange()`) — that covers clock skew against the gateway and a
+   * gateway-side TTL change, both of which would otherwise leave a long-running process refusing every
+   * call until restart. An explicit token is never retried (there is nothing to re-exchange it with),
+   * and a stored credential is not either: see `refusal()` for what it gets instead.
+   */
+  private async authed(
+    path: string,
+    init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+  ): Promise<{ res: Response; source: TokenSource }> {
+    const send = (token: string) =>
+      fetch(`${this.opts.gatewayUrl}${path}`, {
+        ...init,
+        headers: { ...init.headers, authorization: `Bearer ${token}` },
+      })
+    const first = await this.resolveToken()
+    const res = await send(first.token)
+    if (res.status !== 401 || first.source !== "exchange") return { res, source: first.source }
+    this.cached = undefined
+    const retry = await this.exchange(Date.now())
+    return { res: await send(retry.token), source: retry.source }
+  }
+
+  /** A refusal on a stored credential names the one remedy there is, instead of a bare 401. */
+  private refusal(op: string, res: Response, source: TokenSource, text: string): GatewayRefused {
+    const message = `${op} failed: ${res.status}${text ? ` ${text}` : ""}`
+    if (res.status !== 401 || source !== "stored") return new GatewayRefused(res.status, message)
+    // Drop it so the next call re-reads the file rather than re-sending a token the gateway refused.
+    this.cached = undefined
+    return new StoredCredentialExpired(`${message} — ${STORED_CREDENTIAL_EXPIRED}`)
   }
 
   /**
@@ -215,13 +377,9 @@ export class IntygaClient {
           "this approval is bound to",
       )
     }
-    const token = await this.token()
-    const res = await fetch(`${this.opts.gatewayUrl}/authorize`, {
+    const { res, source } = await this.authed("/authorize", {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({
         target,
         actionDescription,
@@ -230,7 +388,7 @@ export class IntygaClient {
         timeout: opts?.timeout,
       }),
     })
-    if (!res.ok) throw new GatewayRefused(res.status, `authorize failed: ${res.status} ${await res.text()}`)
+    if (!res.ok) throw this.refusal("authorize", res, source, await res.text())
     return (await res.json()) as { nonce: string; status: ApprovalStatus }
   }
 
@@ -242,13 +400,10 @@ export class IntygaClient {
     nonce: string,
     what: { target: string; actionType: string; params?: Record<string, unknown> },
   ): Promise<{ ok: boolean; reason?: string }> {
-    const token = await this.token()
-    const res = await fetch(`${this.opts.gatewayUrl}/authorize/verify`, {
+    // Non-throwing by contract: callers branch on `ok`, so even a refusal status reaches them as a body.
+    const { res } = await this.authed("/authorize/verify", {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({
         nonce,
         target: what.target,
@@ -261,11 +416,8 @@ export class IntygaClient {
 
   /** Poll a challenge's current status (non-blocking). */
   async status(nonce: string): Promise<ApprovalResult> {
-    const token = await this.token()
-    const res = await fetch(`${this.opts.gatewayUrl}/authorize/${encodeURIComponent(nonce)}`, {
-      headers: { authorization: `Bearer ${token}` },
-    })
-    if (!res.ok) throw new GatewayRefused(res.status, `status failed: ${res.status}`)
+    const { res, source } = await this.authed(`/authorize/${encodeURIComponent(nonce)}`)
+    if (!res.ok) throw this.refusal("status", res, source, "")
     return (await res.json()) as ApprovalResult
   }
 
@@ -283,10 +435,15 @@ export class IntygaClient {
    *   // Hard binding before executing. `nonce` and `approvers` are REQUIRED by
    *   // verifyApprovalReceipt and have no default: a receipt checked against the key inside
    *   // itself proves nothing (DIV Invariant 3). Resolve approvers from your own key policy.
+   *   // For passkey receipts (the normal flow) `expectedOrigin`/`expectedRpId` are REQUIRED too —
+   *   // the verifier fails closed without them, or an assertion from any site would verify.
    *   const check = verifyApprovalReceipt(r.receipt!, {
    *     ...action,
    *     nonce: r.nonce!,
    *     approvers: { publicKeys: trustedApproverKeys },
+   *   }, {
+   *     expectedOrigin: process.env.INTYGA_WEBAUTHN_ORIGIN,  // your approval console's origin
+   *     expectedRpId: process.env.INTYGA_WEBAUTHN_RP_ID,     // and its RP ID
    *   });
    *   if (!check.ok) throw new Error(check.reason);
    *
@@ -394,16 +551,18 @@ export class IntygaClient {
   async reconcileOfflineApprovals(
     opts: Pick<OfflineApprovalOptions, "bundleDir" | "bufferDir">,
   ): Promise<{ reported: number; failed: number; reasons: string[] }> {
-    const token = await this.token()
+    // Resolve credentials up front so a misconfigured client throws here, as it always did, instead of
+    // being counted as one "failed" report per buffered approval.
+    await this.token()
     const reasons: string[] = []
     let reported = 0
     let failed = 0
 
     for (const use of pendingApprovals(opts)) {
       try {
-        const res = await fetch(`${this.opts.gatewayUrl}/offline-approval/reconcile`, {
+        const { res } = await this.authed("/offline-approval/reconcile", {
           method: "POST",
-          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          headers: { "content-type": "application/json" },
           body: JSON.stringify({
             nonce: use.nonce,
             usedAt: use.usedAt,

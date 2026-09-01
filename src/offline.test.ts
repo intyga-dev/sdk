@@ -791,3 +791,28 @@ describe("nonces used as path segments", () => {
     assert.equal(fs.existsSync(path.join(dir, "escape.used")), false)
   })
 })
+
+describe("offline-sign.html source pin", () => {
+  // The parity tests above re-implement the page's WebCrypto calls — they cannot execute the HTML
+  // itself, so an edit to the page's own script used to pass this suite unnoticed. Pinning the
+  // source text of the security-relevant lines makes a page edit fail here until the parity tests
+  // are re-checked against it.
+  const html = fs.readFileSync(new URL("../offline-sign.html", import.meta.url), "utf8")
+
+  it("still derives the verification code exactly as @intyga/verify does", () => {
+    assert.match(html, /crypto\.subtle\.digest\("SHA-256", new TextEncoder\(\)\.encode\(canonical\)\)/)
+    assert.match(html, /\.slice\(0, 8\)/)
+    assert.match(html, /\.toUpperCase\(\)/)
+    assert.match(html, /hex\.slice\(0, 4\)\}-\$\{hex\.slice\(4, 8\)\}/)
+  })
+
+  it("still signs P-256 ECDSA (raw P1363) over the canonical bytes", () => {
+    assert.match(html, /namedCurve: "P-256"/)
+    assert.match(html, /\{ name: "ECDSA", hash: "SHA-256" \}/)
+    assert.match(html, /new TextEncoder\(\)\.encode\(current\.canonical\)/)
+  })
+
+  it("re-checks expiry at sign time, not only at decode time", () => {
+    assert.match(html, /Date\.parse\(current\.expiresAt\) < Date\.now\(\)/)
+  })
+})
