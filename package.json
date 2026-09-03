@@ -59,7 +59,7 @@
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=87 --test-coverage-branches=75 --test-coverage-functions=88 --test-coverage-exclude='../**' --test-coverage-exclude='dist/cli.js' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.4.0",
     "typescript": "^5.9.3"
   }
 }
