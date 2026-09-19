@@ -5,6 +5,15 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+- Rebuilt against the DIV Intent Payload's new REQUIRED `evidence` field (DIV §4.3.4), which is
+  `null` in this version. No API change; receipts carry the field inside `canonicalPayload` only.
+
+- Offline delegation seals must satisfy the action's ordinary eligible approvers and sealing
+  requirement, including quorum and four-eyes restrictions. Recheck the trust bundle's freshness
+  after collecting signatures; delegated approvals also recheck the delegation's expiry at use.
+- Offline rule selection uses gateway-signed ranking and tie-breaking metadata, including the
+  ordering effects of online-only constraints. Re-export legacy trust bundles when multiple rules
+  match an action; ambiguous or incomplete selection metadata is refused.
 - **Tokens are refreshed automatically.** `IntygaClient` now reads `expires_in` from the
   client-credentials exchange and re-exchanges `min(60s, expires_in / 10)` before expiry, so a
   long-lived client (or a `requireApproval` wait longer than the token's life) no longer fails

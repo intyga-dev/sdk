@@ -40,6 +40,9 @@ export interface BundleApprover {
 
 /** The approval requirement in force for one action pattern, as the gateway resolved it. */
 export interface BundlePolicy {
+  /** Mirrors gateway TrustBundlePolicyEntry (apps/gateway/src/approvalMatch.ts). Absent only in legacy exports. */
+  selectionRank?: number
+  selectionKey?: string
   /** Matched against `actionType` + display text, exactly as the gateway matches its own rules. */
   actionPattern: string
   requiredApprovals: number
@@ -135,6 +138,16 @@ export function verifyTrustBundle(
     return { ok: false, reason: "trust bundle names no approvers" }
   if (!Array.isArray(bundle.policy)) return { ok: false, reason: "trust bundle carries no policy" }
 
+  const freshness = checkTrustBundleFreshness(bundle, opts)
+  if (!freshness.ok) return freshness
+  return { ok: true, bundle }
+}
+
+/** Recheck a verified bundle after an out-of-band signing ceremony, without changing its trust keys. */
+export function checkTrustBundleFreshness(
+  bundle: TrustBundle,
+  opts: { asOf?: Date } = {},
+): { ok: boolean; reason?: string } {
   // Two independent staleness checks. The gateway's own `expiresAt` can be set generously, so the
   // local age cap is what actually bounds drift — a relying party must not be able to run for a year
   // on a bundle just because whoever exported it chose a long expiry.
@@ -154,7 +167,7 @@ export function verifyTrustBundle(
       reason: `trust bundle is ${ageDays.toFixed(1)} days old, over the ${MAX_TRUST_BUNDLE_AGE_DAYS}-day maximum — export a fresh one`,
     }
 
-  return { ok: true, bundle }
+  return { ok: true }
 }
 
 /** Write a bundle and its pinned verification key into `dir`, for use during a later outage. */
@@ -212,15 +225,18 @@ export function approverAnchor(bundle: TrustBundle, limitToDids?: string[]): App
 }
 
 /**
- * Resolve the requirement for an action from the bundle, mirroring the gateway's own rule selection.
+ * Resolve the requirement for an action from the bundle's offline policy projection.
  *
- * Matching and precedence are copied from the gateway deliberately: the pattern is matched against
+ * Matching follows the gateway: the pattern is matched against
  * `actionType` AND the display text together (so a rule keyed to the action type cannot be dodged by
  * wording the description around it), and among several matches the STRICTEST wins rather than the
  * longest. A relying party that picked the first or loosest match would quietly grant itself a weaker
  * policy than the tenant configured.
+ * Ranking and tie-breaking come from signed gateway metadata, because even online-only constraints
+ * (DIV §4.3.2) affect which rule supplies the ordinary approver set. A legacy bundle with overlapping
+ * matches must be refreshed; guessing its lost selection metadata could choose weaker approvers.
  *
- * Returns `null` when nothing matches. That is a REFUSAL, not a default: there is no implicit
+ * Returns `null` when nothing matches or selection is ambiguous. That is a REFUSAL, not a default: there is no implicit
  * 1-of-1 fallback here, because inventing a requirement is exactly what §5a.3 forbids.
  */
 export function requirementFor(
@@ -233,11 +249,43 @@ export function requirementFor(
     (p) => p.actionPattern === "*" || haystack.includes(p.actionPattern.toLowerCase()),
   )
   if (matches.length === 0) return null
-  // Strictness ordering mirrors the gateway's ruleStrictness: approvals dominate, then hardware key,
-  // then four-eyes. Weights are shifted so no combination of weaker controls outranks a stronger one.
-  const strictness = (p: BundlePolicy) =>
-    Math.max(1, p.requiredApprovals) * 8 + (p.requireHardwareKey ? 4 : 0) + (p.requesterCannotApprove ? 1 : 0)
-  const winner = [...matches].sort((a, b) => strictness(b) - strictness(a))[0] as BundlePolicy
+  if (
+    matches.length > 1 &&
+    matches.some(
+      (p) =>
+        !Number.isSafeInteger(p.selectionRank) ||
+        (p.selectionRank ?? 0) < 1 ||
+        typeof p.selectionKey !== "string" ||
+        p.selectionKey.length === 0,
+    )
+  )
+    return null
+  const winner = [...matches].sort((a, b) => {
+    const rank = (b.selectionRank ?? 0) - (a.selectionRank ?? 0)
+    if (rank !== 0) return rank
+    const ka = a.selectionKey ?? ""
+    const kb = b.selectionKey ?? ""
+    return ka < kb ? -1 : ka > kb ? 1 : 0
+  })[0] as BundlePolicy
+  // Expanded groups can expose different eligible sets behind otherwise identical selection keys.
+  // Do not let array order resolve a remaining collision with different authorization semantics.
+  const policyKey = (p: BundlePolicy) =>
+    JSON.stringify([
+      p.requiredApprovals,
+      p.requireHardwareKey,
+      [...(p.allowedAaguids ?? [])].sort(),
+      p.requesterCannotApprove,
+      [...p.approverDids].sort(),
+    ])
+  if (
+    matches.some(
+      (p) =>
+        p.selectionRank === winner.selectionRank &&
+        p.selectionKey === winner.selectionKey &&
+        policyKey(p) !== policyKey(winner),
+    )
+  )
+    return null
   return {
     requirement: {
       requiredApprovals: Math.max(1, winner.requiredApprovals),

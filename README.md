@@ -95,6 +95,10 @@ assemble the result into an `OFFLINE_APPROVED` receipt — a status deliberately
 guard. Call `intyga.reconcileOfflineApprovals()` on reconnect: until an offline approval is
 reported it exists only on your disk. See [`docs/DIV.md`](../../docs/DIV.md) §5a.
 
+Update the gateway and SDK together, then re-export trust bundles used with overlapping approval
+rules. New exports carry signed rule-selection metadata; older bundles with multiple matching rules
+are refused because their governing approver set cannot be selected reliably.
+
 Node ≥18 (global `fetch` + `node:crypto`); the only dependency is the zero-dep [`@intyga/verify`](https://github.com/intyga-dev/verify).
 
 ## Verify approvals independently

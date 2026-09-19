@@ -53,6 +53,8 @@ function makeApprover(did: string) {
 
 const ALICE = makeApprover("did:intyga:alice")
 const BOB = makeApprover("did:intyga:bob")
+const MALLORY = makeApprover("did:intyga:mallory")
+const CAROL = makeApprover("did:intyga:carol")
 
 function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
@@ -184,6 +186,8 @@ describe("trust bundle", () => {
     const bundle = bundleOf({
       policy: [
         {
+          selectionRank: 32,
+          selectionKey: '["*",[],[],["did:intyga:alice"]]',
           actionPattern: "*",
           requiredApprovals: 1,
           requireHardwareKey: false,
@@ -193,6 +197,8 @@ describe("trust bundle", () => {
           approverDids: [ALICE.did],
         },
         {
+          selectionRank: 100,
+          selectionKey: '["db.restart",[],[],["did:intyga:alice","did:intyga:bob"]]',
           // Keyed to the ACTION TYPE, and deliberately absent from the display text — a matcher that
           // only looked at the description would miss this and hand back the 1-of-1 rule.
           actionPattern: "db.restart",
@@ -208,6 +214,119 @@ describe("trust bundle", () => {
     const resolved = requirementFor(bundle, "db.restart", "Emergency recovery procedure")
     assert.equal(resolved?.requirement.requiredApprovals, 3)
     assert.equal(resolved?.requirement.requesterCannotApprove, true)
+  })
+
+  it("uses signed selection metadata regardless of exported rule order", () => {
+    const policy: TrustBundle["policy"] = [
+      {
+        selectionRank: 33,
+        selectionKey: '["*",[],["issuer-a"],["did:intyga:alice"]]',
+        actionPattern: "*",
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+        approverDids: [ALICE.did],
+      },
+      {
+        selectionRank: 40,
+        selectionKey: '["db.restart",[],[],["did:intyga:bob"]]',
+        actionPattern: "db.restart",
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+        approverDids: [BOB.did],
+      },
+    ]
+    for (const ordered of [policy, [...policy].reverse()]) {
+      const resolved = requirementFor(
+        bundleOf({ policy: ordered }),
+        "db.restart",
+        "Emergency recovery procedure",
+      )
+      assert.deepEqual(resolved?.approverDids, [BOB.did])
+    }
+  })
+
+  it("uses signed tie-break metadata deterministically for equally ranked AAGUID rules", () => {
+    const policy: TrustBundle["policy"] = [
+      {
+        selectionRank: 34,
+        selectionKey: '["db.restart",["yubikey"],[],["did:intyga:alice"]]',
+        actionPattern: "db.restart",
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: ["yubikey"],
+        requesterCannotApprove: false,
+        signerClass: "human",
+        approverDids: [ALICE.did],
+      },
+      {
+        selectionRank: 34,
+        selectionKey: '["db.restart",["titan"],[],["did:intyga:bob"]]',
+        actionPattern: "db.restart",
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: ["titan"],
+        requesterCannotApprove: false,
+        signerClass: "human",
+        approverDids: [BOB.did],
+      },
+    ]
+    for (const ordered of [policy, [...policy].reverse()]) {
+      const resolved = requirementFor(bundleOf({ policy: ordered }), "db.restart", ACTION.display)
+      assert.deepEqual(resolved?.approverDids, [BOB.did])
+      assert.deepEqual(resolved?.requirement.allowedAaguids, ["titan"])
+    }
+  })
+
+  it("refuses colliding rank/key metadata with different expanded eligible sets", () => {
+    const common = {
+      selectionRank: 32,
+      selectionKey: '["db.restart",[],[],["group:ops"]]',
+      actionPattern: "db.restart",
+      requiredApprovals: 1,
+      requireHardwareKey: false,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    }
+    const bundle = bundleOf({
+      policy: [
+        { ...common, approverDids: [ALICE.did] },
+        { ...common, approverDids: [BOB.did] },
+      ],
+    })
+    assert.equal(requirementFor(bundle, "db.restart", ACTION.display), null)
+  })
+
+  it("refuses overlapping legacy rules whose signed selection metadata is absent", () => {
+    const legacy = bundleOf({
+      policy: [
+        {
+          actionPattern: "*",
+          requiredApprovals: 1,
+          requireHardwareKey: false,
+          allowedAaguids: [],
+          requesterCannotApprove: false,
+          signerClass: "human",
+          approverDids: [ALICE.did],
+        },
+        {
+          actionPattern: "db.restart",
+          requiredApprovals: 2,
+          requireHardwareKey: false,
+          allowedAaguids: [],
+          requesterCannotApprove: false,
+          signerClass: "human",
+          approverDids: [ALICE.did, BOB.did],
+        },
+      ],
+    })
+    assert.equal(requirementFor(legacy, "db.restart", ACTION.display), null)
   })
 
   it("returns null for an unmatched action rather than defaulting to 1-of-1", () => {
@@ -387,7 +506,9 @@ describe("useOfflineApproval", () => {
   }
 
   it("approves when the quorum signs, and buffers the approval for reconciliation", async () => {
-    const dir = bundleDir()
+    const dir = bundleDir({
+      approvers: [ALICE, BOB, MALLORY, CAROL].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+    })
     const warnings: string[] = []
     const r = await useOfflineApproval(ACTION, {
       bundleDir: dir,
@@ -430,6 +551,180 @@ describe("useOfflineApproval", () => {
     })
     assert.equal(r.ok, false)
     assert.match(r.reason ?? "", /quorum not met/)
+  })
+
+  it("refuses a delegation sealed by a trusted but ineligible approver", async () => {
+    const dir = bundleDir({
+      approvers: [ALICE, BOB, MALLORY].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+      policy: [
+        {
+          actionPattern: ACTION.actionType,
+          requiredApprovals: 1,
+          requireHardwareKey: false,
+          allowedAaguids: [],
+          requesterCannotApprove: false,
+          signerClass: "human",
+          approverDids: [ALICE.did],
+        },
+      ],
+    })
+    const delegationDir = path.join(dir, "delegations")
+    fs.mkdirSync(delegationDir)
+    const payload = canonicalDelegationPayload({
+      ...ACTION,
+      requester: { did: requesterDid, attestation: null },
+      requirement: {
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      delegatedTo: [BOB.did],
+      delegatedQuorum: 1,
+      nonce: "dlg_ineligible",
+      sealedAt: new Date(Date.now() - 1000).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    const receipt = {
+      canonicalPayload: payload,
+      actionDescription: ACTION.display,
+      params: ACTION.params,
+      requester: { did: requesterDid, attestation: null },
+      signatures: [
+        {
+          signerDid: MALLORY.did,
+          signerPublicKey: MALLORY.spki,
+          signature: MALLORY.sign(payload),
+          sigAlg: "ES256",
+        },
+      ],
+      verificationCode: verificationCode(payload),
+    }
+    fs.writeFileSync(path.join(delegationDir, "bad.json"), JSON.stringify(receipt))
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: dir,
+      delegationDir,
+      requesterDid,
+      collectSignatures: collectFrom(BOB),
+      warn: () => {},
+    })
+    assert.equal(r.ok, false)
+  })
+
+  it("uses a valid ordinary 2-of-N seal to delegate to two other trusted approvers", async () => {
+    const dir = bundleDir({
+      approvers: [ALICE, BOB, MALLORY, CAROL].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+    })
+    const delegationDir = path.join(dir, "delegations")
+    fs.mkdirSync(delegationDir)
+    const payload = canonicalDelegationPayload({
+      ...ACTION,
+      requester: { did: requesterDid, attestation: null },
+      requirement: {
+        requiredApprovals: 2,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      delegatedTo: [MALLORY.did, CAROL.did],
+      delegatedQuorum: 2,
+      nonce: "dlg-valid-seal",
+      sealedAt: new Date(Date.now() - 1_000).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    fs.writeFileSync(
+      path.join(delegationDir, "valid.json"),
+      JSON.stringify({
+        canonicalPayload: payload,
+        actionDescription: ACTION.display,
+        params: ACTION.params,
+        requester: { did: requesterDid, attestation: null },
+        signatures: [ALICE, BOB].map((a) => ({
+          signerDid: a.did,
+          signerPublicKey: a.spki,
+          signature: a.sign(payload),
+          sigAlg: "ES256",
+        })),
+        verificationCode: verificationCode(payload),
+      }),
+    )
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: dir,
+      delegationDir,
+      requesterDid,
+      collectSignatures: collectFrom(MALLORY, CAROL),
+      warn: () => {},
+    })
+    assert.equal(r.ok, true, r.reason)
+    assert.equal(r.viaDelegation, "dlg-valid-seal")
+    assert.deepEqual(r.signers, [CAROL.did, MALLORY.did])
+  })
+
+  it("refuses a validly signed seal that drops the ordinary requesterCannotApprove requirement", async () => {
+    const dir = bundleDir({
+      approvers: [ALICE, BOB, MALLORY, CAROL].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+      policy: [
+        {
+          actionPattern: ACTION.actionType,
+          requiredApprovals: 2,
+          requireHardwareKey: false,
+          allowedAaguids: [],
+          requesterCannotApprove: true,
+          signerClass: "human",
+          approverDids: [ALICE.did, BOB.did],
+        },
+      ],
+    })
+    const delegationDir = path.join(dir, "delegations")
+    fs.mkdirSync(delegationDir)
+    const payload = canonicalDelegationPayload({
+      ...ACTION,
+      requester: { did: requesterDid, attestation: null },
+      requirement: {
+        requiredApprovals: 2,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      delegatedTo: [MALLORY.did, CAROL.did],
+      delegatedQuorum: 2,
+      nonce: "dlg-dropped-four-eyes",
+      sealedAt: new Date(Date.now() - 1_000).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    fs.writeFileSync(
+      path.join(delegationDir, "weaker.json"),
+      JSON.stringify({
+        canonicalPayload: payload,
+        actionDescription: ACTION.display,
+        params: ACTION.params,
+        requester: { did: requesterDid, attestation: null },
+        signatures: [ALICE, BOB].map((a) => ({
+          signerDid: a.did,
+          signerPublicKey: a.spki,
+          signature: a.sign(payload),
+          sigAlg: "ES256",
+        })),
+        verificationCode: verificationCode(payload),
+      }),
+    )
+    const warnings: string[] = []
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: dir,
+      delegationDir,
+      requesterDid,
+      collectSignatures: collectFrom(MALLORY, CAROL),
+      warn: (message) => warnings.push(message),
+    })
+    assert.equal(r.ok, false)
+    assert.equal(r.viaDelegation, undefined)
+    assert.ok(
+      warnings.some((warning) => /delegation sealing requirement is weaker/.test(warning)),
+      warnings.join("; "),
+    )
   })
 
   it("refuses when no signatures come back at all", async () => {
@@ -493,6 +788,81 @@ describe("useOfflineApproval", () => {
     })
     assert.equal(r.ok, false)
     assert.match(r.reason ?? "", /maximum|expired/)
+  })
+
+  it("rechecks bundle freshness after signature collection", async () => {
+    const asOf = new Date()
+    const dir = bundleDir({ expiresAt: new Date(asOf.getTime() + 1_000).toISOString() })
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: dir,
+      requesterDid,
+      asOf,
+      collectSignatures: async (challenge) => {
+        asOf.setTime(asOf.getTime() + 2_000)
+        return collectFrom(ALICE, BOB)(challenge)
+      },
+      warn: () => {},
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /expired|fresh|trust bundle/i)
+  })
+
+  it("rechecks delegation expiry after signature collection", async () => {
+    const asOf = new Date()
+    const delegationDir = path.join(
+      bundleDir({
+        approvers: [ALICE, BOB, MALLORY, CAROL].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+      }),
+      "delegations",
+    )
+    fs.mkdirSync(delegationDir)
+    const sealedAt = new Date(asOf.getTime() - 1_000)
+    const expiresAt = new Date(asOf.getTime() + 1_000)
+    const payload = canonicalDelegationPayload({
+      ...ACTION,
+      requester: { did: requesterDid, attestation: null },
+      requirement: {
+        requiredApprovals: 2,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      delegatedTo: [MALLORY.did, CAROL.did],
+      delegatedQuorum: 2,
+      nonce: "dlg-short",
+      sealedAt: sealedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+    })
+    fs.writeFileSync(
+      path.join(delegationDir, "short.json"),
+      JSON.stringify({
+        canonicalPayload: payload,
+        actionDescription: ACTION.display,
+        params: ACTION.params,
+        requester: { did: requesterDid, attestation: null },
+        signatures: [ALICE, BOB].map((a) => ({
+          signerDid: a.did,
+          signerPublicKey: a.spki,
+          signature: a.sign(payload),
+          sigAlg: "ES256",
+        })),
+        verificationCode: verificationCode(payload),
+      }),
+    )
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: path.dirname(delegationDir),
+      delegationDir,
+      requesterDid,
+      asOf,
+      collectSignatures: async (challenge) => {
+        asOf.setTime(asOf.getTime() + 60_000)
+        return collectFrom(MALLORY, CAROL)(challenge)
+      },
+      warn: () => {},
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /delegation.*expired|expired.*delegation/i)
   })
 })
 

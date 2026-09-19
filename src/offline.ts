@@ -45,7 +45,13 @@ import {
   verifyApprovalReceipt,
   verifyDelegation,
 } from "@intyga/verify"
-import { approverAnchor, loadTrustBundle, requirementFor, type TrustBundle } from "./trust-bundle.js"
+import {
+  approverAnchor,
+  checkTrustBundleFreshness,
+  loadTrustBundle,
+  requirementFor,
+  type TrustBundle,
+} from "./trust-bundle.js"
 
 /** Wire prefix for a challenge travelling OUT to the approvers. */
 export const CHALLENGE_ENVELOPE_PREFIX = "DIV1:"
@@ -116,7 +122,7 @@ export function createOfflineChallenge(input: {
   if (!resolved)
     return {
       ok: false,
-      reason: `the trust bundle has no approval rule matching "${input.actionType}" — an action with no configured requirement cannot be approved offline (DIV §5a.3)`,
+      reason: `the trust bundle has no approval rule matching "${input.actionType}" that can be selected unambiguously — configure the rule or export a fresh bundle with rule-selection metadata (DIV §5a.3)`,
     }
 
   // A hardware-key policy cannot be satisfied offline (DIV §5a.3 step 4). Refuse at CHALLENGE time as
@@ -477,6 +483,8 @@ export async function useOfflineApproval(
   const challenge = built.challenge
 
   const raw = await opts.collectSignatures(challenge)
+  const freshness = checkTrustBundleFreshness(bundle, { asOf: opts.asOf })
+  if (!freshness.ok) return freshness
   if (!raw || raw.length === 0)
     return { ok: false, reason: "no signatures were collected — the action is not approved" }
 
@@ -544,9 +552,15 @@ export async function useOfflineApproval(
 function findDelegation(
   dir: string,
   bundle: TrustBundle,
-  expected: { target: string; actionType: string; params: Record<string, unknown> },
+  expected: { target: string; actionType: string; display: string; params: Record<string, unknown> },
   asOf?: Date,
 ): { delegation?: VerifiedDelegation; reason?: string } {
+  const resolved = requirementFor(bundle, expected.actionType, expected.display)
+  if (!resolved)
+    return {
+      reason:
+        "no unambiguous ordinary approval rule applies to this delegation — export a fresh trust bundle",
+    }
   let files: string[]
   try {
     files = fs
@@ -570,7 +584,7 @@ function findDelegation(
       {
         // The ORDINARY approver set — not the delegates. Whoever may approve this action is who must
         // have delegated it.
-        approvers: approverAnchor(bundle),
+        approvers: approverAnchor(bundle, resolved.approverDids),
         target: expected.target,
         actionType: expected.actionType,
         params: expected.params,
@@ -579,6 +593,28 @@ function findDelegation(
     )
     if (!res.ok || !res.delegation) {
       rejected.push(`${path.basename(file)}: ${res.reason}`)
+      continue
+    }
+    // The preceding verification binds this requirement to the seal's signatures. Incident quorum
+    // alone is insufficient: an eligible person must not seal a 3-of-N delegation with a 1-of-N
+    // ceremony, nor omit an ordinary four-eyes/hardware restriction (DIV §5a.5).
+    const { requirement: sealed } = JSON.parse(receipt.canonicalPayload) as {
+      requirement: ApprovalRequirementAttestation
+    }
+    const ordinary = resolved.requirement
+    const weakerAaguids =
+      ordinary.allowedAaguids.length > 0 &&
+      (sealed.allowedAaguids.length === 0 ||
+        sealed.allowedAaguids.some((aaguid) => !ordinary.allowedAaguids.includes(aaguid)))
+    if (
+      sealed.requiredApprovals < ordinary.requiredApprovals ||
+      (ordinary.requireHardwareKey && !sealed.requireHardwareKey) ||
+      (ordinary.requesterCannotApprove && !sealed.requesterCannotApprove) ||
+      weakerAaguids
+    ) {
+      rejected.push(
+        `${path.basename(file)}: delegation sealing requirement is weaker than the ordinary approval rule`,
+      )
       continue
     }
     return { delegation: res.delegation }
