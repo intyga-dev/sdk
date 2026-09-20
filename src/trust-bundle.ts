@@ -1,3 +1,9 @@
+import {
+  selectApprovalRule,
+  validateExactApprovalPolicy,
+  ApprovalPolicyConflict,
+  type PolicyRule,
+} from "@intyga/verify/approval-policy"
 // Offline trust bundle (docs/DIV.md §5a.4) — the relying party's local answer to "whose signature
 // counts, and what does policy require?"
 //
@@ -22,7 +28,7 @@ import type { ApproverTrustAnchor, ApprovalRequirementAttestation } from "@intyg
 import { SIGNER_CLASS_HUMAN } from "@intyga/verify"
 
 /** Bundle `type` discriminator, inside the signed JWS payload. */
-export const DIV_TRUST_BUNDLE_TYPE = "div-trust-bundle"
+export const DIV_TRUST_BUNDLE_TYPE = "div-trust-bundle-v1"
 
 /**
  * Hard ceiling on bundle age, enforced here regardless of the `expiresAt` the gateway wrote. A stale
@@ -39,11 +45,12 @@ export interface BundleApprover {
 }
 
 /** The approval requirement in force for one action pattern, as the gateway resolved it. */
-export interface BundlePolicy {
-  /** Mirrors gateway TrustBundlePolicyEntry (apps/gateway/src/approvalMatch.ts). Absent only in legacy exports. */
+export interface BundlePolicy extends PolicyRule {
+  signerClass: "human"
+  /** Mirrors gateway TrustBundlePolicyEntry (apps/gateway/src/approvalMatch.ts). */
   selectionRank?: number
   selectionKey?: string
-  /** Matched against `actionType` + display text, exactly as the gateway matches its own rules. */
+  /** Exact actionType ID, or `*` for the tenant baseline. Display text never selects a rule. */
   actionPattern: string
   requiredApprovals: number
   requireHardwareKey: boolean
@@ -54,11 +61,12 @@ export interface BundlePolicy {
 }
 
 export interface TrustBundle {
-  v: number
-  type: string
+  v: 1
+  type: typeof DIV_TRUST_BUNDLE_TYPE
   tenantId: string
   approvers: BundleApprover[]
   policy: BundlePolicy[]
+  unmatchedActionPolicy: "DENY" | "BASELINE"
   issuedAt: string
   expiresAt: string
 }
@@ -101,6 +109,7 @@ export function verifyTrustBundle(
   } catch {
     return { ok: false, reason: "trust bundle header is not JSON" }
   }
+  if (!header || typeof header !== "object") return { ok: false, reason: "invalid trust bundle header" }
   if (header.alg !== "RS256")
     return { ok: false, reason: `trust bundle alg must be RS256, got ${header.alg ?? "(none)"}` }
 
@@ -132,11 +141,39 @@ export function verifyTrustBundle(
   } catch {
     return { ok: false, reason: "trust bundle payload is not JSON" }
   }
-  if (bundle.type !== DIV_TRUST_BUNDLE_TYPE)
-    return { ok: false, reason: `not a ${DIV_TRUST_BUNDLE_TYPE} (got ${String(bundle.type)})` }
+  if (!bundle || typeof bundle !== "object") return { ok: false, reason: "invalid trust bundle payload" }
+  if (bundle.type !== DIV_TRUST_BUNDLE_TYPE || bundle.v !== 1)
+    return { ok: false, reason: "unsupported trust bundle type or version" }
+  if (bundle.unmatchedActionPolicy !== "DENY" && bundle.unmatchedActionPolicy !== "BASELINE")
+    return { ok: false, reason: "trust bundle has no valid unmatched-action decision" }
   if (!Array.isArray(bundle.approvers) || bundle.approvers.length === 0)
     return { ok: false, reason: "trust bundle names no approvers" }
-  if (!Array.isArray(bundle.policy)) return { ok: false, reason: "trust bundle carries no policy" }
+  if (
+    !bundle.approvers.every(
+      (a) =>
+        a &&
+        typeof a.did === "string" &&
+        a.did.length &&
+        Array.isArray(a.publicKeys) &&
+        a.publicKeys.length &&
+        a.publicKeys.every((k) => typeof k === "string" && k.length),
+    )
+  )
+    return { ok: false, reason: "invalid bundle approver keys" }
+  if (!Array.isArray(bundle.policy) || !bundle.policy.every(validBundlePolicy))
+    return { ok: false, reason: "trust bundle carries invalid or incomplete policy" }
+  try {
+    validateExactApprovalPolicy(bundle.policy)
+    if (bundle.unmatchedActionPolicy === "BASELINE" && !bundle.policy.some((r) => r.actionPattern === "*"))
+      return { ok: false, reason: "trust bundle has no baseline for unknown actions" }
+  } catch (error) {
+    if (error instanceof ApprovalPolicyConflict)
+      return {
+        ok: false,
+        reason: `trust bundle has invalid exact-action policy: ${error.fields.join(", ")}`,
+      }
+    throw error
+  }
 
   const freshness = checkTrustBundleFreshness(bundle, opts)
   if (!freshness.ok) return freshness
@@ -227,63 +264,38 @@ export function approverAnchor(bundle: TrustBundle, limitToDids?: string[]): App
 /**
  * Resolve the requirement for an action from the bundle's offline policy projection.
  *
- * Matching follows the gateway: the pattern is matched against
- * `actionType` AND the display text together (so a rule keyed to the action type cannot be dodged by
- * wording the description around it), and among several matches the STRICTEST wins rather than the
- * longest. A relying party that picked the first or loosest match would quietly grant itself a weaker
- * policy than the tenant configured.
- * Ranking and tie-breaking come from signed gateway metadata, because even online-only constraints
- * (DIV §4.3.2) affect which rule supplies the ordinary approver set. A legacy bundle with overlapping
- * matches must be refreshed; guessing its lost selection metadata could choose weaker approvers.
- *
- * Returns `null` when nothing matches or selection is ambiguous. That is a REFUSAL, not a default: there is no implicit
- * 1-of-1 fallback here, because inventing a requirement is exactly what §5a.3 forbids.
+ * Matching follows the gateway's exact-ID evaluator. Signed rank/key fields are informational;
+ * constraints are evaluated from the complete v1 policy. Unsupported offline controls,
+ * conflicts, malformed bundles, and unmatched actions return null (refusal).
  */
 export function requirementFor(
   bundle: TrustBundle,
   actionType: string,
   display: string,
 ): { requirement: ApprovalRequirementAttestation; approverDids: string[] } | null {
-  const haystack = `${actionType}\n${display}`.toLowerCase()
-  const matches = bundle.policy.filter(
-    (p) => p.actionPattern === "*" || haystack.includes(p.actionPattern.toLowerCase()),
-  )
-  if (matches.length === 0) return null
   if (
-    matches.length > 1 &&
-    matches.some(
-      (p) =>
-        !Number.isSafeInteger(p.selectionRank) ||
-        (p.selectionRank ?? 0) < 1 ||
-        typeof p.selectionKey !== "string" ||
-        p.selectionKey.length === 0,
-    )
+    bundle?.v !== 1 ||
+    bundle.type !== DIV_TRUST_BUNDLE_TYPE ||
+    (bundle.unmatchedActionPolicy !== "DENY" && bundle.unmatchedActionPolicy !== "BASELINE") ||
+    !Array.isArray(bundle.policy) ||
+    !bundle.policy.every(validBundlePolicy)
   )
     return null
-  const winner = [...matches].sort((a, b) => {
-    const rank = (b.selectionRank ?? 0) - (a.selectionRank ?? 0)
-    if (rank !== 0) return rank
-    const ka = a.selectionKey ?? ""
-    const kb = b.selectionKey ?? ""
-    return ka < kb ? -1 : ka > kb ? 1 : 0
-  })[0] as BundlePolicy
-  // Expanded groups can expose different eligible sets behind otherwise identical selection keys.
-  // Do not let array order resolve a remaining collision with different authorization semantics.
-  const policyKey = (p: BundlePolicy) =>
-    JSON.stringify([
-      p.requiredApprovals,
-      p.requireHardwareKey,
-      [...(p.allowedAaguids ?? [])].sort(),
-      p.requesterCannotApprove,
-      [...p.approverDids].sort(),
-    ])
+  let winner: BundlePolicy | undefined
+  try {
+    winner = selectApprovalRule(bundle.policy, actionType, display, 3, bundle.unmatchedActionPolicy)
+  } catch (error) {
+    if (error instanceof ApprovalPolicyConflict) return null
+    throw error
+  }
+  // These online-only conditions cannot be reconstructed by an offline ceremony.
   if (
-    matches.some(
-      (p) =>
-        p.selectionRank === winner.selectionRank &&
-        p.selectionKey === winner.selectionKey &&
-        policyKey(p) !== policyKey(winner),
-    )
+    !winner ||
+    new Set(winner.approverDids).size < winner.requiredApprovals ||
+    winner.requireAttestedRequester ||
+    winner.allowedIssuers?.length ||
+    winner.escalateAfterSeconds ||
+    winner.autoApproveRequesterDid
   )
     return null
   return {
@@ -296,4 +308,41 @@ export function requirementFor(
     },
     approverDids: winner.approverDids ?? [],
   }
+}
+
+function validBundlePolicy(value: unknown): value is BundlePolicy {
+  if (!value || typeof value !== "object") return false
+  const p = value as Record<string, unknown>
+  if (p.signerClass !== "human") return false
+  if (
+    typeof p.actionPattern !== "string" ||
+    !p.actionPattern.trim() ||
+    !Number.isSafeInteger(p.requiredApprovals) ||
+    Number(p.requiredApprovals) < 1
+  )
+    return false
+  for (const field of ["requireHardwareKey", "requesterCannotApprove", "requireAttestedRequester"]) {
+    if (typeof p[field] !== "boolean") return false
+  }
+  for (const field of ["approverDids", "allowedAaguids", "allowedIssuers", "escalationApproverDids"]) {
+    if (
+      !Array.isArray(p[field]) ||
+      !(p[field] as unknown[]).every((v) => typeof v === "string" && v.length > 0)
+    )
+      return false
+  }
+  if (
+    p.escalateAfterSeconds !== null &&
+    (!Number.isSafeInteger(p.escalateAfterSeconds) || Number(p.escalateAfterSeconds) < 1)
+  )
+    return false
+  for (const field of ["autoApproveRequesterDid", "autoApproveWindowStart", "autoApproveWindowEnd"]) {
+    if (p[field] !== null && typeof p[field] !== "string") return false
+  }
+  return (
+    p.autoApproveDayOfWeek === null ||
+    (Number.isInteger(p.autoApproveDayOfWeek) &&
+      Number(p.autoApproveDayOfWeek) >= 0 &&
+      Number(p.autoApproveDayOfWeek) <= 6)
+  )
 }

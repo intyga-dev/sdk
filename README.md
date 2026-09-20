@@ -106,6 +106,13 @@ Node ≥18 (global `fetch` + `node:crypto`); the only dependency is the zero-dep
 Every APPROVED result carries a **receipt**. Confirm — in your own code, with no Intyga secret — that a
 human signed off on the *exact* instruction you're about to run:
 
+The example below is for a human or `SERVICE` key. An `AI_AGENT` key must also send
+`agentContext` (reversibility, decimal amount, configuration digest, delegation receipt hash and
+session state) and use `verifyAgentForExecution` with a live configuration and its own locked
+`AgentSessionState`. Persist the returned head and reserve a global budget atomically with nonce
+redemption before the action. `configDigest` is an RP claim, not an agent integrity attestation;
+raw prompts and personal data must not enter the new receipt fields. See DIV §4.3.6.
+
 ```ts
 import { verifyApprovalReceipt } from "@intyga/sdk"; // re-exported from @intyga/verify
 

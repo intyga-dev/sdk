@@ -193,6 +193,28 @@ test("authorize binds actionType and params into the request", async (t) => {
   })
 })
 
+test("authorize exposes issuer-completed v1 context for the RP to retain", async (t) => {
+  const agentContext = {
+    action: { reversibility: "reversible", amount: null },
+    agent: { label: "did:intyga:agent:test", configDigest: `sha256:${"1".repeat(64)}`, delegatedBy: null },
+    session: { id: `sha256:${"2".repeat(64)}`, seq: "1", prev: null, aggregate: null },
+    nbf: "2026-09-20T10:00:00.000Z",
+  }
+  const f = stubFetch(() => ({ body: { nonce: "n-v1", status: "PENDING", agentContext } }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+  const opened = await c.authorize("Review", {
+    target: "test-rp",
+    agentContext: {
+      action: { reversibility: "reversible", amount: null },
+      configDigest: agentContext.agent.configDigest,
+      delegatedBy: null,
+      session: agentContext.session,
+    },
+  })
+  assert.deepEqual(opened.agentContext, agentContext)
+})
+
 test("authorize throws on a non-2xx rather than returning a falsy nonce", async (t) => {
   const f = stubFetch(() => ({ status: 403, text: "forbidden" }))
   t.after(f.restore)

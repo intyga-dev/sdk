@@ -5,6 +5,11 @@
 // Receipt verification + canonical helpers now live in the standalone, zero-dependency @intyga/verify
 // package (open-source, inspect-it-yourself). Re-exported here so existing SDK consumers are unchanged.
 export {
+  agentConfigDigest,
+  agentReceiptDigest,
+  verifyAgentSessionChain,
+  verifyAgentDelegationChain,
+  type AgentIntentContext,
   type ApprovalReceipt,
   type ApproverTrustAnchor,
   canonicalIntentPayload,
@@ -69,8 +74,9 @@ export {
   type PlatformReceiptExpectation,
   verifyPlatformReceipt,
 } from "@intyga/verify"
+export { type AgentSessionState, type LiveAgentConfig, verifyAgentForExecution } from "./agent-execution.js"
 
-import type { ApprovalReceipt } from "@intyga/verify"
+import type { AgentIntentContext, ApprovalReceipt } from "@intyga/verify"
 import {
   clearPendingApproval,
   type OfflineApprovalOptions,
@@ -111,6 +117,8 @@ export type ApprovalStatus =
 
 export interface ApprovalResult {
   status: ApprovalStatus
+  /** Issuer-completed v1 context retained from challenge creation, never copied from the receipt. */
+  agentContext?: AgentIntentContext
   signatureHash?: string
   receipt?: ApprovalReceipt
   /**
@@ -135,6 +143,22 @@ export interface AuthorizeOptions {
   params?: Record<string, unknown>
   /** Custom Time-To-Live (TTL) for the approval challenge in seconds. */
   timeout?: number
+  /** RP-asserted continuity claim for AI_AGENT keys. The PEP must recompute configDigest before
+   * execution and compare the signed session state against its own durable budget. */
+  agentContext?: {
+    action: {
+      reversibility: "reversible" | "irreversible"
+      amount: { amount: string; currency: string } | null
+    }
+    configDigest: string
+    delegatedBy: string | null
+    session: {
+      id: string
+      seq: string
+      prev: string | null
+      aggregate: { amount: string; currency: string } | null
+    }
+  }
 }
 
 export interface VerifyResult {
@@ -369,7 +393,7 @@ export class IntygaClient {
   async authorize(
     actionDescription: string,
     opts: AuthorizeOptions,
-  ): Promise<{ nonce: string; status: ApprovalStatus }> {
+  ): Promise<{ nonce: string; status: ApprovalStatus; agentContext?: AgentIntentContext }> {
     const target = opts?.target?.trim()
     if (!target) {
       throw new Error(
@@ -386,10 +410,11 @@ export class IntygaClient {
         actionType: opts?.actionType,
         params: opts?.params ?? {},
         timeout: opts?.timeout,
+        agentContext: opts?.agentContext,
       }),
     })
     if (!res.ok) throw this.refusal("authorize", res, source, await res.text())
-    return (await res.json()) as { nonce: string; status: ApprovalStatus }
+    return (await res.json()) as { nonce: string; status: ApprovalStatus; agentContext?: AgentIntentContext }
   }
 
   /**
@@ -486,6 +511,8 @@ export class IntygaClient {
       // 5xx is deliberately NOT included: a 502 from a load balancer or a 503 from a restarting
       // instance is infrastructure failing, which is exactly the "could not ask" §5a is written for.
       if (err instanceof GatewayRefused && err.status < 500) throw err
+      if (opts.agentContext)
+        throw new Error("agent continuity requests cannot fall back to an unchained offline proof")
       if (!opts.offline) throw new Error(cause)
       const offline = await useOfflineApproval(
         {
@@ -502,12 +529,14 @@ export class IntygaClient {
     }
 
     let nonce: string
+    let agentContext: AgentIntentContext | undefined
     try {
-      ;({ nonce } = await this.authorize(actionDescription, {
+      ;({ nonce, agentContext } = await this.authorize(actionDescription, {
         target: opts.target,
         actionType: opts.actionType,
         params: opts.params,
         timeout: Math.ceil(timeoutMs / 1000),
+        agentContext: opts.agentContext,
       }))
     } catch (err) {
       // Could not even raise the challenge — the clearest "gateway is unreachable" signal there is,
@@ -523,7 +552,7 @@ export class IntygaClient {
       try {
         const r = await this.status(nonce)
         consecutiveErrors = 0
-        if (r.status !== "PENDING") return { ...r, nonce }
+        if (r.status !== "PENDING") return { ...r, nonce, ...(agentContext ? { agentContext } : {}) }
       } catch (err: unknown) {
         if (++consecutiveErrors >= MAX_POLL_ERRORS) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -533,7 +562,8 @@ export class IntygaClient {
           return tryOffline(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`, err)
         }
       }
-      if (Date.now() > deadline) return { status: "EXPIRED", nonce }
+      if (Date.now() > deadline)
+        return { status: "EXPIRED", nonce, ...(agentContext ? { agentContext } : {}) }
       await new Promise((resolve) => setTimeout(resolve, interval))
     }
   }

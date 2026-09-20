@@ -72,9 +72,9 @@ function signBundle(bundle: unknown, opts: { alg?: string; key?: crypto.KeyObjec
 }
 
 function bundleOf(over: Partial<TrustBundle> = {}): TrustBundle {
-  return {
-    v: 1,
-    type: "div-trust-bundle",
+  const bundle = {
+    v: 1 as const,
+    type: "div-trust-bundle-v1" as const,
     tenantId: "11111111-1111-4111-8111-111111111111",
     approvers: [
       { did: ALICE.did, publicKeys: [ALICE.spki] },
@@ -90,11 +90,34 @@ function bundleOf(over: Partial<TrustBundle> = {}): TrustBundle {
         signerClass: "human",
         approverDids: [ALICE.did, BOB.did],
       },
+      {
+        actionPattern: "*",
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+        approverDids: [ALICE.did, BOB.did],
+      },
     ],
+    unmatchedActionPolicy: "DENY" as const,
     issuedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
     ...over,
   }
+  bundle.policy = bundle.policy.map((p) => ({
+    signerClass: "human",
+    requireAttestedRequester: false,
+    allowedIssuers: [],
+    escalationApproverDids: [],
+    escalateAfterSeconds: null,
+    autoApproveRequesterDid: null,
+    autoApproveDayOfWeek: null,
+    autoApproveWindowStart: null,
+    autoApproveWindowEnd: null,
+    ...p,
+  }))
+  return bundle
 }
 
 function tmpdir(): string {
@@ -121,6 +144,28 @@ describe("trust bundle", () => {
     const r = verifyTrustBundle(signBundle(bundleOf()), GATEWAY_JWK)
     assert.equal(r.ok, true, r.reason)
     assert.equal(r.bundle?.approvers.length, 2)
+  })
+
+  it("refuses legacy types, unknown versions, null, and incomplete constraint metadata", () => {
+    const incomplete = bundleOf()
+    delete incomplete.policy[0]!.requireAttestedRequester
+    for (const value of [
+      null,
+      { ...bundleOf(), type: "div-trust-bundle", v: 1 },
+      { ...bundleOf(), type: "div-trust-bundle-v2", v: 2 },
+      { ...bundleOf(), v: 3 },
+      incomplete,
+    ]) {
+      assert.equal(verifyTrustBundle(signBundle(value), GATEWAY_JWK).ok, false)
+    }
+    assert.equal(requirementFor(incomplete, "db.restart", ""), null)
+  })
+
+  it("accepts a stricter winner preserving baseline eligibility and quorum", () => {
+    const bundle = bundleOf()
+    const selected = requirementFor(bundle, "db.restart", "Recovery")
+    assert.equal(selected?.requirement.requiredApprovals, 2)
+    assert.deepEqual(selected?.approverDids, [ALICE.did, BOB.did])
   })
 
   it("refuses a tampered payload", () => {
@@ -182,7 +227,7 @@ describe("trust bundle", () => {
     assert.match(r.reason ?? "", /trust-bundle export/)
   })
 
-  it("resolves the STRICTEST matching rule, matching on actionType as well as display", () => {
+  it("refuses an overlapping rule that widens eligibility or cannot meet its quorum", () => {
     const bundle = bundleOf({
       policy: [
         {
@@ -212,8 +257,7 @@ describe("trust bundle", () => {
       ],
     })
     const resolved = requirementFor(bundle, "db.restart", "Emergency recovery procedure")
-    assert.equal(resolved?.requirement.requiredApprovals, 3)
-    assert.equal(resolved?.requirement.requesterCannotApprove, true)
+    assert.equal(resolved, null)
   })
 
   it("uses signed selection metadata regardless of exported rule order", () => {
@@ -247,7 +291,7 @@ describe("trust bundle", () => {
         "db.restart",
         "Emergency recovery procedure",
       )
-      assert.deepEqual(resolved?.approverDids, [BOB.did])
+      assert.equal(resolved, null)
     }
   })
 
@@ -278,8 +322,7 @@ describe("trust bundle", () => {
     ]
     for (const ordered of [policy, [...policy].reverse()]) {
       const resolved = requirementFor(bundleOf({ policy: ordered }), "db.restart", ACTION.display)
-      assert.deepEqual(resolved?.approverDids, [BOB.did])
-      assert.deepEqual(resolved?.requirement.allowedAaguids, ["titan"])
+      assert.equal(resolved, null)
     }
   })
 
@@ -331,6 +374,36 @@ describe("trust bundle", () => {
 
   it("returns null for an unmatched action rather than defaulting to 1-of-1", () => {
     assert.equal(requirementFor(bundleOf(), "billing.refund", "Refund a customer"), null)
+  })
+
+  it("the public v1 bundle applies the signed baseline only when enabled and ignores display text", () => {
+    const baseline = {
+      ...bundleOf().policy[0]!,
+      actionPattern: "*",
+      requiredApprovals: 1,
+      approverDids: [ALICE.did, BOB.did],
+    }
+    const exact = {
+      ...baseline,
+      actionPattern: "db.restart",
+      requiredApprovals: 2,
+      approverDids: [ALICE.did, BOB.did],
+    }
+    const bundle = bundleOf({
+      v: 1,
+      type: "div-trust-bundle-v1",
+      unmatchedActionPolicy: "DENY",
+      policy: [baseline, exact],
+    })
+    const checked = verifyTrustBundle(signBundle(bundle), GATEWAY_JWK)
+    assert.equal(checked.ok, true, checked.reason)
+    assert.equal(requirementFor(bundle, "db.restart", "ordinary text")?.requirement.requiredApprovals, 2)
+    assert.equal(requirementFor(bundle, "billing.refund", "db.restart"), null)
+    bundle.unmatchedActionPolicy = "BASELINE"
+    assert.equal(requirementFor(bundle, "billing.refund", "db.restart")?.requirement.requiredApprovals, 1)
+    bundle.policy[1]!.requireHardwareKey = false
+    bundle.policy[0]!.requireHardwareKey = true
+    assert.equal(requirementFor(bundle, "db.restart", "ordinary text"), null)
   })
 
   it("builds a DID-mode anchor whose keys all map to one identity", () => {
@@ -675,6 +748,15 @@ describe("useOfflineApproval", () => {
           signerClass: "human",
           approverDids: [ALICE.did, BOB.did],
         },
+        {
+          actionPattern: "*",
+          requiredApprovals: 2,
+          requireHardwareKey: false,
+          allowedAaguids: [],
+          requesterCannotApprove: true,
+          signerClass: "human",
+          approverDids: [ALICE.did, BOB.did],
+        },
       ],
     })
     const delegationDir = path.join(dir, "delegations")
@@ -1012,6 +1094,15 @@ describe("offline-sign.html signing path", () => {
         policy: [
           {
             actionPattern: "db.restart",
+            requiredApprovals: 1,
+            requireHardwareKey: false,
+            allowedAaguids: [],
+            requesterCannotApprove: false,
+            signerClass: "human",
+            approverDids: [ALICE.did],
+          },
+          {
+            actionPattern: "*",
             requiredApprovals: 1,
             requireHardwareKey: false,
             allowedAaguids: [],
