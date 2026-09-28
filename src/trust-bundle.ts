@@ -1,3 +1,4 @@
+import type { webcrypto } from "node:crypto"
 import {
   selectApprovalRule,
   validateExactApprovalPolicy,
@@ -76,7 +77,7 @@ export interface TrustBundleFiles {
   /** Compact JWS produced by the gateway. */
   jws: string
   /** The gateway public key, as a JWK, PINNED when the bundle was exported. */
-  gatewayJwk: JsonWebKey
+  gatewayJwk: webcrypto.JsonWebKey
 }
 
 const BUNDLE_FILE = "trust-bundle.jws"
@@ -96,7 +97,7 @@ function b64urlToBuffer(s: string): Buffer {
  */
 export function verifyTrustBundle(
   jws: string,
-  gatewayJwk: JsonWebKey,
+  gatewayJwk: webcrypto.JsonWebKey,
   opts: { asOf?: Date } = {},
 ): { ok: boolean; reason?: string; bundle?: TrustBundle } {
   const parts = jws.split(".")
@@ -225,7 +226,7 @@ export function loadTrustBundle(
   opts: { asOf?: Date } = {},
 ): { ok: boolean; reason?: string; bundle?: TrustBundle } {
   let jws: string
-  let jwk: JsonWebKey
+  let jwk: webcrypto.JsonWebKey
   try {
     jws = fs.readFileSync(path.join(dir, BUNDLE_FILE), "utf8").trim()
   } catch {
@@ -235,7 +236,7 @@ export function loadTrustBundle(
     }
   }
   try {
-    jwk = JSON.parse(fs.readFileSync(path.join(dir, KEY_FILE), "utf8")) as JsonWebKey
+    jwk = JSON.parse(fs.readFileSync(path.join(dir, KEY_FILE), "utf8")) as webcrypto.JsonWebKey
   } catch {
     return { ok: false, reason: `no pinned gateway key at ${path.join(dir, KEY_FILE)}` }
   }

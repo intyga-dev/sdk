@@ -118,6 +118,176 @@ test("audit-verify preserves contextual invalid JSON errors", () => {
   assert.doesNotMatch(r.stderr, /\n {4}at /)
 })
 
+test("audit-verify applies caller-owned RFC 3161 trust without counting one issuer twice", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-audit-tsa-test-"))
+  try {
+    const vectors = JSON.parse(
+      fs.readFileSync(
+        path.join(import.meta.dirname, "../vectors/rfc3161-vectors.json"),
+        "utf8",
+      ),
+    ) as { cases: Array<{ name: string; anchor: Record<string, unknown>; trust: Record<string, unknown> }> }
+    const fixture = vectors.cases.find((entry) => entry.name === "valid-unchecked")
+    assert.ok(fixture)
+    const issuer = String(fixture.anchor.issuer)
+    const root = String(fixture.anchor.dailyRoot)
+    const bundlePath = path.join(tmp, "bundle.json")
+    const trustPath = path.join(tmp, "tsa.json")
+    fs.writeFileSync(
+      bundlePath,
+      JSON.stringify({
+        protocol: "DEWP",
+        kind: "dewp.audit.evidence-bundle",
+        version: "1.0",
+        entries: [],
+        // The checkpoint states the position and time its anchors bind: without them nothing can hold
+        // the TSA's genTime to anything and the root never counts as anchored (DEWP §5.3).
+        checkpoints: [
+          {
+            root,
+            seqStart: fixture.anchor.seqStart,
+            seqEnd: fixture.anchor.seqEnd,
+            chainHash: fixture.anchor.chainHash,
+            anchoredAt: fixture.anchor.timestamp,
+            anchors: [fixture.anchor, fixture.anchor],
+          },
+        ],
+      }),
+    )
+    fs.writeFileSync(trustPath, JSON.stringify({ [issuer]: fixture.trust }))
+
+    const invoke = (extra: string[]) =>
+      run([
+        "audit-verify",
+        bundlePath,
+        "--root",
+        root,
+        "--trusted-issuer",
+        issuer,
+        "--tsa-trust",
+        trustPath,
+        "--json",
+        ...extra,
+      ])
+    const valid = invoke(["--require-anchors", "1"])
+    assert.equal(valid.status, 1) // empty evidence bundle is invalid, but its root quorum is evaluated
+    const validReport = JSON.parse(valid.stdout) as { roots: Array<{ anchorVerified: boolean }> }
+    assert.equal(validReport.roots[0]?.anchorVerified, true)
+
+    const duplicate = invoke(["--require-anchors", "2"])
+    const duplicateReport = JSON.parse(duplicate.stdout) as { roots: Array<{ anchorVerified: boolean }> }
+    assert.equal(duplicateReport.roots[0]?.anchorVerified, false)
+
+    fs.writeFileSync(
+      trustPath,
+      JSON.stringify({ [issuer]: { ...fixture.trust, signerCertificateSha256: "00".repeat(32) } }),
+    )
+    const tampered = invoke(["--require-anchors", "1"])
+    const tamperedReport = JSON.parse(tampered.stdout) as { roots: Array<{ anchorVerified: boolean }> }
+    assert.equal(tamperedReport.roots[0]?.anchorVerified, false)
+
+    const missing = run(["audit-verify", bundlePath, "--root", root, "--trusted-issuer", issuer, "--json"])
+    const missingReport = JSON.parse(missing.stdout) as { roots: Array<{ anchorVerified: boolean }> }
+    assert.equal(missingReport.roots[0]?.anchorVerified, false)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("audit-verify holds anchors to the roots file's own checkpoint records (DEWP §5.3)", () => {
+  // --roots used to pass only each line's root into the verifier, discarding the chain-verified time
+  // and chain hash: a bundle could then re-date its checkpoint (or strip it) and a late witness counted.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-audit-roots-records-test-"))
+  try {
+    type Case = { name: string; bundle: unknown; options: { trustedCheckpoints?: Record<string, unknown>[] } }
+    const vectors = JSON.parse(
+      fs.readFileSync(
+        path.join(import.meta.dirname, "../vectors/verifier-parity-vectors.json"),
+        "utf8",
+      ),
+    ) as {
+      dewpEvidenceHardening: { keys: { id: string; spkiB64: string }[]; evidence: { cases: Case[] } }
+    }
+    const section = vectors.dewpEvidenceHardening
+    const byName = (n: string) => {
+      const c = section.evidence.cases.find((x) => x.name === n)
+      assert.ok(c, n)
+      return c
+    }
+    const record = byName("trusted-record-fills-stripped-checkpoint").options.trustedCheckpoints?.[0]
+    assert.ok(record)
+    const rootsPath = path.join(tmp, "roots.jsonl")
+    fs.writeFileSync(rootsPath, `${JSON.stringify({ ...record, prevChainHash: "" })}\n`)
+    const keyPath = path.join(tmp, "rekor.key")
+    fs.writeFileSync(keyPath, section.keys.find((k) => k.id === "h-rekor")?.spkiB64 ?? "")
+    const verify = (name: string) => {
+      const bundlePath = path.join(tmp, `${name}.json`)
+      fs.writeFileSync(bundlePath, JSON.stringify(byName(name).bundle))
+      return run([
+        "audit-verify",
+        bundlePath,
+        "--roots",
+        rootsPath,
+        "--trusted-issuer",
+        "https://rekor.sigstore.dev",
+        "--rekor-key",
+        keyPath,
+        "--json",
+      ])
+    }
+    // The bundle strips its checkpoint's time and chain; the roots file supplies them.
+    assert.equal(verify("trusted-record-fills-stripped-checkpoint").status, 0)
+    // The bundle re-dates its checkpoint with a self-consistent chain; the roots file contradicts it.
+    const redated = verify("redated-checkpoint-contradicts-trusted-record")
+    assert.equal(redated.status, 1)
+    assert.match(redated.stdout, /contradicts your trusted checkpoint record/)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("audit-verify refuses malformed or unscoped --tsa-trust", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-audit-tsa-config-test-"))
+  try {
+    const bundlePath = path.join(tmp, "bundle.json")
+    const trustPath = path.join(tmp, "tsa.json")
+    fs.writeFileSync(bundlePath, JSON.stringify({ proof: {} }))
+    fs.writeFileSync(trustPath, "{}")
+    const empty = run(["audit-verify", bundlePath, "--trusted-issuer", "issuer", "--tsa-trust", trustPath])
+    assert.equal(empty.status, 1)
+    assert.match(empty.stderr, /non-empty JSON object/)
+    const unscoped = run(["audit-verify", bundlePath, "--tsa-trust", trustPath])
+    assert.equal(unscoped.status, 1)
+    assert.match(unscoped.stderr, /requires --trusted-issuer/)
+    const rekorPath = path.join(tmp, "rekor.pem")
+    fs.writeFileSync(rekorPath, "public log key")
+    const ambiguousRekor = run([
+      "audit-verify",
+      bundlePath,
+      "--trusted-issuer",
+      "rekor.example,tsa.example",
+      "--rekor-key",
+      rekorPath,
+    ])
+    assert.equal(ambiguousRekor.status, 1)
+    assert.match(ambiguousRekor.stderr, /requires --rekor-issuer/)
+    const unknownScope = run([
+      "audit-verify",
+      bundlePath,
+      "--trusted-issuer",
+      "rekor.example,tsa.example",
+      "--rekor-key",
+      rekorPath,
+      "--rekor-issuer",
+      "other.example",
+    ])
+    assert.equal(unknownScope.status, 1)
+    assert.match(unknownScope.stderr, /must name a --trusted-issuer/)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test("authorize without an action description exits non-zero", () => {
   const r = run(["authorize"])
   assert.notEqual(r.status, 0)
@@ -318,5 +488,82 @@ test("authorize refuses an AUTO_APPROVED receipt by default, and accepts it only
   } finally {
     server.closeAllConnections()
     server.close()
+  }
+})
+
+// ── Transport rules (transport.ts): https-only gateway, redirects never followed ───────────────────
+
+test("commands that talk to the gateway refuse a non-https, non-loopback --gateway", () => {
+  for (const args of [
+    ["login", "--did", "did:example:1", "--gateway", "http://gw.example"],
+    ["verify", "abc", "--gateway", "http://gw.example"],
+    ["authorize", "x", "--target", "prod", "--token", "t", "--gateway", "http://gw.example"],
+  ]) {
+    const r = run(args)
+    assert.notEqual(r.status, 0, args.join(" "))
+    assert.match(r.stderr, /--gateway \/ INTYGA_GATEWAY_URL must use https:\/\//, args.join(" "))
+  }
+})
+
+test("offline commands ignore an http INTYGA_GATEWAY_URL", () => {
+  const r = spawnSync("node", [cli], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env, INTYGA_GATEWAY_URL: "http://gw.example" },
+  })
+  assert.equal(r.status, 0)
+})
+
+test("login and trust-bundle export do not follow a 307 to another origin", async () => {
+  const http = await import("node:http")
+  const reached: string[] = []
+  const elsewhere = http.createServer((req, res) => {
+    reached.push(`${req.method} ${req.url} ${req.headers.authorization ?? ""}`)
+    req.resume()
+    res.setHeader("content-type", "application/json")
+    res.end(JSON.stringify({ nonce: "n", pollSecret: "p", ok: true }))
+  })
+  await new Promise<void>((r) => elsewhere.listen(0, "127.0.0.1", r))
+  const elsewherePort = (elsewhere.address() as { port: number }).port
+  const origin = http.createServer((req, res) => {
+    req.resume()
+    res.statusCode = 307
+    res.setHeader("location", `http://127.0.0.1:${elsewherePort}${req.url}`)
+    res.end()
+  })
+  await new Promise<void>((r) => origin.listen(0, "127.0.0.1", r))
+  const gateway = `http://127.0.0.1:${(origin.address() as { port: number }).port}`
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "intyga-cli-redirect-"))
+
+  const runAsync = (args: string[], env: Record<string, string> = {}) =>
+    new Promise<{ status: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn("node", [cli, ...args], { env: { ...process.env, HOME: home, ...env } })
+      let stderr = ""
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString()
+      })
+      child.on("error", reject)
+      child.on("close", (status) => resolve({ status, stderr }))
+    })
+
+  try {
+    const login = await runAsync(["login", "--did", "did:example:1", "--gateway", gateway])
+    assert.notEqual(login.status, 0)
+    assert.match(login.stderr, /never follow redirects/)
+
+    const exported = await runAsync(
+      ["trust-bundle", "export", "--tenant", "00000000-0000-0000-0000-000000000000", "--gateway", gateway],
+      { INTYGA_INTERNAL_TOKEN: "internal-secret" },
+    )
+    assert.notEqual(exported.status, 0)
+    assert.match(exported.stderr, /export failed \(307\).*never follow redirects/)
+
+    assert.deepEqual(reached, [], "a request (and its credential) reached the redirect target")
+  } finally {
+    for (const s of [origin, elsewhere]) {
+      s.closeAllConnections()
+      s.close()
+    }
+    fs.rmSync(home, { recursive: true, force: true })
   }
 })

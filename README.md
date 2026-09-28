@@ -36,6 +36,10 @@ is Intyga as a general zero-trust gate for *any* backend action, not just agents
 Tokens are re-exchanged automatically before the `expires_in` the gateway reports, so a long-lived
 client needs no token management of its own; an explicit `token` is yours to refresh.
 
+`gatewayUrl` must be `https://` (every client and the CLI refuse plain `http://` at construction except
+to a loopback host — `localhost`, `127.0.0.0/8`, `::1` — for local development), and requests never
+follow redirects.
+
 ## Verify a witnessed document/policy
 
 ```ts
@@ -72,8 +76,24 @@ intyga sign <DIV1:...> --key <private.pem|private.der> --did <your-did> [--yes]
 intyga trust-bundle export --tenant <uuid> [--dir <dir>] [--gateway <url>]   # INTYGA_INTERNAL_TOKEN | --token-file | --token-stdin
 intyga trust-bundle show [--dir <dir>]
 intyga verify <documentHash> --gateway <url>
-intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--rekor-key <pem>] [--json]
+intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--rekor-key <pem>] [--rekor-issuer <issuer>] [--tsa-trust <tsa-trust.json>] [--json]
 ```
+
+`audit-verify --roots` passes each roots-file line to the verifier as a trusted checkpoint record, not
+just its root: an evidence-bundle checkpoint that contradicts its line fails, and anchors are held to
+the line's chain-verified range, chain hash and time (DEWP §5.3). For a single inclusion proof the
+covering line is the only checkpoint time available, so with `--root` alone Rekor/TSA anchors do not
+count toward quorum; a `--root` that differs from the covering line is refused.
+
+`audit-verify --tsa-trust` reads a caller-owned JSON map from RFC 3161 issuer URL to its OpenSSL
+trust configuration (`caPem`, `signerCertificateSha256`, explicit `revocation`, and optional
+`crlPem`, `untrustedPem`, `verificationTime`, or `opensslPath`). Trust is never accepted from the
+bundle. Combine it with `--trusted-issuer` and `--require-anchors`; `--rekor-key` may be supplied at
+the same time for a mixed Rekor/TSA quorum.
+When more than one issuer is trusted, `--rekor-issuer` is required with `--rekor-key`; this binds
+the global Rekor log key to the one issuer it represents and prevents one valid SET from being
+relabelled as several independent witnesses. A legacy unscoped Rekor key is accepted only when the
+policy names exactly one trusted issuer.
 
 `--target` is not optional on `authorize`/`await`: it names the relying party the approval is bound
 to (DIV Target Isolation), and the CLI exits non-zero without it.
@@ -99,7 +119,7 @@ Update the gateway and SDK together, then re-export trust bundles used with over
 rules. New exports carry signed rule-selection metadata; older bundles with multiple matching rules
 are refused because their governing approver set cannot be selected reliably.
 
-Node ≥18 (global `fetch` + `node:crypto`); the only dependency is the zero-dep [`@intyga/verify`](https://github.com/intyga-dev/verify).
+Node ≥18 (global `fetch` + `node:crypto`); the only npm dependency is [`@intyga/verify`](https://github.com/intyga-dev/verify). Optional RFC 3161 verification also requires OpenSSL 3.
 
 ## Verify approvals independently
 
@@ -135,6 +155,12 @@ const ok = verifyApprovalReceipt(r.receipt!, {
   // these from the gateway: a compromised gateway would then supply both the receipt and the key
   // that validates it. See @intyga/verify's "Whose key?" section.
   approvers: { dids: ["did:intyga:cfo-alice"], resolveKey: (did) => APPROVER_KEYS[did] ?? null },
+}, {
+  // REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP ID,
+  // from the trust-anchor file exported in the console (its `webauthn` block — see
+  // `parseTrustAnchorFile`). Without them the verifier refuses a passkey receipt outright.
+  expectedOrigin: process.env.INTYGA_WEBAUTHN_ORIGIN!,
+  expectedRpId: process.env.INTYGA_WEBAUTHN_RP_ID!,
 });
 if (!ok.ok) throw new Error(`refusing to proceed: ${ok.reason}`);
 
@@ -158,11 +184,14 @@ import (
 	verify "github.com/intyga-dev/verify-go"
 )
 
-client := intyga.NewClient(intyga.ClientOptions{
+client, err := intyga.NewClient(intyga.ClientOptions{
 	GatewayURL:   "https://api.intyga.com",
 	ClientID:     os.Getenv("INTYGA_CLIENT_ID"),
 	ClientSecret: os.Getenv("INTYGA_CLIENT_SECRET"),
 })
+if err != nil {
+	log.Fatal(err) // GatewayURL must be https:// (http:// only to a loopback host)
+}
 
 // Blocks until the human approves with their passkey / security key (or times out).
 // Target is required — it names THIS execution environment (DIV Target Isolation), and the
@@ -186,7 +215,12 @@ res := verify.VerifyApprovalReceipt(*r.Receipt, verify.Expected{
 	Nonce: r.Nonce, ActionType: "wipe_production", Target: "prod-payments-eu",
 	Params:    params,
 	Approvers: verify.ApproverTrustAnchor{PublicKeys: []string{alicePubB64}},
-}, verify.VerifyOptions{})
+}, verify.VerifyOptions{
+	// REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and
+	// RP ID, from the trust-anchor file exported in the console (its `webauthn` block).
+	ExpectedOrigin: os.Getenv("INTYGA_WEBAUTHN_ORIGIN"),
+	ExpectedRpID:   os.Getenv("INTYGA_WEBAUTHN_RP_ID"),
+})
 if !res.OK {
 	log.Fatalf("refusing to proceed: %s", res.Reason)
 }
@@ -208,7 +242,7 @@ let mut client = Client::new(ClientOptions {
     client_id: std::env::var("INTYGA_CLIENT_ID").ok(),
     client_secret: std::env::var("INTYGA_CLIENT_SECRET").ok(),
     ..Default::default()
-});
+})?; // Err unless gateway_url is https:// (http:// only to a loopback host)
 
 // Blocks until the human approves with their passkey / security key (or times out).
 // `target` is required — it names THIS execution environment (DIV Target Isolation), and the
@@ -235,7 +269,14 @@ let expected = Expected {
     params: json!({ "database": "prod-db-1" }),
     approvers: ApproverTrustAnchor::PublicKeys(vec![alice_pub_b64]),
 };
-verify_approval_receipt_with_options(&r.receipt.unwrap(), &expected, &VerifyOptions::default())?;
+// REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP ID,
+// from the trust-anchor file exported in the console (its `webauthn` block).
+let opts = VerifyOptions {
+    expected_origin: std::env::var("INTYGA_WEBAUTHN_ORIGIN").ok(),
+    expected_rp_id: std::env::var("INTYGA_WEBAUTHN_RP_ID").ok(),
+    ..Default::default()
+};
+verify_approval_receipt_with_options(&r.receipt.unwrap(), &expected, &opts)?;
 ```
 
 The Rust client is generic over a pluggable `Transport` (default: a built-in blocking `ureq` transport), so you can supply your own async/instrumented HTTP client.

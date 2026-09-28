@@ -851,3 +851,36 @@ test("reconcileOfflineApprovals with a misconfigured client throws up front rath
   await assert.rejects(() => c.reconcileOfflineApprovals({ bundleDir: "/unused" }), /provide `token`/)
   assert.equal(f.calls.length, 0)
 })
+
+test("public witness lookup refuses a non-2xx response even if its body claims verification", async (t) => {
+  const f = stubFetch(() => ({ status: 503, body: { verified: true, status: "SIGNED" } }))
+  t.after(f.restore)
+  await assert.rejects(new IntygaClient({ gatewayUrl: GW }).verify("hash"), /verify failed: 503/)
+})
+
+test("default transport bounds requests and returns redirects as gateway refusals", async (t) => {
+  const original = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = original
+  })
+  globalThis.fetch = (async (_url, init) => {
+    assert.equal(init?.redirect, "manual")
+    assert.ok(init?.signal instanceof AbortSignal)
+    return new Response("", { status: 307, headers: { location: "https://elsewhere.example" } })
+  }) as typeof fetch
+  const client = new IntygaClient({ gatewayUrl: GW, clientId: "id", clientSecret: "secret" })
+  await assert.rejects(client.token(), /token exchange failed: 307/)
+  await assert.rejects(new IntygaClient({ gatewayUrl: GW, token: "t" }).status("nonce"), /307/)
+})
+
+test("requireApproval refuses an approval arriving after the caller's wait window", async () => {
+  const client = new IntygaClient({ gatewayUrl: GW, token: "t" })
+  client.authorize = async () => ({ nonce: "late", status: "PENDING" })
+  client.status = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    return { status: "APPROVED" }
+  }
+  const result = await client.requireApproval("wire", { target: "prod", timeoutMs: 5, intervalMs: 1 })
+  assert.equal(result.status, "EXPIRED")
+  assert.equal(result.nonce, "late")
+})

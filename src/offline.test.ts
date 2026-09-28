@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
+import type { webcrypto } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -36,7 +37,7 @@ import {
 
 // ── fixtures ────────────────────────────────────────────────────────────────────
 const GATEWAY = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
-const GATEWAY_JWK = GATEWAY.publicKey.export({ format: "jwk" }) as JsonWebKey
+const GATEWAY_JWK = GATEWAY.publicKey.export({ format: "jwk" }) as webcrypto.JsonWebKey
 
 function makeApprover(did: string) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
@@ -539,6 +540,20 @@ describe("offline challenge construction", () => {
     assert.match(r.reason ?? "", /cannot be produced offline/)
   })
 
+  it("refuses up front when the policy pins an authenticator-model allowlist", () => {
+    // A non-empty allowedAaguids is the same policy class as requireHardwareKey: a bare offline key
+    // has no authenticator model, so no offline signature can ever satisfy it (DIV §4.3.2).
+    const bundle = bundleOf()
+    bundle.policy[0]!.allowedAaguids = ["cb69481e-8ff7-4039-93ec-0a2729a154a8"]
+    const r = createOfflineChallenge({
+      bundle,
+      ...ACTION,
+      requester: { did: "did:intyga:x", attestation: null },
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /cannot be produced offline/)
+  })
+
   it("caps the window at the verifier's maximum", () => {
     const built = createOfflineChallenge({
       bundle: bundleOf(),
@@ -804,7 +819,11 @@ describe("useOfflineApproval", () => {
     assert.equal(r.ok, false)
     assert.equal(r.viaDelegation, undefined)
     assert.ok(
-      warnings.some((warning) => /delegation sealing requirement is weaker/.test(warning)),
+      // Refused by verifyDelegation's DIV §5 step 3d floor (the ordinary rule), before the SDK's own
+      // AAGUID-aware comparison is reached.
+      warnings.some((warning) =>
+        /signed requirement is weaker than the relying party's policy/.test(warning),
+      ),
       warnings.join("; "),
     )
   })
@@ -973,7 +992,7 @@ describe("requireApproval offline gating", () => {
         headers: { "content-type": "application/json" },
       })
     }) as typeof fetch
-    const client = new IntygaClient({ gatewayUrl: "http://gw.invalid", token: "t" })
+    const client = new IntygaClient({ gatewayUrl: "https://gw.invalid", token: "t" })
     return {
       client,
       offlineOpts,

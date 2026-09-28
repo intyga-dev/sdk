@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto"
+import type { webcrypto } from "node:crypto"
 import fs from "node:fs"
 // Paths come from the SDK so this writer and the `token()` reader can never drift apart.
 import { type ApprovalResult, CREDENTIALS_FILE, INTYGA_DIR, IntygaClient } from "./index.js"
@@ -11,6 +12,7 @@ import {
 } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
+import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
 import type { ApproverTrustAnchor } from "@intyga/verify"
 import { parseTrustAnchorFile, trustAnchorApprovers } from "./trust-anchor.js"
 
@@ -210,20 +212,36 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  * Timestamp is checked. Without that key a Rekor anchor cannot be verified and therefore does NOT
  * count toward quorum — deliberately, because counting an unverifiable anchor is how "independently
  * anchored" becomes a claim rather than a fact. Get the key from Sigstore's TUF root, not from the
- * bundle you are checking.
+ * bundle you are checking. `--rekor-submitter-key` additionally pins WHO submitted the entry — the
+ * producer's published anchor key — since Rekor logs a submission under any key at all.
+ *
+ * External witness times are bounded (DEWP §5.3): an anchor first witnessed more than
+ * `--max-anchor-lag` seconds (default one day) after its checkpoint's claimed time does not count.
  */
 async function buildAnchorOptions(
   trustedIssuers: string | undefined,
   anchorKeysFile: string | undefined,
   requireAnchors: string | undefined,
   rekorKeyFile?: string,
+  tsaTrustFile?: string,
+  rekorIssuer?: string,
+  rekorSubmitterKeyFile?: string,
+  maxAnchorLag?: string,
 ): Promise<Record<string, unknown>> {
-  if (!trustedIssuers) return {}
+  if (!trustedIssuers) {
+    if (tsaTrustFile) die("--tsa-trust requires --trusted-issuer")
+    if (rekorSubmitterKeyFile) die("--rekor-submitter-key requires --trusted-issuer")
+    if (maxAnchorLag) die("--max-anchor-lag requires --trusted-issuer")
+    return {}
+  }
   const issuers = trustedIssuers
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
-  if (issuers.length === 0) return {}
+  if (issuers.length === 0) {
+    if (tsaTrustFile) die("--tsa-trust requires at least one --trusted-issuer")
+    return {}
+  }
 
   const nodeCrypto = await import("node:crypto")
   let keyMap: Record<string, string> = {}
@@ -248,13 +266,105 @@ async function buildAnchorOptions(
       die(`cannot read --rekor-key: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
+  if (rekorIssuer && !rekorKey) die("--rekor-issuer requires --rekor-key")
+  let rekorSubmitterKey: string | undefined
+  if (rekorSubmitterKeyFile) {
+    if (!rekorKey) die("--rekor-submitter-key requires --rekor-key")
+    try {
+      rekorSubmitterKey = fs.readFileSync(rekorSubmitterKeyFile, "utf8").trim()
+    } catch (err) {
+      die(`cannot read --rekor-submitter-key: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  const maxAnchorLagSeconds = maxAnchorLag === undefined ? undefined : Number(maxAnchorLag)
+  if (
+    maxAnchorLagSeconds !== undefined &&
+    (!Number.isSafeInteger(maxAnchorLagSeconds) || maxAnchorLagSeconds < 0)
+  )
+    die("--max-anchor-lag must be a non-negative integer number of seconds")
+  if (rekorIssuer && !issuers.includes(rekorIssuer)) die("--rekor-issuer must name a --trusted-issuer")
+  if (rekorKey && issuers.length > 1 && !rekorIssuer) {
+    die("--rekor-key with multiple trusted issuers requires --rekor-issuer")
+  }
+
+  let rfc3161: Record<string, import("@intyga/verify").Rfc3161Trust> | undefined
+  if (tsaTrustFile) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(fs.readFileSync(tsaTrustFile, "utf8")) as unknown
+    } catch (err) {
+      die(`cannot read --tsa-trust: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
+      die("--tsa-trust must contain a non-empty JSON object mapping issuer to RFC 3161 trust")
+    }
+    const trusts: Record<string, import("@intyga/verify").Rfc3161Trust> = {}
+    for (const [issuer, value] of Object.entries(parsed)) {
+      if (!issuer || !value || typeof value !== "object" || Array.isArray(value)) {
+        die(`--tsa-trust entry ${JSON.stringify(issuer)} is not an RFC 3161 trust object`)
+      }
+      const trust = value as Record<string, unknown>
+      const byteLength = (text: unknown) => (typeof text === "string" ? Buffer.byteLength(text, "utf8") : 0)
+      const allowed = new Set([
+        "caPem",
+        "signerCertificateSha256",
+        "revocation",
+        "crlPem",
+        "untrustedPem",
+        "verificationTime",
+        "opensslPath",
+      ])
+      if (
+        Object.keys(trust).some((key) => !allowed.has(key)) ||
+        typeof trust.caPem !== "string" ||
+        trust.caPem.length === 0 ||
+        byteLength(trust.caPem) > 1024 * 1024 ||
+        typeof trust.signerCertificateSha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(trust.signerCertificateSha256) ||
+        !["crl", "unchecked"].includes(String(trust.revocation)) ||
+        (trust.revocation === "crl" && (typeof trust.crlPem !== "string" || trust.crlPem.length === 0)) ||
+        (trust.crlPem !== undefined && typeof trust.crlPem !== "string") ||
+        byteLength(trust.crlPem) > 1024 * 1024 ||
+        (trust.untrustedPem !== undefined && typeof trust.untrustedPem !== "string") ||
+        byteLength(trust.untrustedPem) > 1024 * 1024 ||
+        (trust.verificationTime !== undefined &&
+          (!Number.isSafeInteger(trust.verificationTime) ||
+            Number(trust.verificationTime) < 0 ||
+            Number(trust.verificationTime) > 253402300799)) ||
+        (trust.opensslPath !== undefined &&
+          (typeof trust.opensslPath !== "string" || !trust.opensslPath || trust.opensslPath.includes("\0")))
+      ) {
+        die(`--tsa-trust entry ${JSON.stringify(issuer)} is invalid`)
+      }
+      trusts[issuer] = {
+        caPem: trust.caPem as string,
+        signerCertificateSha256: trust.signerCertificateSha256 as string,
+        revocation: trust.revocation as "crl" | "unchecked",
+        ...(trust.crlPem !== undefined ? { crlPem: trust.crlPem as string } : {}),
+        ...(trust.untrustedPem !== undefined ? { untrustedPem: trust.untrustedPem as string } : {}),
+        ...(trust.verificationTime !== undefined
+          ? { verificationTime: trust.verificationTime as number }
+          : {}),
+        ...(trust.opensslPath !== undefined ? { opensslPath: trust.opensslPath as string } : {}),
+      }
+    }
+    rfc3161 = trusts
+  }
+
+  const externalKeys = {
+    ...(rekorKey ? { rekor: rekorKey } : {}),
+    ...(rekorIssuer ? { rekorIssuer } : {}),
+    ...(rekorSubmitterKey ? { rekorSubmitterKeys: [rekorSubmitterKey] } : {}),
+    ...(rfc3161 ? { rfc3161 } : {}),
+  }
 
   return {
-    ...(rekorKey ? { externalKeys: { rekor: rekorKey } } : {}),
+    ...(Object.keys(externalKeys).length > 0 ? { externalKeys } : {}),
     anchorPolicy: {
       requiredAnchors: required,
       trustedIssuers: issuers,
       quorum: required >= issuers.length ? "ALL_MUST_AGREE" : "N_OF_M",
+      ...(maxAnchorLagSeconds !== undefined ? { maxAnchorLagSeconds } : {}),
     },
     resolveAnchorKey: (anchor: { issuer: string; keyId: string }) => {
       const spki = keyMap[`${anchor.issuer}#${anchor.keyId}`] ?? keyMap[anchor.issuer]
@@ -319,12 +429,26 @@ function parseRootsEntries(rootsPath: string): RootsFileEntry[] {
     })
 }
 
-/** Pick the published daily root that covers this proof's seq (or matches its anchorRef).
+/** A roots-file line as the verifier's caller-trusted checkpoint record (DEWP §5.4.1). The chain-verified
+ *  time and chain hash are what anchors must be held to — passing only `.root` threw them away and let a
+ *  bundle re-date its checkpoint to make a late witness look prompt (§5.3). */
+function toTrustedCheckpoint(e: RootsFileEntry): import("@intyga/verify").TrustedCheckpoint {
+  return {
+    root: e.root,
+    seqStart: e.seqStart ?? null,
+    seqEnd: e.seqEnd ?? null,
+    entryCount: typeof e.entryCount === "number" ? e.entryCount : null,
+    anchoredAt: e.anchoredAt ?? null,
+    chainHash: e.chainHash ?? null,
+  }
+}
+
+/** Pick the published roots-file line that covers this proof's seq (or matches its anchorRef).
  *  Undefined if no match. */
 function pickRoot(
   entries: RootsFileEntry[],
   bundle: { proof: { seq: string; anchorRef: string | null } },
-): string | undefined {
+): RootsFileEntry | undefined {
   const seq = rootsDecimal(bundle.proof.seq, "bundle proof.seq")
   const byAnchor = bundle.proof.anchorRef
     ? entries.find((e) => e.anchorRef && e.anchorRef === bundle.proof.anchorRef)
@@ -335,7 +459,7 @@ function pickRoot(
     const seqEnd = rootsDecimal(e.seqEnd, "roots file entry seqEnd")
     return seqStart <= seq && seq <= seqEnd
   })
-  return (byAnchor ?? bySeq)?.root
+  return byAnchor ?? bySeq
 }
 
 function parseParamsArg(): Record<string, unknown> {
@@ -493,9 +617,10 @@ async function postNotifications(input: {
   const codeLine = input.code ? `Verification code: \`${input.code}\`` : "Sign with your wallet or passkey."
   if (input.slack) {
     try {
-      await fetch(input.slack, {
+      const res = await fetch(input.slack, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        redirect: "manual",
         signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
           text: `🔒 Intyga approval required: ${input.context}`,
@@ -522,15 +647,17 @@ async function postNotifications(input: {
           ],
         }),
       })
+      if (isRedirect(res)) console.error(`[notify:slack] webhook answered with a redirect; not followed`)
     } catch (err) {
       console.error(`[notify:slack] ${(err as Error).message}`)
     }
   }
   if (input.teams) {
     try {
-      await fetch(input.teams, {
+      const res = await fetch(input.teams, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        redirect: "manual",
         signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
           "@type": "MessageCard",
@@ -554,6 +681,7 @@ async function postNotifications(input: {
           ],
         }),
       })
+      if (isRedirect(res)) console.error(`[notify:teams] webhook answered with a redirect; not followed`)
     } catch (err) {
       console.error(`[notify:teams] ${(err as Error).message}`)
     }
@@ -566,6 +694,16 @@ async function main() {
     /\/+$/,
     "",
   )
+  // Checked by each command that talks to the gateway (not here), so offline commands such as
+  // `keygen` or `sign` keep working with any INTYGA_GATEWAY_URL in the environment. https:// only,
+  // except loopback for local development — the same rule every Intyga client applies (transport.ts).
+  const requireGateway = (): void => {
+    try {
+      assertGatewayUrl(gatewayUrl, "--gateway / INTYGA_GATEWAY_URL")
+    } catch (err) {
+      die((err as Error).message)
+    }
+  }
 
   switch (cmd) {
     case "keygen": {
@@ -604,22 +742,35 @@ async function main() {
     case "login": {
       const did = arg("did")
       if (!did) die("usage: intyga login --did <did> [--gateway <url>]")
+      requireGateway()
 
       console.log(`Initiating passwordless OIDC login challenge for ${did}...`)
+      // Never follow a redirect: the poll below carries the poll secret, and a followed 307 re-sends
+      // a request to whatever origin the Location names.
       const reqRes = await fetch(`${gatewayUrl}/cli/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ did }),
+        redirect: "manual",
+        signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
       })
 
       if (!reqRes.ok) {
-        die(`Failed to request login challenge: ${reqRes.status} - ${await reqRes.text()}`)
+        die(
+          `Failed to request login challenge: ${reqRes.status} - ${isRedirect(reqRes) ? redirectHint(reqRes) : await reqRes.text()}`,
+        )
       }
 
       // `pollSecret` is what authorises collecting the token; the gateway returns it exactly once,
       // here, and stores only its hash. Never print it — the nonce below is a correlation id and is
       // safe on screen, but this value is a bearer credential for the next two minutes.
-      const { nonce, pollSecret } = (await reqRes.json()) as { nonce: string; pollSecret?: string }
+      // `code` is the sign-in verification code the approval page also shows (gateway
+      // `loginVerificationCode`). Optional: a gateway from before it existed does not send one.
+      const { nonce, pollSecret, code } = (await reqRes.json()) as {
+        nonce: string
+        pollSecret?: string
+        code?: string
+      }
       if (!pollSecret) {
         die(
           "This gateway did not issue a poll secret. It is running a build from before CLI login was " +
@@ -628,7 +779,12 @@ async function main() {
       }
       console.log(`\n------------------------------------------------------------`)
       console.log(`Challenge: ${nonce.slice(0, 8)}…`)
-      console.log(`PLEASE APPROVE this login in your Intyga Wallet or Console.`)
+      if (typeof code === "string" && /^[0-9A-F]{4}-[0-9A-F]{4}$/.test(code)) {
+        console.log(`Verification code: ${code}`)
+        console.log(`Approve this sign-in in your Intyga console ONLY if it shows the same code.`)
+      } else {
+        console.log(`PLEASE APPROVE this login in your Intyga Wallet or Console.`)
+      }
       console.log(`------------------------------------------------------------\n`)
 
       console.log("Polling for biometric wallet signature...")
@@ -644,7 +800,10 @@ async function main() {
         // header, and a secret in a URL is a secret in every log and proxy along the path.
         const checkRes = await fetch(`${gatewayUrl}/cli/login/${nonce}`, {
           headers: { authorization: `Bearer ${pollSecret}` },
+          redirect: "manual",
+          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
         })
+        if (isRedirect(checkRes)) die(`Login status check failed: ${redirectHint(checkRes)}`)
         if (checkRes.ok) {
           const checkData = (await checkRes.json()) as {
             status: string
@@ -672,6 +831,7 @@ async function main() {
       const params = parseParamsArg()
       const target = arg("target") ?? ""
       if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
+      requireGateway()
 
       const client = new IntygaClient({
         gatewayUrl,
@@ -755,6 +915,7 @@ async function main() {
       const { timeoutMs } = parseTimeout(arg("timeout"))
       const target = arg("target") ?? ""
       if (!target) die("--target is required (DIV Target Isolation): identify the executing RP / environment")
+      requireGateway()
       const client = new IntygaClient({
         gatewayUrl,
         token: arg("token") ?? process.env.INTYGA_TOKEN,
@@ -793,6 +954,7 @@ async function main() {
     case "verify": {
       const hash = rest.find((a) => !a.startsWith("--"))
       if (!hash) die("usage: intyga verify <documentHash> --gateway <url>")
+      requireGateway()
       const client = new IntygaClient({ gatewayUrl })
       console.log(JSON.stringify(await client.verify(hash), null, 2))
       return
@@ -800,10 +962,12 @@ async function main() {
     // biome-ignore lint/suspicious/noFallthroughSwitchClause: every exit from this case is a process.exit() (type `never`), so control never reaches `default:`; Biome does not type-analyze.
     case "audit-verify": {
       // Offline, no-secret verification of an audit inclusion proof exported from the dashboard.
-      // For a trustworthy verdict, supply the daily root from an independent source: --root <hex>
-      // (pasted from the external anchor) or --roots <file> (the published end-of-day root list, e.g.
-      // a checkout of the intyga-dev/ledger repo). Without one, the bundle is only checked against its
-      // own asserted root. Exit code 0 = verified, 1 = not.
+      // For a trustworthy verdict, supply the daily root from an independent source: --roots <file>
+      // (the published end-of-day root list, e.g. a checkout of the intyga-dev/ledger repo) or
+      // --root <hex> (a root you recorded earlier). NOT a root copied from the bundle — that checks it
+      // against itself — and not "from the external anchor": Rekor and a TSA hold only a digest that
+      // commits to the root, never the root. Without one, the bundle is only checked against its own
+      // asserted root. Exit code 0 = verified, 1 = not.
       const { verifyBundle, verifyEvidenceBundle, verifyRootsChain, EVIDENCE_BUNDLE_KIND } = await import(
         "@intyga/verify"
       )
@@ -812,7 +976,8 @@ async function main() {
         die(
           "usage: intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
             "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] " +
-            "[--rekor-key <pem>] [--json]\n" +
+            "[--rekor-key <pem>] [--rekor-issuer <issuer>] [--rekor-submitter-key <pem>] " +
+            "[--tsa-trust <tsa-trust.json>] [--max-anchor-lag <seconds>] [--json]\n" +
             "  Works for both single inclusion proofs and multi-entry evidence bundles.",
         )
 
@@ -862,6 +1027,10 @@ async function main() {
         arg("anchor-keys"),
         arg("require-anchors"),
         arg("rekor-key"),
+        arg("tsa-trust"),
+        arg("rekor-issuer"),
+        arg("rekor-submitter-key"),
+        arg("max-anchor-lag"),
       )
 
       // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
@@ -875,6 +1044,9 @@ async function main() {
         const trustedRoots = [...new Set([...(root ? [root] : []), ...fromFile])]
         const result = verifyEvidenceBundle(evidence, {
           trustedRoots: trustedRoots.length > 0 ? trustedRoots : undefined,
+          // The full lines, not just their roots: a bundle checkpoint must agree with them, and its
+          // anchors are held to their chain-verified range, chain hash and time (DEWP §5.3).
+          trustedCheckpoints: rootsEntries?.map(toTrustedCheckpoint),
           ...anchorOpts,
         })
         if (process.argv.indexOf("--json") >= 0) {
@@ -907,6 +1079,9 @@ async function main() {
                 ? `VERIFIED (${r.verifiedIssuers.join(", ")})`
                 : "NOT MET"
           console.log(`  root ${r.root.slice(0, 16)}… anchor: ${r.anchorRef ?? "(none)"}  quorum: ${quorum}`)
+          for (const [issuer, at] of Object.entries(r.witnessTimes)) {
+            console.log(`    witnessed by ${issuer} at ${new Date(at * 1000).toISOString()}`)
+          }
         }
         for (const n of result.notes) console.log(`  note: ${n}`)
         console.log("")
@@ -914,11 +1089,19 @@ async function main() {
         process.exit(result.ok ? 0 : 1)
       }
 
-      const trustedRoot = arg("root") ?? (rootsEntries ? pickRoot(rootsEntries, bundle) : undefined)
-      if (rootsEntries && !trustedRoot)
+      const rootFlag = arg("root")
+      const picked = rootsEntries ? pickRoot(rootsEntries, bundle) : undefined
+      const trustedRoot = rootFlag ?? picked?.root
+      if (rootsEntries && !picked)
         console.error("warning: no matching root in the roots file for this event.")
+      if (rootFlag && picked && picked.root !== rootFlag)
+        console.error("warning: --root differs from the roots-file line covering this event; refusing both.")
+      // A single proof carries no checkpoint: the roots-file line is the only checkpoint time and chain
+      // hash an external witness can be held to. With --root alone there is none, so Rekor/TSA anchors
+      // do not count (the verdict says why). A --root naming a different root than that line is refused.
+      const trustedCheckpoint = picked ? toTrustedCheckpoint(picked) : undefined
 
-      const result = verifyBundle(bundle, { trustedRoot, ...anchorOpts })
+      const result = verifyBundle(bundle, { trustedRoot, trustedCheckpoint, ...anchorOpts })
 
       if (process.argv.indexOf("--json") >= 0) {
         console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
@@ -928,7 +1111,20 @@ async function main() {
       const m = (x: { pass: boolean | null }) =>
         x.pass === true ? "PASS" : x.pass === false ? "FAIL" : "n/a "
       console.log(`Intyga inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`)
-      console.log(`  root source     ${result.rootSource}`)
+      // The verifier only knows the root was handed to it; where it came from decides whether it is
+      // independent, so say which input supplied it.
+      const provenance =
+        result.rootSource !== "caller-supplied"
+          ? ""
+          : rootFlag
+            ? " (--root: independent only if you did not copy it from this bundle)"
+            : rootsChain?.ok
+              ? " (roots file, chain verified)"
+              : " (roots file, chain NOT verified)"
+      console.log(`  root source     ${result.rootSource}${provenance}`)
+      for (const [issuer, at] of Object.entries(result.witnessTimes)) {
+        console.log(`  witnessed       ${issuer} at ${new Date(at * 1000).toISOString()}`)
+      }
       console.log(`  [${m(c.inclusion)}] inclusion       ${c.inclusion.detail}`)
       console.log(`  [${m(c.rootConsistency)}] root match      ${c.rootConsistency.detail}`)
       console.log(`  [${m(c.leafBinding)}] leaf binding    ${c.leafBinding.detail}`)
@@ -1057,17 +1253,22 @@ async function main() {
           die(
             "usage: intyga trust-bundle export --tenant <uuid> (INTYGA_INTERNAL_TOKEN | --token-file <0600-file> | --token-stdin) [--dir <dir>] [--gateway <url>]",
           )
+        requireGateway()
         const token = internalToken()
+        // `redirect: "manual"`: the internal token rides on this request (transport.ts).
         const res = await fetch(`${gatewayUrl}/trust-bundle/export`, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
           body: JSON.stringify({ tenantId }),
+          redirect: "manual",
+          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
         })
+        if (isRedirect(res)) die(`export failed (${res.status}): ${redirectHint(res)}`)
         const out = (await res.json()) as {
           ok?: boolean
           reason?: string
           jws?: string
-          gatewayJwk?: JsonWebKey
+          gatewayJwk?: webcrypto.JsonWebKey
         }
         if (!res.ok || !out.ok || !out.jws || !out.gatewayJwk)
           die(out.reason ?? `export failed (${res.status})`)
@@ -1125,9 +1326,15 @@ async function main() {
           "  read back to the operator before signing.",
           "  intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>]",
           "                     [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>]",
-          "                     [--rekor-key <sigstore-log-key.pem>] [--json]",
+          "                     [--rekor-key <sigstore-log-key.pem>] [--rekor-issuer <issuer>] [--rekor-submitter-key <pem>]",
+          "                     [--tsa-trust <tsa-trust.json>] [--max-anchor-lag <seconds>] [--json]",
+          "",
+          "  Supply the root from the published roots file (--roots) or one you recorded earlier (--root);",
+          "  never copy it out of the bundle. An anchor witnessed more than --max-anchor-lag seconds",
+          "  (default 86400) after its checkpoint's time does not count toward quorum.",
           "",
           "  A Rekor anchor is checked against Sigstore's LOG key (--rekor-key), not --anchor-keys:",
+          "  An RFC 3161 anchor is checked against caller-owned issuer trust from --tsa-trust, never bundle trust:",
           "  it carries no DEWP signature, only its Signed Entry Timestamp. Without that key it",
           "  cannot be verified and does NOT count toward quorum. Take the key from Sigstore's TUF",
           "  root — never from the bundle you are checking.",

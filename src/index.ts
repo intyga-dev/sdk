@@ -13,11 +13,13 @@ export {
   type ApprovalReceipt,
   type ApproverTrustAnchor,
   canonicalIntentPayload,
+  type RequirementFloor,
   SELF_CERTIFYING_DID_PREFIX,
   selfCertifyingDid,
   verificationCode,
   verifyApprovalReceipt,
   verifyEcdsaP256,
+  WEAKER_REQUIREMENT_REASON,
 } from "@intyga/verify"
 export {
   parseTrustAnchorFile,
@@ -83,6 +85,14 @@ import {
   pendingApprovals,
   useOfflineApproval,
 } from "./offline.js"
+import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
+export {
+  assertGatewayUrl,
+  GATEWAY_TIMEOUT_MS,
+  isLoopbackHost,
+  isRedirect,
+  redirectHint,
+} from "./transport.js"
 
 export interface IntygaClientOptions {
   gatewayUrl: string
@@ -272,7 +282,10 @@ export class StoredCredentialExpired extends GatewayRefused {
 
 export class IntygaClient {
   private cached?: CachedToken
-  constructor(private readonly opts: IntygaClientOptions) {}
+  /** Throws unless `gatewayUrl` is https:// (or http:// to a loopback host) — see transport.ts. */
+  constructor(private readonly opts: IntygaClientOptions) {
+    this.opts = { ...opts, gatewayUrl: assertGatewayUrl(opts.gatewayUrl) }
+  }
 
   /**
    * Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange.
@@ -330,12 +343,17 @@ export class IntygaClient {
     const res = await fetch(`${this.opts.gatewayUrl}/oauth/token`, {
       method: "POST",
       headers: { authorization: `Basic ${basic}` },
+      redirect: "manual",
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
     })
     // A refused exchange is a verdict from a reachable gateway, like any other 4xx — and since the
     // 401-retry in `authed()` re-exchanges, a revoked key now gets here mid-call, where a bare Error
     // would read as an outage and could route a `requireApproval` wait offline.
     if (!res.ok)
-      throw new GatewayRefused(res.status, `token exchange failed: ${res.status} ${await res.text()}`)
+      throw new GatewayRefused(
+        res.status,
+        `token exchange failed: ${res.status} ${isRedirect(res) ? redirectHint(res) : await res.text()}`,
+      )
     const data = (await res.json()) as { access_token: string; expires_in?: unknown }
     this.cached = {
       token: data.access_token,
@@ -360,6 +378,8 @@ export class IntygaClient {
     const send = (token: string) =>
       fetch(`${this.opts.gatewayUrl}${path}`, {
         ...init,
+        redirect: "manual",
+        signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
         headers: { ...init.headers, authorization: `Bearer ${token}` },
       })
     const first = await this.resolveToken()
@@ -372,7 +392,8 @@ export class IntygaClient {
 
   /** A refusal on a stored credential names the one remedy there is, instead of a bare 401. */
   private refusal(op: string, res: Response, source: TokenSource, text: string): GatewayRefused {
-    const message = `${op} failed: ${res.status}${text ? ` ${text}` : ""}`
+    const detail = isRedirect(res) ? redirectHint(res) : text
+    const message = `${op} failed: ${res.status}${detail ? ` ${detail}` : ""}`
     if (res.status !== 401 || source !== "stored") return new GatewayRefused(res.status, message)
     // Drop it so the next call re-reads the file rather than re-sending a token the gateway refused.
     this.cached = undefined
@@ -497,6 +518,10 @@ export class IntygaClient {
     // either abandon a still-live challenge (returning a false EXPIRED after the human already approved)
     // or keep polling a nonce the gateway has already dropped. `!= null` so `timeout: 0` isn't swallowed.
     const timeoutMs = opts.timeoutMs ?? (opts.timeout != null ? opts.timeout * 1000 : 120_000)
+    const interval = opts.intervalMs ?? 2_000
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(interval) || interval <= 0)
+      throw new Error("timeout and interval must be finite numbers greater than zero")
+    const deadline = performance.now() + timeoutMs
 
     // The fallback is reachable ONLY from a transport failure. Every other outcome below returns
     // normally: a DENIED or EXPIRED result means a human was reached and did not approve, and letting
@@ -543,14 +568,19 @@ export class IntygaClient {
       // unless the gateway in fact answered, which tryOffline rethrows rather than routing offline.
       return tryOffline(`could not reach Intyga to request approval: ${(err as Error).message}`, err)
     }
-    const deadline = Date.now() + timeoutMs
-    const interval = opts.intervalMs ?? 2_000
+    const expired = (): ApprovalResult => ({
+      status: "EXPIRED",
+      nonce,
+      ...(agentContext ? { agentContext } : {}),
+    })
     let consecutiveErrors = 0
     for (;;) {
+      if (performance.now() >= deadline) return expired()
       // A human approval can outlast a transient 502 or socket hangup — don't discard the whole wait
       // over one bad poll. Only give up once the gateway looks genuinely unreachable.
       try {
         const r = await this.status(nonce)
+        if (performance.now() >= deadline) return expired()
         consecutiveErrors = 0
         if (r.status !== "PENDING") return { ...r, nonce, ...(agentContext ? { agentContext } : {}) }
       } catch (err: unknown) {
@@ -562,9 +592,8 @@ export class IntygaClient {
           return tryOffline(`polling failed after ${MAX_POLL_ERRORS} consecutive errors: ${msg}`, err)
         }
       }
-      if (Date.now() > deadline)
-        return { status: "EXPIRED", nonce, ...(agentContext ? { agentContext } : {}) }
-      await new Promise((resolve) => setTimeout(resolve, interval))
+      if (performance.now() >= deadline) return expired()
+      await new Promise((resolve) => setTimeout(resolve, Math.min(interval, deadline - performance.now())))
     }
   }
 
@@ -622,7 +651,15 @@ export class IntygaClient {
 
   /** Public witness lookup: has this document hash been signed, by whom, and when? */
   async verify(documentHash: string): Promise<VerifyResult> {
-    const res = await fetch(`${this.opts.gatewayUrl}/verify/${encodeURIComponent(documentHash)}`)
+    const res = await fetch(`${this.opts.gatewayUrl}/verify/${encodeURIComponent(documentHash)}`, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+    })
+    if (!res.ok)
+      throw new GatewayRefused(
+        res.status,
+        `verify failed: ${res.status}${isRedirect(res) ? ` ${redirectHint(res)}` : ""}`,
+      )
     return (await res.json()) as VerifyResult
   }
 }

@@ -7,6 +7,7 @@ import {
   type VerifyReceiptOptions,
 } from "@intyga/verify"
 import { GatewayRefused } from "./index.js"
+import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
 
 /**
  * The platform-plane client (DIV §5c): for services that embed Intyga for THEIR end customers.
@@ -20,6 +21,7 @@ import { GatewayRefused } from "./index.js"
  * signs a fresh assertion per token exchange. The private key never leaves the process.
  */
 export interface IntygaPlatformClientOptions {
+  /** https:// only; http:// is accepted for a loopback host (local development) and nothing else. */
   gatewayUrl: string
   clientId: string
   /** The P-256 private key registered (by public half) on the API key: PEM string or KeyObject. */
@@ -64,16 +66,19 @@ export interface PlatformSignatureResult {
 
 export class IntygaPlatformClient {
   private readonly key: crypto.KeyObject
+  private readonly gatewayUrl: string
   private cached?: { token: string; refreshAt?: number }
 
   constructor(private readonly opts: IntygaPlatformClientOptions) {
+    // Before the key is parsed: a plain-http URL must fail construction, never reach a request.
+    this.gatewayUrl = assertGatewayUrl(opts.gatewayUrl)
     this.key =
       typeof opts.privateKey === "string" ? crypto.createPrivateKey(opts.privateKey) : opts.privateKey
   }
 
   /** A fresh RFC 7523 client assertion: ES256, iss=sub=clientId, aud=token endpoint, one-shot jti. */
   private assertion(nowMs: number): string {
-    const url = new URL("/oauth/token", this.opts.gatewayUrl)
+    const url = new URL("/oauth/token", this.gatewayUrl)
     const header = b64url(JSON.stringify({ alg: "ES256", typ: "JWT" }))
     const iat = Math.floor(nowMs / 1000)
     const payload = b64url(
@@ -105,16 +110,23 @@ export class IntygaPlatformClient {
   }
 
   private async exchange(nowMs: number): Promise<{ token: string }> {
-    const res = await fetch(`${this.opts.gatewayUrl}/oauth/token`, {
+    // `redirect: "manual"`: a followed 307/308 would re-send this body — the client assertion — to
+    // whatever origin the Location names. A 3xx is refused below instead (transport.ts).
+    const res = await fetch(`${this.gatewayUrl}/oauth/token`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
       body: JSON.stringify({
         client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
         client_assertion: this.assertion(nowMs),
       }),
     })
     if (!res.ok)
-      throw new GatewayRefused(res.status, `token exchange failed: ${res.status} ${await res.text()}`)
+      throw new GatewayRefused(
+        res.status,
+        `token exchange failed: ${res.status} ${isRedirect(res) ? redirectHint(res) : await res.text()}`,
+      )
     const data = (await res.json()) as { access_token: string; expires_in?: unknown }
     const ttlMs = typeof data.expires_in === "number" ? data.expires_in * 1000 : undefined
     this.cached = {
@@ -131,8 +143,10 @@ export class IntygaPlatformClient {
     op = path,
   ): Promise<T> {
     const send = async (token: string) =>
-      fetch(`${this.opts.gatewayUrl}${path}`, {
+      fetch(`${this.gatewayUrl}${path}`, {
         method: init.method ?? (init.body === undefined ? "GET" : "POST"),
+        redirect: "manual",
+        signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
         headers: {
           authorization: `Bearer ${token}`,
           ...(init.body === undefined ? {} : { "content-type": "application/json" }),
@@ -145,7 +159,11 @@ export class IntygaPlatformClient {
       this.cached = undefined
       res = await send((await this.exchange(Date.now())).token)
     }
-    if (!res.ok) throw new GatewayRefused(res.status, `${op} failed: ${res.status} ${await res.text()}`)
+    if (!res.ok)
+      throw new GatewayRefused(
+        res.status,
+        `${op} failed: ${res.status} ${isRedirect(res) ? redirectHint(res) : await res.text()}`,
+      )
     return (await res.json()) as T
   }
 

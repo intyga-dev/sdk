@@ -40,6 +40,8 @@ import {
   DIV_OFFLINE_INTENT_TYPE,
   MAX_OFFLINE_WINDOW_MINUTES,
   type RequesterIdentity,
+  type RequirementFloor,
+  requiresHardwareCredential,
   type VerifiedDelegation,
   verificationCode,
   verifyApprovalReceipt,
@@ -127,8 +129,9 @@ export function createOfflineChallenge(input: {
 
   // A hardware-key policy cannot be satisfied offline (DIV §5a.3 step 4). Refuse at CHALLENGE time as
   // well as at verification: sending approvers a payload nobody can produce a valid signature for
-  // wastes the one resource an incident is short of, and the error here can explain why.
-  if (resolved.requirement.requireHardwareKey)
+  // wastes the one resource an incident is short of, and the error here can explain why. A non-empty
+  // authenticator-model allowlist is the same policy class — a bare offline key has no model.
+  if (requiresHardwareCredential(resolved.requirement))
     return {
       ok: false,
       reason: `"${input.actionType}" requires a hardware-backed WebAuthn credential, which cannot be produced offline — this action cannot be approved out of band (DIV §5a.3)`,
@@ -501,6 +504,12 @@ export async function useOfflineApproval(
   if (witnesses.length === 0) return { ok: false, reason: `no usable signatures (${rejected.join("; ")})` }
 
   const receipt = assembleOfflineReceipt(challenge, witnesses)
+  // DIV §5 step 3d. The signed requirement is the signers' own statement, so it is held to the
+  // bundle's ORDINARY rule, re-resolved here rather than read back from the challenge. Under a
+  // delegation that is still the right floor: createOfflineChallenge refused any delegatedQuorum
+  // below the ordinary quorum (DIV §5a.5), and the rest of the requirement is copied from the rule.
+  const ordinary = requirementFor(bundle, expected.actionType, expected.display)
+  if (!ordinary) return { ok: false, reason: "no unambiguous approval rule applies to this action" }
   const result = verifyApprovalReceipt(
     receipt,
     {
@@ -511,6 +520,7 @@ export async function useOfflineApproval(
       // Restricted to the approvers eligible for THIS action, so a valid signature from someone
       // outside the rule's approver list does not count toward its quorum.
       approvers: approverAnchor(bundle, challenge.approverDids),
+      requirement: requirementFloorOf(ordinary.requirement),
     },
     { allowOffline: true, delegation, asOf: opts.asOf },
   )
@@ -588,6 +598,9 @@ function findDelegation(
         target: expected.target,
         actionType: expected.actionType,
         params: expected.params,
+        // DIV §5 step 3d / §5a.5: the sealing requirement may not be weaker than the ordinary rule.
+        // The AAGUID comparison below stays, because the floor does not cover allowedAaguids.
+        requirement: requirementFloorOf(resolved.requirement),
       },
       { asOf },
     )
@@ -620,6 +633,15 @@ function findDelegation(
     return { delegation: res.delegation }
   }
   return rejected.length > 0 ? { reason: `no delegation applies (${rejected.join("; ")})` } : {}
+}
+
+/** The DIV §5 step 3d floor a bundle rule imposes on a signed requirement. */
+function requirementFloorOf(rule: ApprovalRequirementAttestation): RequirementFloor {
+  return {
+    requiredApprovals: rule.requiredApprovals,
+    requesterCannotApprove: rule.requesterCannotApprove,
+    requireHardwareKey: rule.requireHardwareKey,
+  }
 }
 
 /** A buffered offline approval awaiting reconciliation. */
