@@ -333,3 +333,31 @@ For **WebAuthn** receipts, verification requires you to pin the expected origin 
 ## License
 
 Apache-2.0 — see [`LICENSE`](./LICENSE).
+
+### Audit verification with passkey signatures
+
+```sh
+intyga audit-verify proof.json --roots roots.jsonl \
+  --approvers-file trusted-approvers.json --require-signatures \
+  --trusted-issuer https://rekor.sigstore.dev,https://timestamp.digicert.com \
+  --require-anchors 2 --rekor-key rekor.pem --rekor-issuer https://rekor.sigstore.dev \
+  --tsa-trust tsa-trust.json --json
+```
+
+`trusted-approvers.json` is your independently provisioned `intyga-trust-anchor` file with explicit
+`publicKeys` for each DID. It supplies WebAuthn `origin` and `rpId`; `--webauthn-origin` /
+`--webauthn-rp-id` (or the corresponding `INTYGA_WEBAUTHN_ORIGIN` / `INTYGA_WEBAUTHN_RP_ID` variables)
+can override them. No key or expected origin is adopted from the proof. The audit command requires
+DID-scoped keys, not a flat `--approver-key` list or keyless self-certifying entries.
+
+JSON exposes `signature: {status, reason, trusted}` for one proof and per-entry `signatures.checks`
+for bulk evidence. Status is `verified`, `invalid`, `not_checked` or `not_applicable`. Text output
+shows the reason and uses an incomplete-verification summary when a signature or anchor check was
+skipped. Legacy embedded ES256 keys alone do not establish signer identity.
+
+`--require-signatures` returns a nonzero exit code unless **every selected event** has a valid
+signature under caller-trusted keys. This includes refusing unsigned/system and redacted entries;
+select signed events for this gate. Without that flag, exit status describes the requested ledger
+and anchor checks; inspect signature results separately. Even a verified audit signature does not
+establish approval quorum, expected deploy parameters or hardware attestation — verify the full
+approval receipt for authorization. Audit verification does not consume approval or prove execution.

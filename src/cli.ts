@@ -977,7 +977,8 @@ async function main() {
           "usage: intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] " +
             "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] " +
             "[--rekor-key <pem>] [--rekor-issuer <issuer>] [--rekor-submitter-key <pem>] " +
-            "[--tsa-trust <tsa-trust.json>] [--max-anchor-lag <seconds>] [--json]\n" +
+            "[--tsa-trust <tsa-trust.json>] [--max-anchor-lag <seconds>] " +
+            "[--approvers-file <trust.json>] [--require-signatures] [--webauthn-origin <url>] [--webauthn-rp-id <host>] [--json]\n" +
             "  Works for both single inclusion proofs and multi-entry evidence bundles.",
         )
 
@@ -1033,6 +1034,29 @@ async function main() {
         arg("max-anchor-lag"),
       )
 
+      const requireSignatures = process.argv.includes("--require-signatures")
+      let signaturePolicy: import("@intyga/verify").AuditSignaturePolicy | undefined
+      const signerFile = arg("approvers-file") ?? process.env.INTYGA_APPROVERS_FILE
+      if (approverKeys().length)
+        die(
+          "audit-verify requires --approvers-file with explicit keys per signer DID; flat --approver-key is not supported",
+        )
+      if (signerFile) {
+        try {
+          const trust = parseTrustAnchorFile(fs.readFileSync(signerFile, "utf8"))
+          const trustedSigners: Record<string, string[]> = Object.create(null)
+          for (const approver of trust.approvers) {
+            if (!approver.publicKeys?.length)
+              die("audit-verify requires explicit publicKeys for every trusted signer")
+            trustedSigners[approver.did] = approver.publicKeys
+          }
+          signaturePolicy = { trustedSigners, ...webauthnExpectations(trust.webauthn) }
+        } catch (err) {
+          die(`cannot load audit signer trust: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      const signatureOptions = { signaturePolicy, requireSignatures }
+
       // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
       const bundleKind = (bundle as { kind?: string }).kind
       if (bundleKind === EVIDENCE_BUNDLE_KIND) {
@@ -1048,13 +1072,14 @@ async function main() {
           // anchors are held to their chain-verified range, chain hash and time (DEWP §5.3).
           trustedCheckpoints: rootsEntries?.map(toTrustedCheckpoint),
           ...anchorOpts,
+          ...signatureOptions,
         })
         if (process.argv.indexOf("--json") >= 0) {
           console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
           process.exit(result.ok ? 0 : 1)
         }
         console.log(
-          `Intyga evidence bundle — ${result.total} entries (${evidence.range.from} → ${evidence.range.to})`,
+          `INTYGA evidence bundle — ${result.total} entries (${evidence.range.from} → ${evidence.range.to})`,
         )
         console.log(`  content-verified  ${result.contentVerified}`)
         console.log(
@@ -1062,14 +1087,13 @@ async function main() {
         )
         console.log(`  failed            ${result.failed.length}`)
         for (const f of result.failed.slice(0, 20)) console.log(`    seq ${f.seq}: ${f.reason}`)
-        // DEWP §9.2 Extended Profile: offline DIV signature verification, per entry. Only ES256 is
-        // checkable from a leaf — see the `signatures` docs on EvidenceVerification.
+        // Signature checks over committed payloads, not full approval-policy verification.
         console.log(
           `  signatures        ${result.signatures.verified} verified, ${result.signatures.invalid.length} invalid, ` +
-            `${result.signatures.notCheckable} not offline-checkable`,
+            `${result.signatures.notCheckable} not checked or not applicable`,
         )
-        for (const s of result.signatures.invalid.slice(0, 20)) {
-          console.log(`    seq ${s.seq}: committed ES256 proof material does not verify`)
+        for (const s of result.signatures.checks ?? []) {
+          console.log(`    seq ${s.seq}: ${s.status.toUpperCase()} — ${s.reason}`)
         }
         for (const r of result.roots) {
           const quorum =
@@ -1085,7 +1109,16 @@ async function main() {
         }
         for (const n of result.notes) console.log(`  note: ${n}`)
         console.log("")
-        console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m")
+        console.log(
+          !result.ok
+            ? "\x1b[31mNOT VERIFIED ✗\x1b[0m"
+            : result.roots.every((r) => r.anchorVerified === true) &&
+                result.signatures.checks?.every(
+                  (s) => s.status === "not_applicable" || (s.status === "verified" && s.trusted),
+                )
+              ? "\x1b[32mLEDGER AND APPLICABLE SIGNATURE CHECKS VERIFIED ✓\x1b[0m"
+              : "\x1b[33mLEDGER CHECKS PASSED — additional verification incomplete; see signature and anchor results\x1b[0m",
+        )
         process.exit(result.ok ? 0 : 1)
       }
 
@@ -1101,7 +1134,12 @@ async function main() {
       // do not count (the verdict says why). A --root naming a different root than that line is refused.
       const trustedCheckpoint = picked ? toTrustedCheckpoint(picked) : undefined
 
-      const result = verifyBundle(bundle, { trustedRoot, trustedCheckpoint, ...anchorOpts })
+      const result = verifyBundle(bundle, {
+        trustedRoot,
+        trustedCheckpoint,
+        ...anchorOpts,
+        ...signatureOptions,
+      })
 
       if (process.argv.indexOf("--json") >= 0) {
         console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
@@ -1110,7 +1148,7 @@ async function main() {
       const c = result.checks
       const m = (x: { pass: boolean | null }) =>
         x.pass === true ? "PASS" : x.pass === false ? "FAIL" : "n/a "
-      console.log(`Intyga inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`)
+      console.log(`INTYGA inclusion proof — seq ${bundle.proof.seq} (${bundle.event.type})`)
       // The verifier only knows the root was handed to it; where it came from decides whether it is
       // independent, so say which input supplied it.
       const provenance =
@@ -1132,6 +1170,10 @@ async function main() {
       // property line below. Printing it as "[PASS] anchored" for self-signed-only roots was the bug.
       console.log(`  [${m(c.anchored)}] anchor claim    ${c.anchored.detail}`)
       // DEWP §7.1 property model + summary level.
+      console.log(`  signature       ${result.signature.status.toUpperCase()} — ${result.signature.reason}`)
+      console.log(
+        "  scope           Signature checks do not establish deployment authorization, approval quorum or hardware attestation.",
+      )
       const p = result.properties
       const yn = (b: boolean) => (b ? "yes" : "no ")
       console.log(
@@ -1141,7 +1183,15 @@ async function main() {
       )
       for (const n of result.notes) console.log(`  note: ${n}`)
       console.log("")
-      console.log(result.ok ? "\x1b[32mVERIFIED ✓\x1b[0m" : "\x1b[31mNOT VERIFIED ✗\x1b[0m")
+      console.log(
+        !result.ok
+          ? "\x1b[31mNOT VERIFIED ✗\x1b[0m"
+          : result.properties.anchorVerified &&
+              (result.signature.status === "not_applicable" ||
+                (result.signature.status === "verified" && result.signature.trusted))
+            ? "\x1b[32mLEDGER AND APPLICABLE SIGNATURE CHECKS VERIFIED ✓\x1b[0m"
+            : "\x1b[33mLEDGER CHECKS PASSED — additional verification incomplete; see signature and anchor results\x1b[0m",
+      )
       process.exit(result.ok ? 0 : 1)
     }
     // biome-ignore lint/suspicious/noFallthroughSwitchClause: every exit from this case is a process.exit()/die() (type `never`), so control never reaches `default:`; Biome does not type-analyze.

@@ -567,3 +567,52 @@ test("login and trust-bundle export do not follow a 307 to another origin", asyn
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
+
+test("audit-verify exposes WebAuthn status and enforces caller-trusted signatures", () => {
+  const data = JSON.parse(
+    fs.readFileSync(
+      new URL("../vectors/audit-signature-vectors.json", import.meta.url),
+      "utf8",
+    ),
+  )
+  const v = data.cases.find((c: { name: string }) => c.name === "valid")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "audit-signatures-"))
+  try {
+    const bundle = path.join(tmp, "proof.json"),
+      trust = path.join(tmp, "trust.json")
+    fs.writeFileSync(bundle, JSON.stringify(v.bundle))
+    const args = ["audit-verify", bundle, "--root", v.root]
+    const unchecked = run(args)
+    assert.equal(unchecked.status, 0)
+    assert.match(unchecked.stdout, /NOT_CHECKED/)
+    assert.match(unchecked.stdout, /additional verification incomplete/)
+    assert.equal(unchecked.stdout.includes("\x1b[32m"), false)
+    const strictMissing = run([...args, "--require-signatures", "--json"])
+    assert.equal(strictMissing.status, 1)
+    assert.equal(JSON.parse(strictMissing.stdout).signature.status, "not_checked")
+    const file = {
+      type: "intyga-trust-anchor",
+      v: 1,
+      epoch: 1,
+      approvers: Object.entries(v.policy.trustedSigners).map(([did, publicKeys]) => ({ did, publicKeys })),
+      webauthn: { origin: v.policy.expectedOrigin, rpId: v.policy.expectedRpId },
+    }
+    fs.writeFileSync(trust, JSON.stringify(file))
+    const trusted = run([...args, "--approvers-file", trust, "--require-signatures", "--json"])
+    assert.equal(trusted.status, 0, trusted.stderr)
+    assert.equal(JSON.parse(trusted.stdout).signature.trusted, true)
+    const bad = run([
+      ...args,
+      "--approvers-file",
+      trust,
+      "--webauthn-origin",
+      "https://evil.example",
+      "--require-signatures",
+      "--json",
+    ])
+    assert.equal(bad.status, 1)
+    assert.equal(JSON.parse(bad.stdout).signature.status, "invalid")
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})

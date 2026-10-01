@@ -5,6 +5,10 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+- Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
+  Report explicit per-event signature status and key trust; add strict signature acceptance for
+  single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
+
 - **Security (L21, I11):** `IntygaPlatformClient` and the `intyga` CLI (`login`, `trust-bundle
   export`, the Slack/Teams notifications) no longer follow redirects — a followed 307 re-sent the
   POST body, including the `private_key_jwt` client assertion, to whatever origin the `Location`
