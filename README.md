@@ -1,6 +1,6 @@
 # @intyga/sdk — Universal Governance for Automated Operations
 
-One SDK for every Intyga use case. Intyga is agent-agnostic: the primitive is uniform — **request a challenge → a human approves with a passkey or security key → poll until resolved** — so the same client works for scripts, pipelines, and AI agents. Plus off-platform **zero-knowledge** policy encryption.
+One SDK for every INTYGA use case. INTYGA is agent-agnostic: the primitive is uniform — **request a challenge → a human approves with a passkey or security key → poll until resolved** — so the same client works for scripts, pipelines, and AI agents. Plus off-platform **zero-knowledge** policy encryption.
 
 This TypeScript package is the reference client. The same primitive is also available for **Go**, **Rust**, **Java** and **Python** backends (see [Other languages](#other-languages-go-rust-java--python)), and offline receipt verification ships in **five** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
 
@@ -31,7 +31,7 @@ if (!spent.ok) throw new Error(`could not consume the approval: ${spent.reason ?
 ```
 
 Works identically whether the token is a **human key** (backend/service) or an **agent key**. This
-is Intyga as a general zero-trust gate for *any* backend action, not just agents.
+is INTYGA as a general zero-trust gate for *any* backend action, not just agents.
 
 Tokens are re-exchanged automatically before the `expires_in` the gateway reports, so a long-lived
 client needs no token management of its own; an explicit `token` is yours to refresh.
@@ -48,13 +48,13 @@ const w = await intyga.verify(sha256Hex);   // { verified, signerDid, signedAt, 
 
 ## Zero-knowledge policy (off-platform)
 
-Encrypt policies on **your** machine so Intyga never sees plaintext or your private key — the
-strongest ZK posture (no trust in Intyga-served code):
+Encrypt policies on **your** machine so INTYGA never sees plaintext or your private key — the
+strongest ZK posture (no trust in INTYGA-served code):
 
 ```bash
 intyga keygen --out org                       # → org.public.key (upload) + org.private.key (keep!)
 intyga policy-encrypt policy.json --pubkey org.public.key --out blob.json
-# publish blob.json (encryptedBlob + blobHash); Intyga stores only ciphertext + hash
+# publish blob.json (encryptedBlob + blobHash); INTYGA stores only ciphertext + hash
 ```
 
 ```ts
@@ -123,7 +123,7 @@ Node ≥18 (global `fetch` + `node:crypto`); the only npm dependency is [`@intyg
 
 ## Verify approvals independently
 
-Every APPROVED result carries a **receipt**. Confirm — in your own code, with no Intyga secret — that a
+Every APPROVED result carries a **receipt**. Confirm — in your own code, with no INTYGA secret — that a
 human signed off on the *exact* instruction you're about to run:
 
 The example below is for a human or `SERVICE` key. An `AI_AGENT` key must also send
@@ -209,7 +209,7 @@ if err != nil || r.Status != intyga.StatusApproved {
 	log.Fatal("not authorized")
 }
 
-// Optional hard binding before executing — no Intyga secret involved:
+// Optional hard binding before executing — no INTYGA secret involved:
 // Approvers is REQUIRED: verification uses keys YOU resolved, never the one in the receipt.
 res := verify.VerifyApprovalReceipt(*r.Receipt, verify.Expected{
 	Nonce: r.Nonce, ActionType: "wipe_production", Target: "prod-payments-eu",
@@ -260,7 +260,7 @@ if r.status != ApprovalStatus::Approved {
     return Err("not authorized".into());
 }
 
-// Optional hard binding before executing — no Intyga secret involved. `approvers` is REQUIRED:
+// Optional hard binding before executing — no INTYGA secret involved. `approvers` is REQUIRED:
 // verification uses keys YOU resolved, never the one inside the receipt.
 let expected = Expected {
     target: "prod-payments-eu".into(),
@@ -311,7 +311,7 @@ def wire_transfer(*, to: str, amount: int, currency: str) -> str:
 
 ## Multi-language offline verifiers
 
-Every APPROVED result carries a **receipt** you can verify in your own process, with no Intyga secret and no network — against approver keys **you** resolve, never one read out of the receipt. The verifier is available in five languages; all five verify both **ES256** (service-key) and **WebAuthn** (passkey) receipts, and are held byte-identical by shared cross-language test vectors.
+Every APPROVED result carries a **receipt** you can verify in your own process, with no INTYGA secret and no network — against approver keys **you** resolve, never one read out of the receipt. The verifier is available in five languages; all five verify both **ES256** (service-key) and **WebAuthn** (passkey) receipts, and are held byte-identical by shared cross-language test vectors.
 
 | Language | Package | Dependencies |
 | :--- | :--- | :--- |

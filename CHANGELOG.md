@@ -5,6 +5,8 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0]
+
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
   Report explicit per-event signature status and key trust; add strict signature acceptance for
   single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
@@ -88,7 +90,6 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
   `Error` (message unchanged), so a key revoked mid-wait is handled as the verdict it is and never
   routes `requireApproval` into the offline-approval path.
 
-## [1.0.0]
 
 Initial public release.
 
