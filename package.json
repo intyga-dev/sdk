@@ -5,10 +5,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/intyga-dev/intyga-sdk.git"
+    "url": "git+https://github.com/intyga-dev/sdk.git"
   },
   "homepage": "https://www.intyga.com",
-  "bugs": "https://github.com/intyga-dev/intyga-sdk/issues",
+  "bugs": "https://github.com/intyga-dev/sdk/issues",
   "keywords": [
     "authorization",
     "human-approval",
