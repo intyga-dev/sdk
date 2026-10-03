@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
@@ -488,6 +489,271 @@ test("authorize refuses an AUTO_APPROVED receipt by default, and accepts it only
   } finally {
     server.closeAllConnections()
     server.close()
+  }
+})
+
+// ── Relying-party floor, request id and evidence (CLI 1.1.0) ──────────────────────────────────────
+// A validly signed one-person receipt against a stub gateway: the floor is what makes a signed
+// requirement of ONE approval insufficient for a policy that demands more (DIV §5 step 3d).
+
+async function signedReceiptServer(requiredApprovals: number, params: Record<string, unknown>) {
+  const { canonicalIntentPayload, verificationCode } = (await import(
+    "../dist/index.js"
+  )) as typeof import("./index.ts")
+  const NONCE = "22222222-2222-2222-2222-222222222222"
+  const TARGET = "prod-db"
+  const ACTION_TYPE = "db.restart"
+  const DISPLAY = "Restart the primary database"
+  const requester = { did: "did:intyga:service:ci", attestation: null }
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const spki = publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const canonicalPayload = canonicalIntentPayload({
+    target: TARGET,
+    actionType: ACTION_TYPE,
+    display: DISPLAY,
+    params,
+    requester,
+    requirement: {
+      requiredApprovals,
+      requireHardwareKey: false,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    },
+    nonce: NONCE,
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+  })
+  const receipt = {
+    canonicalPayload,
+    target: TARGET,
+    actionType: ACTION_TYPE,
+    actionDescription: DISPLAY,
+    params,
+    requester,
+    verificationCode: verificationCode(canonicalPayload),
+    signatures: [
+      {
+        signerDid: "did:intyga:alice",
+        signerPublicKey: spki,
+        sigAlg: "ES256",
+        signature: crypto
+          .sign("sha256", Buffer.from(canonicalPayload, "utf8"), {
+            key: privateKey,
+            dsaEncoding: "ieee-p1363",
+          })
+          .toString("base64"),
+      },
+    ],
+  }
+  const seen: { posted: unknown[] } = { posted: [] }
+  const http = await import("node:http")
+  const server = http.createServer((req, res) => {
+    res.setHeader("content-type", "application/json")
+    let body = ""
+    req.on("data", (d: Buffer) => {
+      body += d.toString()
+    })
+    req.on("end", () => {
+      if (req.method === "POST" && body) seen.posted.push({ url: req.url, body: JSON.parse(body) })
+      if (req.url === "/authorize" && req.method === "POST")
+        res.end(JSON.stringify({ nonce: NONCE, status: "PENDING" }))
+      else if (req.url === "/authorize/verify") res.end(JSON.stringify({ ok: true }))
+      else res.end(JSON.stringify({ status: "APPROVED", receipt }))
+    })
+  })
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r))
+  const { port } = server.address() as { port: number }
+  return { server, port, spki, seen, NONCE, TARGET, ACTION_TYPE, DISPLAY }
+}
+
+const runCli = (args: string[]) =>
+  new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn("node", [cli, ...args], { encoding: "utf8" })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString()
+    })
+    child.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString()
+    })
+    child.on("error", reject)
+    child.on("close", (status) => resolve({ status, stdout, stderr }))
+  })
+
+test("--required-approvals refuses a validly signed receipt whose own requirement is weaker", async () => {
+  const PARAMS = { cluster: "primary" }
+  const g = await signedReceiptServer(1, PARAMS)
+  const args = (extra: string[]) => [
+    "authorize",
+    g.DISPLAY,
+    "--gateway",
+    `http://127.0.0.1:${g.port}`,
+    "--target",
+    g.TARGET,
+    "--type",
+    g.ACTION_TYPE,
+    "--params",
+    JSON.stringify(PARAMS),
+    "--approver-key",
+    g.spki,
+    "--webauthn-origin",
+    "https://app.example",
+    "--webauthn-rp-id",
+    "app.example",
+    "--token",
+    "t",
+    "--no-open",
+    ...extra,
+  ]
+  try {
+    const without = await runCli(args([]))
+    assert.equal(without.status, 0, "baseline: the receipt must verify without a floor\n" + without.stderr)
+    const refused = await runCli(args(["--required-approvals", "2"]))
+    assert.notEqual(refused.status, 0)
+    assert.match(refused.stderr, /weaker than the relying party's policy/)
+    assert.doesNotMatch(refused.stdout, /CONSUMED/)
+    const same = await runCli(args(["--required-approvals", "1"]))
+    assert.equal(same.status, 0, same.stderr)
+    // The same floor from the environment.
+    const viaEnv = await new Promise<{ status: number | null; stderr: string }>((resolve) => {
+      const child = spawn("node", [cli, ...args([])], {
+        env: { ...process.env, INTYGA_REQUIRED_APPROVALS: "2" },
+      })
+      let stderr = ""
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString()
+      })
+      child.on("close", (status) => resolve({ status, stderr }))
+    })
+    assert.notEqual(viaEnv.status, 0)
+  } finally {
+    g.server.closeAllConnections()
+    g.server.close()
+  }
+})
+
+test("--required-approvals rejects values that are not a whole number from 1 to 64", () => {
+  for (const bad of ["0", "-1", "1.5", "abc", "65", "999"]) {
+    const r = run([
+      "await",
+      "n",
+      "--gateway",
+      "https://x.example",
+      "--target",
+      "t",
+      "--required-approvals",
+      bad,
+    ])
+    assert.notEqual(r.status, 0, bad)
+    assert.match(r.stderr, /--required-approvals must be an integer from 1 to 64/, bad)
+  }
+})
+
+test("--request-id signs a fresh approvalRequestId and refuses a supplied one", async () => {
+  const reserved = run([
+    "authorize",
+    "x",
+    "--gateway",
+    "https://x.example",
+    "--target",
+    "t",
+    "--request-id",
+    "--params",
+    '{"approvalRequestId":"mine"}',
+  ])
+  assert.notEqual(reserved.status, 0)
+  assert.match(reserved.stderr, /approvalRequestId is reserved/)
+
+  const g = await signedReceiptServer(1, {})
+  try {
+    const first = await runCli([
+      "authorize",
+      g.DISPLAY,
+      "--gateway",
+      `http://127.0.0.1:${g.port}`,
+      "--target",
+      g.TARGET,
+      "--type",
+      g.ACTION_TYPE,
+      "--no-wait",
+      "--request-id",
+      "--token",
+      "t",
+    ])
+    const second = await runCli([
+      "authorize",
+      g.DISPLAY,
+      "--gateway",
+      `http://127.0.0.1:${g.port}`,
+      "--target",
+      g.TARGET,
+      "--type",
+      g.ACTION_TYPE,
+      "--no-wait",
+      "--request-id",
+      "--token",
+      "t",
+    ])
+    const a = JSON.parse(first.stdout.trim()).params.approvalRequestId
+    const b = JSON.parse(second.stdout.trim()).params.approvalRequestId
+    assert.match(a, /^[0-9a-f-]{36}$/)
+    assert.notEqual(a, b, "two runs must not share a request id")
+    const posted = g.seen.posted.find((p) => (p as { url: string }).url === "/authorize") as {
+      body: { params: Record<string, unknown> }
+    }
+    assert.equal(posted.body.params.approvalRequestId, a)
+  } finally {
+    g.server.closeAllConnections()
+    g.server.close()
+  }
+})
+
+test("--evidence is written before consumption and again, marked consumed, after it", async () => {
+  const PARAMS = { cluster: "primary" }
+  const g = await signedReceiptServer(1, PARAMS)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "evidence-"))
+  const file = path.join(dir, "evidence.json")
+  try {
+    const r = await runCli([
+      "authorize",
+      g.DISPLAY,
+      "--gateway",
+      `http://127.0.0.1:${g.port}`,
+      "--target",
+      g.TARGET,
+      "--type",
+      g.ACTION_TYPE,
+      "--params",
+      JSON.stringify(PARAMS),
+      "--approver-key",
+      g.spki,
+      "--webauthn-origin",
+      "https://app.example",
+      "--webauthn-rp-id",
+      "app.example",
+      "--token",
+      "t",
+      "--no-open",
+      "--consume",
+      "--required-approvals",
+      "1",
+      "--evidence",
+      file,
+    ])
+    assert.equal(r.status, 0, r.stderr)
+    const evidence = JSON.parse(fs.readFileSync(file, "utf8"))
+    assert.equal(evidence.type, "intyga-approval-evidence")
+    assert.equal(evidence.consumed, true)
+    assert.equal(evidence.expected.nonce, g.NONCE)
+    assert.deepEqual(evidence.expected.requirement, { requiredApprovals: 1 })
+    assert.equal(evidence.verification.ok, true)
+    assert.equal(evidence.receipt.target, g.TARGET)
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    g.server.closeAllConnections()
+    g.server.close()
   }
 })
 

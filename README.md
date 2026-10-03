@@ -69,8 +69,8 @@ const hash = policy.blobHash(blob);          // matches the gateway's check
 intyga keygen [--out <prefix>]
 intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]
 intyga login --did <did> [--gateway <url>]
-intyga authorize "<action>" --gateway <url> --target <target> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]
-intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved]
+intyga authorize "<action>" --gateway <url> --target <target> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]
+intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]
 intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]
 intyga sign <DIV1:...> --key <private.pem|private.der> --did <your-did> [--yes]
 intyga trust-bundle export --tenant <uuid> [--dir <dir>] [--gateway <url>]   # INTYGA_INTERNAL_TOKEN | --token-file | --token-stdin
@@ -78,6 +78,15 @@ intyga trust-bundle show [--dir <dir>]
 intyga verify <documentHash> --gateway <url>
 intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--rekor-key <pem>] [--rekor-issuer <issuer>] [--tsa-trust <tsa-trust.json>] [--json]
 ```
+
+`--required-approvals <n>` (or `INTYGA_REQUIRED_APPROVALS`) is the minimum number of independent human
+approvals **your** policy demands. The verifier refuses a receipt whose own signed requirement is weaker,
+so the requirement cannot be lowered by whoever composed the signed bytes (DIV §5 step 3d). Set it
+whenever you know the rule the action must meet. `--request-id` (on `authorize`) adds a fresh random
+`approvalRequestId` to the signed params so one run's approval cannot be reused by another; it is
+printed with `--no-wait` and must reach the `await` step unchanged. `--evidence <file>` writes the
+receipt, what was expected, the trust anchor and the verification result as JSON (mode 0600), before
+consumption and again with `consumed: true` afterwards.
 
 `audit-verify --roots` passes each roots-file line to the verifier as a trusted checkpoint record, not
 just its root: an evidence-bundle checkpoint that contradicts its line fails, and anchors are held to

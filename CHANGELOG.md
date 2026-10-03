@@ -5,6 +5,23 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0]
+
+- **CLI: `--required-approvals <n>` (or `INTYGA_REQUIRED_APPROVALS`) on `authorize` and `await`.** The
+  minimum number of independent human approvals your policy demands, passed to the verifier as the
+  requirement floor (DIV §5 step 3d). A receipt whose own signed requirement is weaker is refused, so the
+  requirement cannot be lowered by whoever composed the signed bytes.
+- **CLI: `--request-id` on `authorize`.** Adds a fresh random `approvalRequestId` to the signed params so
+  one run's approval cannot be reused by another. Supplying `approvalRequestId` yourself is refused. The
+  exact signed params are printed (`--no-wait`) and exported as the `params` output for the `await` step.
+- **CLI: `--evidence <file>` on `authorize` and `await`.** Writes the receipt, what was expected, the
+  trust anchor and the verification result as JSON (mode 0600), before consumption and again with
+  `consumed: true` afterwards.
+- The `require-approval` GitHub Action gains `approvers-json` (a trust anchor naming people),
+  `required-approvals`, `request-id` and `evidence-file`, installs `@intyga/sdk` **and** `@intyga/verify` at
+  exact pinned versions (the SDK only declares the verifier as a caret range), and runs on Node 24 with a
+  commit-pinned `actions/setup-node`.
+
 ## [1.0.0]
 
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.

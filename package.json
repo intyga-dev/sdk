@@ -1,6 +1,6 @@
 {
   "name": "@intyga/sdk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "INTYGA SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption.",
   "license": "Apache-2.0",
   "repository": {
@@ -50,7 +50,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@intyga/verify": "^1.0.0"
+    "@intyga/verify": "^1.1.0"
   },
   "scripts": {
     "build": "rm -rf dist && tsc",
