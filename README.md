@@ -283,7 +283,7 @@ The Rust client is generic over a pluggable `Transport` (default: a built-in blo
 
 ### Java — [`com.intyga:intyga-sdk`](https://github.com/intyga-dev/sdk-java)
 
-The same client (`requireApproval` / `consume`, blocking, `target` required) for JVM backends, plus a one-line `requireApprovalOrThrow` gate for Spring/Quarkus handlers and LangChain4j tool methods. It bundles the Java verifier, so a receipt can be verified in the same process. Not yet published to Maven Central — see [`sdk-java`](https://github.com/intyga-dev/sdk-java) and [`examples/`](https://github.com/intyga-dev/examples) for Spring Boot, Quarkus and LangChain4j examples.
+The same client (`requireApproval` / `consume`, blocking, `target` required) for JVM backends, plus a one-line `requireApprovalOrThrow` gate for Spring/Quarkus handlers and LangChain4j tool methods. It bundles the Java verifier, so a receipt can be verified in the same process. See [`sdk-java`](https://github.com/intyga-dev/sdk-java) and [`examples/`](https://github.com/intyga-dev/examples) for Spring Boot, Quarkus and LangChain4j examples.
 
 ### Python — [`intyga-sdk`](https://github.com/intyga-dev/sdk-python)
 
