@@ -1,5 +1,7 @@
 # @intyga/sdk — Universal Governance for Automated Operations
 
+[![Release gated by INTYGA](https://www.intyga.com/badges/release-gated-by-intyga.svg)](https://www.intyga.com/use-cases/package-publishing)
+
 One SDK for every INTYGA use case. INTYGA is agent-agnostic: the primitive is uniform — **request a challenge → a human approves with a passkey or security key → poll until resolved** — so the same client works for scripts, pipelines, and AI agents. Plus off-platform **zero-knowledge** policy encryption.
 
 This TypeScript package is the reference client. The same primitive is also available for **Go**, **Rust**, **Java** and **Python** backends (see [Other languages](#other-languages-go-rust-java--python)), and offline receipt verification ships in **five** languages (see [Multi-language offline verifiers](#multi-language-offline-verifiers)).
