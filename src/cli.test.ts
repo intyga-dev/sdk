@@ -608,7 +608,7 @@ test("--required-approvals refuses a validly signed receipt whose own requiremen
   ]
   try {
     const without = await runCli(args([]))
-    assert.equal(without.status, 0, "baseline: the receipt must verify without a floor\n" + without.stderr)
+    assert.equal(without.status, 0, `baseline: the receipt must verify without a floor\n${without.stderr}`)
     const refused = await runCli(args(["--required-approvals", "2"]))
     assert.notEqual(refused.status, 0)
     assert.match(refused.stderr, /weaker than the relying party's policy/)
