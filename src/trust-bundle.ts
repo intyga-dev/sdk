@@ -26,7 +26,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import type { ApproverTrustAnchor, ApprovalRequirementAttestation } from "@intyga/verify"
-import { SIGNER_CLASS_HUMAN } from "@intyga/verify"
+import { parseRfc3339Ms, SIGNER_CLASS_HUMAN } from "@intyga/verify"
 
 /** Bundle `type` discriminator, inside the signed JWS payload. */
 export const DIV_TRUST_BUNDLE_TYPE = "div-trust-bundle-v1"
@@ -43,7 +43,20 @@ export interface BundleApprover {
   did: string
   /** base64 SPKI (raw P-256) and/or base64 COSE (WebAuthn credential) keys. All are this ONE approver. */
   publicKeys: string[]
+  /**
+   * base64 SPKI offline signing keys (DIV §5a.4). They count ONLY toward a `div-offline-intent` —
+   * never a delegation or an ordinary intent — so they are kept out of `publicKeys` rather than merged
+   * into it. See `approverAnchor`.
+   */
+  offlinePublicKeys?: string[]
 }
+
+/**
+ * What a bundle anchor will verify. `ordinary` (the default) admits `publicKeys` only, and is what a
+ * delegation or an ordinary intent is checked against. `offline-intent` also admits
+ * `offlinePublicKeys`, and is only for verifying a `div-offline-intent` proof.
+ */
+export type BundleAnchorPurpose = "ordinary" | "offline-intent"
 
 /** The approval requirement in force for one action pattern, as the gateway resolved it. */
 export interface BundlePolicy extends PolicyRule {
@@ -114,6 +127,9 @@ export function verifyTrustBundle(
   if (header.alg !== "RS256")
     return { ok: false, reason: `trust bundle alg must be RS256, got ${header.alg ?? "(none)"}` }
 
+  // RS256 means an RSA key. A pinned EC key would otherwise get ECDSA verification under an RS256
+  // header — the key choice deciding the algorithm, which is the confusion the alg check exists for.
+  if (gatewayJwk?.kty !== "RSA") return { ok: false, reason: "pinned gateway key must be an RSA JWK" }
   let keyObject: crypto.KeyObject
   try {
     keyObject = crypto.createPublicKey({ format: "jwk", key: gatewayJwk })
@@ -157,10 +173,17 @@ export function verifyTrustBundle(
         a.did.length &&
         Array.isArray(a.publicKeys) &&
         a.publicKeys.length &&
-        a.publicKeys.every((k) => typeof k === "string" && k.length),
+        a.publicKeys.every((k) => typeof k === "string" && k.length) &&
+        (a.offlinePublicKeys === undefined ||
+          (Array.isArray(a.offlinePublicKeys) &&
+            a.offlinePublicKeys.every((k) => typeof k === "string" && k.length))),
     )
   )
     return { ok: false, reason: "invalid bundle approver keys" }
+  // A key listed as both ordinary and offline-only would undo the split the second list exists for.
+  const ordinaryKeys = new Set(bundle.approvers.flatMap((a) => a.publicKeys))
+  if (bundle.approvers.some((a) => (a.offlinePublicKeys ?? []).some((k) => ordinaryKeys.has(k))))
+    return { ok: false, reason: "trust bundle lists an offline signing key as an ordinary key" }
   if (!Array.isArray(bundle.policy) || !bundle.policy.every(validBundlePolicy))
     return { ok: false, reason: "trust bundle carries invalid or incomplete policy" }
   try {
@@ -190,12 +213,14 @@ export function checkTrustBundleFreshness(
   // local age cap is what actually bounds drift — a relying party must not be able to run for a year
   // on a bundle just because whoever exported it chose a long expiry.
   const now = (opts.asOf ?? new Date()).getTime()
-  const expiryMs = Date.parse(bundle.expiresAt)
+  // The DIV §6.2 grammar, not Date.parse: a bare date or a zone-less time would otherwise be read
+  // in the host's timezone, and the other SDKs refuse both.
+  const expiryMs = parseRfc3339Ms(bundle.expiresAt)
   if (Number.isNaN(expiryMs))
     return { ok: false, reason: "trust bundle expiresAt is not a valid RFC3339 timestamp" }
   if (now > expiryMs)
     return { ok: false, reason: `trust bundle expired at ${bundle.expiresAt} — export a fresh one` }
-  const issuedMs = Date.parse(bundle.issuedAt)
+  const issuedMs = parseRfc3339Ms(bundle.issuedAt)
   if (Number.isNaN(issuedMs))
     return { ok: false, reason: "trust bundle issuedAt is not a valid RFC3339 timestamp" }
   const ageDays = (now - issuedMs) / 86_400_000
@@ -250,12 +275,25 @@ export function loadTrustBundle(
  * a delegation (DIV §5a.6) names identities that cannot be enforced against an unverified `signerDid`.
  * Flattening every key into one allowlist — which is what a single-key resolver forces — would let one
  * approver holding a software key and two passkeys satisfy a 3-of-N quorum alone.
+ *
+ * `purpose` defaults to `ordinary`, which never admits an offline signing key. Pass `offline-intent`
+ * only when the receipt being verified is a `div-offline-intent`: a bare offline key that could seal a
+ * delegation would hand its holder the approval authority the delegation transfers.
  */
-export function approverAnchor(bundle: TrustBundle, limitToDids?: string[]): ApproverTrustAnchor {
+export function approverAnchor(
+  bundle: TrustBundle,
+  limitToDids?: string[],
+  purpose: BundleAnchorPurpose = "ordinary",
+): ApproverTrustAnchor {
   const eligible = limitToDids
     ? bundle.approvers.filter((a) => limitToDids.includes(a.did))
     : bundle.approvers
-  const byDid = new Map(eligible.map((a) => [a.did, a.publicKeys]))
+  const byDid = new Map(
+    eligible.map((a) => [
+      a.did,
+      purpose === "offline-intent" ? [...a.publicKeys, ...(a.offlinePublicKeys ?? [])] : a.publicKeys,
+    ]),
+  )
   return {
     dids: [...byDid.keys()],
     resolveKey: (did) => byDid.get(did) ?? null,

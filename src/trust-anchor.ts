@@ -17,9 +17,22 @@ import type { BundleApprover } from "./trust-bundle.js"
 
 export const TRUST_ANCHOR_FILE_TYPE = "intyga-trust-anchor"
 
+/**
+ * What an anchor is FOR, and so which keys it may pin. `online` pins passkeys and node keys and
+ * verifies ordinary approval receipts; `offline` pins offline signing keys only and verifies DIV §5a
+ * offline approvals. Two files, never one: a bare offline key — no origin binding, no user
+ * verification — must not satisfy a relying party that verifies online approvals.
+ *
+ * A file with no `purpose` predates the field. Every file exported before it was an online anchor, so
+ * that is how one is read.
+ */
+export type TrustAnchorPurpose = "online" | "offline"
+
 export interface TrustAnchorFile {
   type: typeof TRUST_ANCHOR_FILE_TYPE
   v: 1
+  /** Always set after parsing; absent in the file means `online`. */
+  purpose: TrustAnchorPurpose
   /**
    * Monotonic export counter for this scope. Lets a relying party — or a human diffing two copies —
    * detect that one anchor is older than another. It carries no cryptographic weight: freshness of
@@ -53,8 +66,16 @@ const isBase64 = (s: string): boolean => {
  * Parse and validate a trust-anchor file. Throws with a precise, single-problem reason — a trust
  * anchor is security configuration, so a malformed one must fail loudly at load time rather than
  * surface later as an unverifiable receipt.
+ *
+ * `purpose` is what the CALLER is about to verify, and the file must say the same: an offline anchor
+ * handed to an online verifier (or the reverse) is refused rather than trusted. It defaults to
+ * `online`, so a caller that does not think about it can never pin offline keys by accident.
  */
-export function parseTrustAnchorFile(jsonText: string): TrustAnchorFile {
+export function parseTrustAnchorFile(
+  jsonText: string,
+  opts: { purpose?: TrustAnchorPurpose } = {},
+): TrustAnchorFile {
+  const expected = opts.purpose ?? "online"
   let raw: unknown
   try {
     raw = JSON.parse(jsonText)
@@ -69,6 +90,13 @@ export function parseTrustAnchorFile(jsonText: string): TrustAnchorFile {
       `type must be "${TRUST_ANCHOR_FILE_TYPE}" — a div-trust-bundle JWS (offline approval) is a different, gateway-signed artifact and cannot be used here`,
     )
   if (obj.v !== 1) return fail(`unsupported version ${JSON.stringify(obj.v)} (expected 1)`)
+  const purpose = obj.purpose === undefined ? "online" : obj.purpose
+  if (purpose !== "online" && purpose !== "offline")
+    return fail(`purpose must be "online" or "offline", got ${JSON.stringify(obj.purpose)}`)
+  if (purpose !== expected)
+    return fail(
+      `this is an ${purpose} anchor, but it is being loaded to verify ${expected} approvals — export the ${expected} anchor instead`,
+    )
   if (typeof obj.epoch !== "number" || !Number.isInteger(obj.epoch) || obj.epoch < 0)
     return fail("epoch must be a non-negative integer")
   if (obj.label !== undefined && typeof obj.label !== "string") return fail("label must be a string")
@@ -93,6 +121,10 @@ export function parseTrustAnchorFile(jsonText: string): TrustAnchorFile {
     // A stable DID with no keys can never satisfy verification — refuse at load, where the problem
     // is diagnosable, instead of at verify time where it reads as a bad receipt. Self-certifying
     // DIDs are the deliberate exception: their key travels in the receipt and is checked by hash.
+    // An offline anchor has no such exception: a DID commits to its ONLINE key, not to an offline
+    // signing key its owner chose to register.
+    if (publicKeys.length === 0 && purpose === "offline")
+      return fail(`approver ${did} has no publicKeys — an offline anchor must pin every offline key`)
     if (publicKeys.length === 0 && !did.startsWith(SELF_CERTIFYING_DID_PREFIX))
       return fail(
         `approver ${did} has no publicKeys and is not self-certifying (${SELF_CERTIFYING_DID_PREFIX}…) — a receipt from them could never verify`,
@@ -108,7 +140,7 @@ export function parseTrustAnchorFile(jsonText: string): TrustAnchorFile {
       return fail("webauthn.rpId must be a non-empty string")
   }
 
-  return obj as unknown as TrustAnchorFile
+  return { ...(obj as unknown as TrustAnchorFile), purpose }
 }
 
 /**

@@ -25,6 +25,7 @@ export {
   parseTrustAnchorFile,
   TRUST_ANCHOR_FILE_TYPE,
   type TrustAnchorFile,
+  type TrustAnchorPurpose,
   trustAnchorApprovers,
 } from "./trust-anchor.js"
 export * as policy from "./policy.js"
@@ -34,6 +35,7 @@ export {
   clearPendingApproval,
   createOfflineChallenge,
   decodeChallengeEnvelope,
+  type DecodedChallenge,
   decodeSignatureEnvelope,
   DEFAULT_OFFLINE_WINDOW_MINUTES,
   encodeSignatureEnvelope,
@@ -43,12 +45,15 @@ export {
   type OfflineChallenge,
   type PendingApproval,
   pendingApprovals,
+  readPendingApprovals,
   type RedemptionStore,
   SIGNATURE_ENVELOPE_PREFIX,
+  signChallengeEnvelope,
   useOfflineApproval,
 } from "./offline.js"
 export {
   approverAnchor,
+  type BundleAnchorPurpose,
   type BundleApprover,
   type BundlePolicy,
   DIV_TRUST_BUNDLE_TYPE,
@@ -82,7 +87,7 @@ import type { AgentIntentContext, ApprovalReceipt } from "@intyga/verify"
 import {
   clearPendingApproval,
   type OfflineApprovalOptions,
-  pendingApprovals,
+  readPendingApprovals,
   useOfflineApproval,
 } from "./offline.js"
 import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
@@ -207,6 +212,30 @@ export class GatewayRefused extends Error {
     super(message)
     this.name = "GatewayRefused"
     this.status = status
+  }
+}
+
+/**
+ * The gateway could not be asked at all: the request never got an answer (connection refused, DNS,
+ * TLS, timeout). This, and a 5xx from infrastructure in front of it, are the only failures that may
+ * route `requireApproval` to the DIV §5a offline path. A local error — a blank target, missing client
+ * credentials — is neither: nothing was asked, and an offline ceremony would bind whatever was wrong.
+ */
+export class GatewayUnreachable extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = "GatewayUnreachable"
+  }
+}
+
+/** `fetch`, with a transport failure surfaced as GatewayUnreachable and everything else unchanged. */
+async function reach(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (err) {
+    throw new GatewayUnreachable(`could not reach ${new URL(url).origin}: ${(err as Error).message}`, {
+      cause: err,
+    })
   }
 }
 
@@ -340,7 +369,7 @@ export class IntygaClient {
       )
     }
     const basic = Buffer.from(`${this.opts.clientId}:${this.opts.clientSecret}`).toString("base64")
-    const res = await fetch(`${this.opts.gatewayUrl}/oauth/token`, {
+    const res = await reach(`${this.opts.gatewayUrl}/oauth/token`, {
       method: "POST",
       headers: { authorization: `Basic ${basic}` },
       redirect: "manual",
@@ -376,7 +405,7 @@ export class IntygaClient {
     init: { method?: string; headers?: Record<string, string>; body?: string } = {},
   ): Promise<{ res: Response; source: TokenSource }> {
     const send = (token: string) =>
-      fetch(`${this.opts.gatewayUrl}${path}`, {
+      reach(`${this.opts.gatewayUrl}${path}`, {
         ...init,
         redirect: "manual",
         signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
@@ -535,10 +564,21 @@ export class IntygaClient {
       //
       // 5xx is deliberately NOT included: a 502 from a load balancer or a 503 from a restarting
       // instance is infrastructure failing, which is exactly the "could not ask" §5a is written for.
-      if (err instanceof GatewayRefused && err.status < 500) throw err
+      //
+      // And only those two. Anything else — a blank target, missing credentials, an unreadable body —
+      // failed HERE, before or after a gateway that did answer, and an offline ceremony would bind the
+      // very input that was wrong (found porting this to Go, 2026-10-06).
+      const couldNotAsk =
+        err instanceof GatewayUnreachable || (err instanceof GatewayRefused && err.status >= 500)
+      if (!couldNotAsk) throw err instanceof Error ? err : new Error(cause)
+      // Without an offline opt-in the caller gets a TYPED error back, so it can still tell an outage
+      // (GatewayUnreachable, a 5xx GatewayRefused) from anything else — with `cause` as its message.
+      if (!opts.offline)
+        throw err instanceof GatewayRefused
+          ? new GatewayRefused(err.status, cause)
+          : new GatewayUnreachable(cause, { cause: err })
       if (opts.agentContext)
         throw new Error("agent continuity requests cannot fall back to an unchained offline proof")
-      if (!opts.offline) throw new Error(cause)
       const offline = await useOfflineApproval(
         {
           target: opts.target,
@@ -574,6 +614,10 @@ export class IntygaClient {
       ...(agentContext ? { agentContext } : {}),
     })
     let consecutiveErrors = 0
+    // The first error in the current streak that was NOT "could not ask". If the streak ends in a
+    // fallback, that error is thrown instead: a gateway that answered 404 once and then went quiet was
+    // reached, and its answer was not an outage (found porting to Java, 2026-10-06).
+    let streakRefusal: unknown
     for (;;) {
       if (performance.now() >= deadline) return expired()
       // A human approval can outlast a transient 502 or socket hangup — don't discard the whole wait
@@ -582,9 +626,14 @@ export class IntygaClient {
         const r = await this.status(nonce)
         if (performance.now() >= deadline) return expired()
         consecutiveErrors = 0
+        streakRefusal = undefined
         if (r.status !== "PENDING") return { ...r, nonce, ...(agentContext ? { agentContext } : {}) }
       } catch (err: unknown) {
+        const couldNotAsk =
+          err instanceof GatewayUnreachable || (err instanceof GatewayRefused && err.status >= 500)
+        if (!couldNotAsk && streakRefusal === undefined) streakRefusal = err
         if (++consecutiveErrors >= MAX_POLL_ERRORS) {
+          if (streakRefusal !== undefined) throw streakRefusal
           const msg = err instanceof Error ? err.message : String(err)
           // The gateway went away mid-wait. Same situation as failing to raise the challenge, so the
           // same fallback applies — and, as there, only because we could not ASK, not because we were
@@ -617,7 +666,14 @@ export class IntygaClient {
     let reported = 0
     let failed = 0
 
-    for (const use of pendingApprovals(opts)) {
+    const { records, unreadable } = readPendingApprovals(opts)
+    // Counted, never skipped: an unreported approval is indistinguishable from an unauthorized one,
+    // and a record nobody can read is still an approval nobody has reported.
+    for (const name of unreadable) {
+      failed++
+      reasons.push(`${name}: unreadable pending record — report it by hand`)
+    }
+    for (const use of records) {
       try {
         const { res } = await this.authed("/offline-approval/reconcile", {
           method: "POST",

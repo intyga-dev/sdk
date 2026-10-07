@@ -5,6 +5,34 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0]
+
+- **Offline signing keys are their own list in the trust bundle.** `BundleApprover.offlinePublicKeys`
+  holds an approver's offline signing keys (DIV §5a.4). `approverAnchor(bundle, dids, purpose)` admits
+  them only for `"offline-intent"`; the default, `"ordinary"`, never does, so an offline key cannot seal
+  a delegation. A bundle listing one key in both lists is refused.
+- **Trust-anchor files carry `purpose`.** `parseTrustAnchorFile(text, { purpose })` refuses a file
+  exported for the other kind of verification; the default is `"online"`, and a file without the field
+  reads as online. An offline anchor must pin a key for every approver.
+- **`signChallengeEnvelope`.** The approver's signing step as a library function; `intyga sign` uses it.
+  It now also refuses a key that is not P-256.
+- `createOfflineChallenge` accepts an optional `nonce`, for deterministic replay and conformance vectors;
+  an empty one is refused, as is a `windowMinutes` that is not a whole number.
+- **`requireApproval` falls back offline only when the gateway could not be asked.** A transport failure
+  is now the typed `GatewayUnreachable`; it and a 5xx `GatewayRefused` are the only routes to the offline
+  path. A local error (a blank target, missing credentials) used to route offline too, and started a
+  ceremony that bound the faulty input. Without the `offline` option the typed error is thrown. A
+  polling streak that includes a refusal throws it rather than falling back.
+- **Reconciliation no longer goes silent over one corrupt record.** `readPendingApprovals` returns the
+  readable records and names the unreadable files; `reconcileOfflineApprovals` counts each as failed and
+  keeps it. `pendingApprovals` returns the readable ones instead of nothing.
+- Envelope decoding is strict base64url and refuses a non-object payload instead of throwing; delegation
+  files are tried in name order; the pinned trust-bundle key must be RSA, and bundle timestamps follow the
+  strict RFC 3339 grammar (DIV §6.2).
+- Shared conformance vectors for the offline-approval layer:
+  `packages/mcp-schemas/vectors/offline-approval-vectors.json`, specified in
+  `docs/OFFLINE-APPROVAL-SDK.md`.
+
 ## [1.1.0]
 
 - **CLI: `--required-approvals <n>` (or `INTYGA_REQUIRED_APPROVALS`) on `authorize` and `await`.** The

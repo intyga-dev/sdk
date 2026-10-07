@@ -105,3 +105,33 @@ test("refuses malformed inputs with a precise reason", () => {
     /rpId/,
   )
 })
+
+// An anchor says what it is for, and the caller says what it is about to verify. They must agree:
+// pinning an offline anchor where online approvals are verified would let a bare offline key — no
+// origin binding, no user verification — satisfy that relying party.
+test("purpose: absent reads as online, and a mismatch is refused either way", () => {
+  assert.equal(parseTrustAnchorFile(JSON.stringify(VALID)).purpose, "online")
+  const online = { ...VALID, purpose: "online" }
+  assert.equal(parseTrustAnchorFile(JSON.stringify(online)).purpose, "online")
+  assert.throws(() => parseTrustAnchorFile(JSON.stringify(online), { purpose: "offline" }), /online anchor/)
+
+  const offline = {
+    ...VALID,
+    purpose: "offline",
+    approvers: [{ did: "did:intyga:human-alice", publicKeys: [SPKI_B64] }],
+  }
+  assert.throws(() => parseTrustAnchorFile(JSON.stringify(offline)), /offline anchor/)
+  const parsed = parseTrustAnchorFile(JSON.stringify(offline), { purpose: "offline" })
+  assert.equal(parsed.purpose, "offline")
+  assert.deepEqual(trustAnchorApprovers(parsed).resolveKey?.("did:intyga:human-alice"), [SPKI_B64])
+
+  assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, purpose: "both" })), /purpose must be/)
+})
+
+test("an offline anchor pins a key for every approver — no self-certifying exception", () => {
+  const offline = { ...VALID, purpose: "offline" }
+  assert.throws(
+    () => parseTrustAnchorFile(JSON.stringify(offline), { purpose: "offline" }),
+    /offline anchor must pin/,
+  )
+})

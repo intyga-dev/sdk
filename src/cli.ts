@@ -4,12 +4,7 @@ import type { webcrypto } from "node:crypto"
 import fs from "node:fs"
 // Paths come from the SDK so this writer and the `token()` reader can never drift apart.
 import { type ApprovalResult, CREDENTIALS_FILE, INTYGA_DIR, IntygaClient } from "./index.js"
-import {
-  decodeChallengeEnvelope,
-  encodeSignatureEnvelope,
-  loadTrustBundle,
-  saveTrustBundle,
-} from "./index.js"
+import { decodeChallengeEnvelope, loadTrustBundle, saveTrustBundle, signChallengeEnvelope } from "./index.js"
 import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
@@ -1312,40 +1307,13 @@ async function main() {
         }
       }
 
-      const raw = fs.readFileSync(keyPath)
-      let privateKey: crypto.KeyObject
-      try {
-        // Accept a PEM or a raw DER PKCS#8 — an approver's key comes from wherever they keep it.
-        privateKey = raw.includes("-----BEGIN")
-          ? crypto.createPrivateKey(raw.toString("utf8"))
-          : crypto.createPrivateKey({ key: raw, format: "der", type: "pkcs8" })
-      } catch (err) {
-        die(`could not read the private key: ${(err as Error).message}`)
-      }
-      const signature = crypto
-        .sign("sha256", Buffer.from(c.canonicalPayload, "utf8"), {
-          key: privateKey,
-          dsaEncoding: "ieee-p1363",
-        })
-        .toString("base64")
-      // Derived via PEM rather than by passing the private KeyObject straight in: createPublicKey
-      // accepts one at runtime, but @types/node does not declare that overload.
-      const publicKey = crypto
-        .createPublicKey(privateKey.export({ format: "pem", type: "pkcs8" }) as string)
-        .export({ format: "der", type: "spki" })
-        .toString("base64")
+      const signed = signChallengeEnvelope(envelope, { privateKey: fs.readFileSync(keyPath), signerDid: did })
+      if (!signed.ok || !signed.envelope) die(signed.reason ?? "could not sign the challenge")
 
       console.log("")
       console.log("Send this back to the operator:")
       console.log("")
-      console.log(
-        encodeSignatureEnvelope({
-          signerDid: did,
-          signerPublicKey: publicKey,
-          signature,
-          sigAlg: "ES256",
-        }),
-      )
+      console.log(signed.envelope)
       console.log("")
       process.exit(0)
     }

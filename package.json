@@ -1,6 +1,6 @@
 {
   "name": "@intyga/sdk",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "INTYGA SDK — require a cryptographically-signed human approval for any high-risk backend action (AI agents, humans, services), with zero-knowledge policy encryption.",
   "license": "Apache-2.0",
   "repository": {
@@ -50,11 +50,12 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@intyga/verify": "^1.1.0"
+    "@intyga/verify": "^1.2.0"
   },
   "scripts": {
     "build": "rm -rf dist && tsc",
     "typecheck": "tsc --noEmit",
+    "generate:offline-vectors": "node --import tsx scripts/generate-offline-approval-vectors.ts",
     "test": "node --test 'src/**/*.test.ts'",
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=87 --test-coverage-branches=75 --test-coverage-functions=88 --test-coverage-exclude='../**' --test-coverage-exclude='dist/cli.js' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
   },

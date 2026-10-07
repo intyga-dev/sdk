@@ -43,6 +43,7 @@ import {
   type RequirementFloor,
   requiresHardwareCredential,
   type VerifiedDelegation,
+  parseRfc3339Ms,
   verificationCode,
   verifyApprovalReceipt,
   verifyDelegation,
@@ -69,9 +70,18 @@ export const DEFAULT_OFFLINE_WINDOW_MINUTES = 15
 function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
+/**
+ * Strict base64url (unpadded or padded). Node's decoder skips characters outside the alphabet, so a
+ * paste with stray text in it would decode to something other than what was sent; the other SDKs
+ * refuse such input, and so does this.
+ */
 function fromB64url(s: string): Buffer {
+  if (!/^[A-Za-z0-9_-]*={0,2}$/.test(s)) throw new Error("not base64url")
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64")
 }
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v)
 
 /** A locally generated offline challenge, ready to hand to the approvers. */
 export interface OfflineChallenge {
@@ -114,12 +124,22 @@ export function createOfflineChallenge(input: {
   /** Overrides "now". For tests and deterministic replay. */
   asOf?: Date
   /**
+   * Overrides the generated nonce, for conformance vectors and deterministic replay. Production callers
+   * omit it. A supplied nonce is still this relying party's own (DIV §5a.2) and is still single-use
+   * through the RedemptionStore; it must be a safe path segment.
+   */
+  nonce?: string
+  /**
    * A verified delegation, when the ordinary approvers are unreachable too. Its `delegatedQuorum`
    * becomes the signed `requiredApprovals`, so the delegated operators sign the policy their
    * signatures are counted toward (DIV §5a.6 step 3).
    */
   delegation?: VerifiedDelegation
 }): { ok: boolean; reason?: string; challenge?: OfflineChallenge } {
+  // DIV §3 Invariant 5 (Target Isolation): a blank target binds no execution environment, so the
+  // approval would verify at every relying party that also asserts it.
+  if (typeof input.target !== "string" || !input.target.trim())
+    return { ok: false, reason: "target is required (DIV Target Isolation)" }
   const resolved = requirementFor(input.bundle, input.actionType, input.display)
   if (!resolved)
     return {
@@ -137,6 +157,8 @@ export function createOfflineChallenge(input: {
       reason: `"${input.actionType}" requires a hardware-backed WebAuthn credential, which cannot be produced offline — this action cannot be approved out of band (DIV §5a.3)`,
     }
 
+  if (input.windowMinutes !== undefined && !Number.isSafeInteger(input.windowMinutes))
+    return { ok: false, reason: "windowMinutes must be a whole number of minutes" }
   const windowMinutes = Math.min(
     MAX_OFFLINE_WINDOW_MINUTES,
     Math.max(1, input.windowMinutes ?? DEFAULT_OFFLINE_WINDOW_MINUTES),
@@ -144,7 +166,8 @@ export function createOfflineChallenge(input: {
   const now = input.asOf ?? new Date()
   const challengedAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + windowMinutes * 60_000).toISOString()
-  const nonce = `off_${crypto.randomUUID()}`
+  const nonce = input.nonce ?? `off_${crypto.randomUUID()}`
+  if (!isPathSafeNonce(nonce)) return { ok: false, reason: "nonce must be a safe path segment" }
 
   // "Narrows who may approve, never the policy" has to be enforced, not merely intended. DIV §5a.5:
   // a Delegation's requirement MUST be at least as strict as the ordinary requirement for the
@@ -242,17 +265,23 @@ export function decodeChallengeEnvelope(envelope: string): {
   } catch {
     return { ok: false, reason: "challenge envelope is not valid base64url" }
   }
-  let parsed: Record<string, unknown>
+  let parsed: unknown
   try {
-    parsed = JSON.parse(canonicalPayload) as Record<string, unknown>
+    parsed = JSON.parse(canonicalPayload)
   } catch {
     return { ok: false, reason: "challenge envelope does not contain a JSON payload (truncated paste?)" }
   }
+  if (!isObject(parsed)) return { ok: false, reason: "challenge payload is not a JSON object" }
   if (parsed.type !== DIV_OFFLINE_INTENT_TYPE)
     return {
       ok: false,
       reason: `this is a ${String(parsed.type)} payload, not an offline approval challenge — refusing to sign it`,
     }
+  // Shapes before bytes. Canonicalization alone would accept `"target": 5` whenever it re-serializes
+  // identically, and the approver would then review — and sign — something no relying party builds.
+  // Every SDK refuses the same shapes (docs/OFFLINE-APPROVAL-SDK.md, "Envelopes").
+  const shapeProblem = challengeShapeProblem(parsed)
+  if (shapeProblem) return { ok: false, reason: `challenge payload ${shapeProblem} — refusing to sign it` }
   const fields = parsed as unknown as DecodedChallenge
   // Re-serializing must reproduce the input byte-for-byte. If it does not, the envelope carries
   // non-canonical or mis-shaped JSON — hand-edited, truncated, or missing fields the review pane
@@ -264,7 +293,7 @@ export function decodeChallengeEnvelope(envelope: string): {
     rebuilt = canonicalOfflineIntentPayload({
       target: fields.target,
       actionType: fields.actionType,
-      display: (parsed.display as string) ?? "",
+      display: fields.display,
       params: fields.params,
       requester: fields.requester,
       requirement: fields.requirement,
@@ -291,7 +320,7 @@ export function decodeChallengeEnvelope(envelope: string): {
       verificationCode: verificationCode(canonicalPayload),
       target: fields.target,
       actionType: fields.actionType,
-      display: (parsed.display as string) ?? "",
+      display: fields.display,
       params: fields.params,
       requester: fields.requester,
       requirement: fields.requirement,
@@ -300,6 +329,17 @@ export function decodeChallengeEnvelope(envelope: string): {
       expiresAt: fields.expiresAt,
     },
   }
+}
+
+/** Why a decoded challenge payload has the wrong shape, or null when every field is well-typed. */
+function challengeShapeProblem(p: Record<string, unknown>): string | null {
+  for (const field of ["target", "actionType", "display", "nonce", "challengedAt", "expiresAt"])
+    if (typeof p[field] !== "string") return `field ${field} is not a string`
+  if (!(p.target as string).trim()) return "has a blank target"
+  if (!isObject(p.params)) return "params is not a JSON object"
+  if (!isObject(p.requester) || typeof p.requester.did !== "string") return "requester is not an identity"
+  if (!isObject(p.requirement)) return "requirement is not a JSON object"
+  return null
 }
 
 /** Encode one approver's signature for the trip back to the relying party. */
@@ -322,22 +362,95 @@ export function decodeSignatureEnvelope(envelope: string): {
   const trimmed = envelope.trim()
   if (!trimmed.startsWith(SIGNATURE_ENVELOPE_PREFIX))
     return { ok: false, reason: `not a signature envelope (expected a ${SIGNATURE_ENVELOPE_PREFIX} prefix)` }
-  let compact: { did?: string; key?: string; sig?: string; alg?: string }
+  let compact: unknown
   try {
     compact = JSON.parse(fromB64url(trimmed.slice(SIGNATURE_ENVELOPE_PREFIX.length)).toString("utf8"))
   } catch {
     return { ok: false, reason: "signature envelope is not valid base64url JSON (truncated paste?)" }
   }
-  if (!compact.did || !compact.key || !compact.sig)
+  // A pasted `null` or array used to throw a TypeError here, which aborted the whole ceremony over
+  // one bad paste instead of discarding that envelope.
+  if (!isObject(compact)) return { ok: false, reason: "signature envelope is not a JSON object" }
+  const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.length > 0
+  if (!nonEmpty(compact.did) || !nonEmpty(compact.key) || !nonEmpty(compact.sig))
     return { ok: false, reason: "signature envelope is missing did, key or sig" }
+  if (compact.alg !== undefined && !nonEmpty(compact.alg))
+    return { ok: false, reason: "signature envelope alg must be a string" }
   return {
     ok: true,
     witness: {
       signerDid: compact.did,
       signerPublicKey: compact.key,
       signature: compact.sig,
-      sigAlg: compact.alg ?? "ES256",
+      sigAlg: typeof compact.alg === "string" ? compact.alg : "ES256",
     },
+  }
+}
+
+/**
+ * Sign a `DIV1:` challenge as an approver — the library half of `intyga sign`.
+ *
+ * Decodes first, so only a canonical `div-offline-intent` is ever signed (an ordinary intent signed
+ * here would be a live approval outside the gateway's single-use accounting), and refuses a challenge
+ * whose `expiresAt` is unreadable or already past. It shows nothing: the caller MUST have shown the
+ * decoded challenge to the approver and had them confirm the verification code with the operator
+ * before calling this (DIV §5a.8) — an approver who signs an opaque blob has approved nothing.
+ *
+ * The key is the approver's offline signing key: a P-256 private key as a PEM string, DER PKCS#8
+ * bytes, or a KeyObject. The signature is ES256 over the canonical payload's UTF-8 bytes, in IEEE
+ * P1363 (r||s) form, as every verifier expects.
+ */
+export function signChallengeEnvelope(
+  envelope: string,
+  opts: { privateKey: crypto.KeyObject | Buffer | string; signerDid: string; asOf?: Date },
+): { ok: boolean; reason?: string; envelope?: string; challenge?: DecodedChallenge } {
+  const decoded = decodeChallengeEnvelope(envelope)
+  if (!decoded.ok || !decoded.challenge) return { ok: false, reason: decoded.reason }
+  const challenge = decoded.challenge
+  // A timestamp we cannot read is not one we can say is still valid. `NaN <= 0` is false, so an
+  // unparseable expiresAt would otherwise sail past the expiry check (DIV §6.2).
+  const expiryMs = parseRfc3339Ms(challenge.expiresAt)
+  if (!Number.isFinite(expiryMs))
+    return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp — refusing to sign" }
+  if (expiryMs <= (opts.asOf ?? new Date()).getTime())
+    return { ok: false, reason: "this challenge has already expired — ask for a fresh one" }
+  if (!opts.signerDid?.startsWith("did:")) return { ok: false, reason: "signerDid must be a DID" }
+
+  let privateKey: crypto.KeyObject
+  try {
+    privateKey =
+      opts.privateKey instanceof crypto.KeyObject
+        ? opts.privateKey
+        : typeof opts.privateKey === "string" || opts.privateKey.includes("-----BEGIN")
+          ? crypto.createPrivateKey(opts.privateKey.toString())
+          : crypto.createPrivateKey({ key: opts.privateKey, format: "der", type: "pkcs8" })
+  } catch (err) {
+    return { ok: false, reason: `could not read the private key: ${(err as Error).message}` }
+  }
+  if (privateKey.type !== "private" || privateKey.asymmetricKeyDetails?.namedCurve !== "prime256v1")
+    return { ok: false, reason: "the signing key must be a P-256 (prime256v1) private key" }
+
+  const signature = crypto
+    .sign("sha256", Buffer.from(challenge.canonicalPayload, "utf8"), {
+      key: privateKey,
+      dsaEncoding: "ieee-p1363",
+    })
+    .toString("base64")
+  // Derived via PEM rather than by passing the private KeyObject straight in: createPublicKey
+  // accepts one at runtime, but @types/node does not declare that overload.
+  const signerPublicKey = crypto
+    .createPublicKey(privateKey.export({ format: "pem", type: "pkcs8" }) as string)
+    .export({ format: "der", type: "spki" })
+    .toString("base64")
+  return {
+    ok: true,
+    challenge,
+    envelope: encodeSignatureEnvelope({
+      signerDid: opts.signerDid,
+      signerPublicKey,
+      signature,
+      sigAlg: "ES256",
+    }),
   }
 }
 
@@ -518,8 +631,9 @@ export async function useOfflineApproval(
       params: expected.params,
       nonce: challenge.nonce,
       // Restricted to the approvers eligible for THIS action, so a valid signature from someone
-      // outside the rule's approver list does not count toward its quorum.
-      approvers: approverAnchor(bundle, challenge.approverDids),
+      // outside the rule's approver list does not count toward its quorum. The one place offline
+      // signing keys count: this receipt is a div-offline-intent.
+      approvers: approverAnchor(bundle, challenge.approverDids, "offline-intent"),
       requirement: requirementFloorOf(ordinary.requirement),
     },
     { allowOffline: true, delegation, asOf: opts.asOf },
@@ -573,9 +687,11 @@ function findDelegation(
     }
   let files: string[]
   try {
+    // Name order, so every port tries the same delegation first when several apply.
     files = fs
       .readdirSync(dir)
       .filter((f) => f.endsWith(".json"))
+      .sort()
       .map((f) => path.join(dir, f))
   } catch {
     return {}
@@ -593,8 +709,8 @@ function findDelegation(
       receipt,
       {
         // The ORDINARY approver set — not the delegates. Whoever may approve this action is who must
-        // have delegated it.
-        approvers: approverAnchor(bundle, resolved.approverDids),
+        // have delegated it. Ordinary keys only: an offline signing key must never seal a delegation.
+        approvers: approverAnchor(bundle, resolved.approverDids, "ordinary"),
         target: expected.target,
         actionType: expected.actionType,
         params: expected.params,
@@ -692,17 +808,44 @@ function bufferForReconciliation(
   }
 }
 
-/** Read the offline approvals buffered by `useOfflineApproval` but not yet reported. */
-export function pendingApprovals(opts: { bundleDir: string; bufferDir?: string }): PendingApproval[] {
+/**
+ * Read the buffered records, and name the files that could not be read.
+ *
+ * One unreadable record must not hide the rest: reading them all in one expression used to turn a
+ * single corrupt file into "nothing pending", which is exactly the silence reconciliation exists to
+ * prevent (found porting this to Go, 2026-10-06).
+ */
+export function readPendingApprovals(opts: { bundleDir: string; bufferDir?: string }): {
+  records: PendingApproval[]
+  unreadable: string[]
+} {
   const dir = opts.bufferDir ?? path.join(opts.bundleDir, ".pending")
+  let names: string[]
   try {
-    return fs
+    names = fs
       .readdirSync(dir)
       .filter((f) => f.endsWith(".json"))
-      .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")) as PendingApproval)
+      .sort()
   } catch {
-    return []
+    return { records: [], unreadable: [] }
   }
+  const records: PendingApproval[] = []
+  const unreadable: string[] = []
+  for (const name of names) {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as PendingApproval
+      if (!record || typeof record.nonce !== "string") throw new Error("not a pending approval")
+      records.push(record)
+    } catch {
+      unreadable.push(name)
+    }
+  }
+  return { records, unreadable }
+}
+
+/** Read the offline approvals buffered by `useOfflineApproval` but not yet reported. */
+export function pendingApprovals(opts: { bundleDir: string; bufferDir?: string }): PendingApproval[] {
+  return readPendingApprovals(opts).records
 }
 
 /**

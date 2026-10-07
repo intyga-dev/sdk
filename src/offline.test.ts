@@ -23,6 +23,7 @@ import {
   encodeSignatureEnvelope,
   FileRedemptionStore,
   pendingApprovals,
+  signChallengeEnvelope,
   useOfflineApproval,
 } from "../dist/offline.js"
 import {
@@ -1038,6 +1039,80 @@ describe("requireApproval offline gating", () => {
     }
   })
 
+  // Found porting to Go, Python and Rust (2026-10-06): a local error used to route offline too, so a
+  // blank target started a ceremony that bound the blank target.
+  it("does NOT fall back on a local error — nothing was asked", async () => {
+    const dir = bundleDir()
+    let collected = 0
+    const h = await clientWith(() => "throw")
+    try {
+      await assert.rejects(
+        h.client.requireApproval(ACTION.display, {
+          target: "   ",
+          actionType: ACTION.actionType,
+          params: ACTION.params,
+          offline: {
+            ...offlineOptionsFor(dir),
+            collectSignatures: async () => {
+              collected++
+              return []
+            },
+          },
+        }),
+        /target is required/,
+      )
+      assert.equal(collected, 0)
+    } finally {
+      h.restore()
+    }
+  })
+
+  it("does NOT fall back when a poll streak contains a refusal", async () => {
+    const dir = bundleDir()
+    let polls = 0
+    let collected = 0
+    const h = await clientWith((url) => {
+      if (url.endsWith("/authorize")) return { status: 200, body: { nonce: "n-streak" } }
+      // Reached once with a verdict (404), then gone: the 404 was an answer, not an outage.
+      return polls++ === 0 ? { status: 404, body: { error: "unknown challenge" } } : { status: 503, body: {} }
+    })
+    try {
+      await assert.rejects(
+        h.client.requireApproval(ACTION.display, {
+          target: ACTION.target,
+          actionType: ACTION.actionType,
+          params: ACTION.params,
+          intervalMs: 1,
+          offline: {
+            ...offlineOptionsFor(dir),
+            collectSignatures: async () => {
+              collected++
+              return []
+            },
+          },
+        }),
+        (err: unknown) => (err as { status?: number }).status === 404,
+      )
+      assert.equal(collected, 0)
+    } finally {
+      h.restore()
+    }
+  })
+
+  it("without an offline opt-in, an outage surfaces as a typed GatewayUnreachable", async () => {
+    const { GatewayUnreachable } = await import("../dist/index.js")
+    const h = await clientWith(() => "throw")
+    try {
+      await assert.rejects(
+        h.client.requireApproval(ACTION.display, { target: ACTION.target, actionType: ACTION.actionType }),
+        (err: unknown) =>
+          err instanceof GatewayUnreachable && /could not reach Intyga/.test((err as Error).message),
+      )
+    } finally {
+      h.restore()
+    }
+  })
+
   it("does NOT fall back on DENIED — a human was reached and refused", async () => {
     const dir = bundleDir()
     // `POST /authorize` creates the challenge; `GET /authorize/<nonce>` polls it.
@@ -1294,5 +1369,272 @@ describe("offline-sign.html source pin", () => {
 
   it("re-checks expiry at sign time, not only at decode time", () => {
     assert.match(html, /Date\.parse\(current\.expiresAt\) < Date\.now\(\)/)
+  })
+})
+
+// Security review 2026-10-06, finding 2. Offline signing keys travel in their own list, and count only
+// toward a div-offline-intent: a delegation verified against the same bundle is sealed by the ORDINARY
+// quorum, which a bare offline key must never be able to stand in for.
+describe("offline signing keys in the trust bundle (DIV §5a.4)", () => {
+  const requesterDid = "did:intyga:service:oncall"
+  const ALICE_OFF = { ...makeApprover(ALICE.did) }
+  const BOB_OFF = { ...makeApprover(BOB.did) }
+  const withOfflineKeys = {
+    approvers: [
+      { did: ALICE.did, publicKeys: [ALICE.spki], offlinePublicKeys: [ALICE_OFF.spki] },
+      { did: BOB.did, publicKeys: [BOB.spki], offlinePublicKeys: [BOB_OFF.spki] },
+      { did: MALLORY.did, publicKeys: [MALLORY.spki] },
+      { did: CAROL.did, publicKeys: [CAROL.spki] },
+    ],
+  }
+  const collectFrom =
+    (...approvers: { did: string; sign: (p: string) => string; spki: string }[]) =>
+    async (challenge: { canonicalPayload: string }) =>
+      approvers.map((a) =>
+        encodeSignatureEnvelope({
+          signerDid: a.did,
+          signerPublicKey: a.spki,
+          signature: a.sign(challenge.canonicalPayload),
+          sigAlg: "ES256",
+        }),
+      )
+
+  it("admits offline keys only to an offline-intent anchor", () => {
+    const bundle = bundleOf(withOfflineKeys)
+    assert.deepEqual(approverAnchor(bundle).resolveKey?.(ALICE.did), [ALICE.spki])
+    assert.deepEqual(approverAnchor(bundle, undefined, "ordinary").resolveKey?.(ALICE.did), [ALICE.spki])
+    assert.deepEqual(approverAnchor(bundle, undefined, "offline-intent").resolveKey?.(ALICE.did), [
+      ALICE.spki,
+      ALICE_OFF.spki,
+    ])
+  })
+
+  it("refuses a bundle that lists one key as both ordinary and offline-only", () => {
+    const mixed = bundleOf({
+      approvers: [{ did: ALICE.did, publicKeys: [ALICE.spki], offlinePublicKeys: [ALICE.spki] }],
+    })
+    const r = verifyTrustBundle(signBundle(mixed), GATEWAY_JWK)
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /offline signing key as an ordinary key/)
+    const malformed = bundleOf({
+      approvers: [
+        { did: ALICE.did, publicKeys: [ALICE.spki], offlinePublicKeys: "x" as unknown as string[] },
+      ],
+    })
+    assert.equal(verifyTrustBundle(signBundle(malformed), GATEWAY_JWK).ok, false)
+  })
+
+  it("approves an offline intent signed with the approvers' offline keys", async () => {
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: bundleDir(withOfflineKeys),
+      requesterDid,
+      collectSignatures: collectFrom(ALICE_OFF, BOB_OFF),
+      warn: () => {},
+    })
+    assert.equal(r.ok, true, r.reason)
+    assert.deepEqual(r.signers, [ALICE.did, BOB.did])
+  })
+
+  it("never accepts a delegation sealed with offline keys", async () => {
+    const dir = bundleDir(withOfflineKeys)
+    const delegationDir = path.join(dir, "delegations")
+    fs.mkdirSync(delegationDir)
+    const payload = canonicalDelegationPayload({
+      ...ACTION,
+      requester: { did: requesterDid, attestation: null },
+      requirement: {
+        requiredApprovals: 2,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      delegatedTo: [MALLORY.did, CAROL.did],
+      delegatedQuorum: 2,
+      nonce: "dlg-offline-seal",
+      sealedAt: new Date(Date.now() - 1_000).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    fs.writeFileSync(
+      path.join(delegationDir, "offline-sealed.json"),
+      JSON.stringify({
+        canonicalPayload: payload,
+        actionDescription: ACTION.display,
+        params: ACTION.params,
+        requester: { did: requesterDid, attestation: null },
+        signatures: [ALICE_OFF, BOB_OFF].map((a) => ({
+          signerDid: a.did,
+          signerPublicKey: a.spki,
+          signature: a.sign(payload),
+          sigAlg: "ES256",
+        })),
+        verificationCode: verificationCode(payload),
+      }),
+    )
+    const warnings: string[] = []
+    const r = await useOfflineApproval(ACTION, {
+      bundleDir: dir,
+      delegationDir,
+      requesterDid,
+      collectSignatures: collectFrom(MALLORY, CAROL),
+      warn: (m) => warnings.push(m),
+    })
+    assert.equal(r.ok, false, "the delegates must not count: the seal is not an ordinary quorum")
+    assert.equal(r.viaDelegation, undefined)
+    assert.match(warnings.join("\n"), /no delegation applies/)
+  })
+})
+
+describe("signChallengeEnvelope", () => {
+  const bundle = bundleOf()
+  const fixedNonce = "off_sign-test"
+  const challengeAt = (asOf: Date) => {
+    const built = createOfflineChallenge({
+      bundle,
+      ...ACTION,
+      requester: { did: "did:intyga:service:oncall", attestation: null },
+      asOf,
+      nonce: fixedNonce,
+    })
+    assert.equal(built.ok, true, built.reason)
+    return built.challenge!
+  }
+
+  it("signs a canonical offline challenge into a SIG1 envelope the receipt verifier accepts", () => {
+    const c = challengeAt(new Date())
+    const signed = signChallengeEnvelope(c.envelope, { privateKey: ALICE.pkcs8, signerDid: ALICE.did })
+    assert.equal(signed.ok, true, signed.reason)
+    const witness = decodeSignatureEnvelope(signed.envelope!).witness!
+    assert.equal(witness.signerDid, ALICE.did)
+    assert.equal(witness.signerPublicKey, ALICE.spki)
+    assert.equal(
+      crypto.verify(
+        "sha256",
+        Buffer.from(c.canonicalPayload, "utf8"),
+        {
+          key: crypto.createPublicKey({
+            key: Buffer.from(ALICE.spki, "base64"),
+            format: "der",
+            type: "spki",
+          }),
+          dsaEncoding: "ieee-p1363",
+        },
+        Buffer.from(witness.signature, "base64"),
+      ),
+      true,
+    )
+  })
+
+  it("refuses an expired challenge, an ordinary intent and a non-P-256 key", () => {
+    const old = challengeAt(new Date(Date.now() - 3_600_000))
+    assert.match(
+      signChallengeEnvelope(old.envelope, { privateKey: ALICE.pkcs8, signerDid: ALICE.did }).reason ?? "",
+      /expired/,
+    )
+    const ordinary = canonicalIntentPayload({
+      target: ACTION.target,
+      actionType: ACTION.actionType,
+      display: ACTION.display,
+      params: ACTION.params,
+      requester: { did: "did:intyga:service:oncall", attestation: null },
+      requirement: {
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      nonce: "n-ordinary",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+    const ordinaryEnvelope = `DIV1:${b64url(Buffer.from(ordinary, "utf8"))}`
+    assert.equal(
+      signChallengeEnvelope(ordinaryEnvelope, { privateKey: ALICE.pkcs8, signerDid: ALICE.did }).ok,
+      false,
+    )
+    const ed = crypto.generateKeyPairSync("ed25519").privateKey
+    assert.match(
+      signChallengeEnvelope(challengeAt(new Date()).envelope, { privateKey: ed, signerDid: ALICE.did })
+        .reason ?? "",
+      /P-256/,
+    )
+  })
+})
+
+describe("robustness found porting to other languages", () => {
+  it("refuses a SIG1 or DIV1 envelope whose payload is not an object, instead of throwing", () => {
+    for (const payload of ["null", "[]", "7"]) {
+      const env = Buffer.from(payload, "utf8").toString("base64url")
+      assert.equal(decodeSignatureEnvelope(`SIG1:${env}`).ok, false, payload)
+      assert.equal(decodeChallengeEnvelope(`DIV1:${env}`).ok, false, payload)
+    }
+  })
+
+  it("refuses base64url with stray characters rather than skipping them", () => {
+    const valid = encodeSignatureEnvelope({
+      signerDid: ALICE.did,
+      signerPublicKey: ALICE.spki,
+      signature: "c2ln",
+      sigAlg: "ES256",
+    })
+    assert.equal(decodeSignatureEnvelope(valid).ok, true)
+    assert.equal(decodeSignatureEnvelope(`${valid.slice(0, 20)}!${valid.slice(20)}`).ok, false)
+  })
+
+  it("one unreadable pending record hides none of the others, and reconcile counts it as failed", async () => {
+    const dir = tmpdir()
+    fs.mkdirSync(path.join(dir, ".pending"), { recursive: true })
+    fs.writeFileSync(path.join(dir, ".pending", "a-corrupt.json"), "{not json")
+    fs.writeFileSync(
+      path.join(dir, ".pending", "b-good.json"),
+      JSON.stringify({
+        nonce: "b-good",
+        target: "t",
+        actionType: "a",
+        display: "d",
+        usedAt: "2026-10-06T00:00:00.000Z",
+        receipt: {},
+      }),
+    )
+    assert.deepEqual(
+      pendingApprovals({ bundleDir: dir }).map((p: { nonce: string }) => p.nonce),
+      ["b-good"],
+    )
+    const { IntygaClient } = await import("../dist/index.js")
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch
+    try {
+      const r = await new IntygaClient({
+        gatewayUrl: "https://gw.invalid",
+        token: "t",
+      }).reconcileOfflineApprovals({
+        bundleDir: dir,
+      })
+      assert.equal(r.reported, 1)
+      assert.equal(r.failed, 1)
+      assert.match(r.reasons.join("\n"), /a-corrupt\.json: unreadable/)
+      assert.ok(fs.existsSync(path.join(dir, ".pending", "a-corrupt.json")), "an unreadable record is kept")
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it("refuses a pinned gateway key that is not RSA, and a bundle timestamp outside RFC 3339", () => {
+    const ec = crypto
+      .generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+      .publicKey.export({ format: "jwk" })
+    assert.match(verifyTrustBundle(signBundle(bundleOf()), ec as webcrypto.JsonWebKey).reason ?? "", /RSA/)
+    const dateOnly = bundleOf({ issuedAt: new Date().toISOString().slice(0, 10) })
+    assert.equal(verifyTrustBundle(signBundle(dateOnly), GATEWAY_JWK).ok, false)
+  })
+
+  it("refuses a fractional window and an empty nonce", () => {
+    const base = {
+      bundle: bundleOf(),
+      ...ACTION,
+      requester: { did: "did:intyga:service:oncall", attestation: null },
+    }
+    assert.equal(createOfflineChallenge({ ...base, windowMinutes: 2.5 }).ok, false)
+    assert.equal(createOfflineChallenge({ ...base, nonce: "" }).ok, false)
   })
 })
