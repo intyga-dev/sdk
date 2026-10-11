@@ -107,6 +107,71 @@ test("a failed exchange throws and surfaces the status", async (t) => {
   await assert.rejects(() => c.token(), /token exchange failed: 401 bad credentials/)
 })
 
+test("complete client credentials take precedence over a valid stored personal login", async (t) => {
+  const credsDir = path.join(home, ".intyga")
+  fs.mkdirSync(credsDir, { recursive: true })
+  fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-personal" }))
+  t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
+  const f = stubFetch(() => ({ body: { access_token: "tok-service", expires_in: 900 } }))
+  t.after(f.restore)
+  const c = new IntygaClient({
+    gatewayUrl: GW,
+    clientId: "service-id",
+    clientSecret: "service-secret",
+    allowStoredCredentials: true,
+  })
+
+  assert.equal(await c.token(), "tok-service")
+  assert.deepEqual(
+    f.calls.map((call) => new URL(call.url).pathname),
+    ["/oauth/token"],
+  )
+  assert.equal(
+    f.calls[0]!.headers.authorization,
+    `Basic ${Buffer.from("service-id:service-secret").toString("base64")}`,
+  )
+})
+
+test("a rejected client-credentials exchange never falls back to a stored personal login", async (t) => {
+  const credsDir = path.join(home, ".intyga")
+  fs.mkdirSync(credsDir, { recursive: true })
+  fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-personal" }))
+  t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
+  const f = stubFetch(() => ({ status: 401, text: "service key revoked" }))
+  t.after(f.restore)
+  const c = new IntygaClient({
+    gatewayUrl: GW,
+    clientId: "service-id",
+    clientSecret: "service-secret",
+    allowStoredCredentials: true,
+  })
+
+  await assert.rejects(() => c.token(), /token exchange failed: 401 service key revoked/)
+  assert.deepEqual(
+    f.calls.map((call) => new URL(call.url).pathname),
+    ["/oauth/token"],
+  )
+})
+
+test("incomplete client credentials fail closed without using a stored personal login", async (t) => {
+  const credsDir = path.join(home, ".intyga")
+  fs.mkdirSync(credsDir, { recursive: true })
+  fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-personal" }))
+  t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
+  const f = stubFetch(() => ({ body: { access_token: "unexpected" } }))
+  t.after(f.restore)
+
+  for (const supplied of [{ clientId: "service-id" }, { clientSecret: "service-secret" }]) {
+    const c = new IntygaClient({
+      gatewayUrl: GW,
+      allowStoredCredentials: true,
+      ...supplied,
+    })
+    await assert.rejects(() => c.token(), /provide `token`, or `clientId` \+ `clientSecret`/)
+  }
+  assert.equal(f.calls.length, 0, "partial credentials must be refused before any request")
+})
+
 test("a stored credential from `intyga login` is picked up per gateway", async (t) => {
   fs.mkdirSync(path.join(home, ".intyga"), { recursive: true })
   fs.writeFileSync(
@@ -539,12 +604,13 @@ test("a 401 on an exchanged token drops the cache and retries the call exactly o
 })
 
 test("the 401 retry re-exchanges with client credentials, never with a stored `intyga login` token", async (t) => {
-  // SECURITY REGRESSION: the retry used to go back through resolveToken(), which re-reads
-  // ~/.intyga/credentials.json BEFORE the client-credentials branch. A process holding client
-  // credentials on a box where someone ran `intyga login` mid-session (dev box, CI runner) would
-  // retry an AGENT call as the HUMAN: a different principal, a different ceremony shape, and a
-  // different requester on the witness leaf. The retry must be a client-credentials exchange, full stop.
+  // SECURITY REGRESSION: a personal login saved before construction used to win over explicitly
+  // supplied client credentials, and a login written mid-session could win on refresh. Either case
+  // would run an AGENT call as the HUMAN: a different principal, workspace, ceremony shape, and
+  // requester on the witness leaf. Both the initial token and retry must come from the service key.
   const credsDir = path.join(home, ".intyga")
+  fs.mkdirSync(credsDir, { recursive: true })
+  fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-human-before" }))
   t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
   let exchanges = 0
   let authorizes = 0
@@ -553,9 +619,8 @@ test("the 401 retry re-exchanges with client credentials, never with a stored `i
       return { body: { access_token: `tok-agent-${++exchanges}`, expires_in: 900 } }
     authorizes += 1
     if (authorizes === 1) {
-      // A concurrent `intyga login` lands exactly between the first exchange and its 401.
-      fs.mkdirSync(credsDir, { recursive: true })
-      fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-human" }))
+      // A concurrent `intyga login` replaces the saved login between the first exchange and its 401.
+      fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-human-after" }))
       return { status: 401, text: "ERR_JWT_EXPIRED" }
     }
     return { body: { nonce: "n-r", status: "PENDING" } }
@@ -579,8 +644,8 @@ test("the 401 retry re-exchanges with client credentials, never with a stored `i
   )
   assert.equal(exchanges, 2)
   assert.ok(
-    !f.calls.some((x) => x.headers.authorization === "Bearer tok-human"),
-    "the stored human token must never be sent",
+    !f.calls.some((x) => x.headers.authorization?.startsWith("Bearer tok-human-")),
+    "neither stored human token may be sent",
   )
 })
 
@@ -623,10 +688,20 @@ test("consume retries a 401 once and still never throws", async (t) => {
 })
 
 test("an explicit token is never re-exchanged on a 401", async (t) => {
+  const credsDir = path.join(home, ".intyga")
+  fs.mkdirSync(credsDir, { recursive: true })
+  fs.writeFileSync(path.join(credsDir, "credentials.json"), JSON.stringify({ [GW]: "tok-stored" }))
+  t.after(() => fs.rmSync(credsDir, { recursive: true, force: true }))
   const f = stubFetch(() => ({ status: 401, text: "expired" }))
   t.after(f.restore)
-  // Client credentials are present too, and must still not be used: the caller chose the token.
-  const c = new IntygaClient({ gatewayUrl: GW, token: "t-explicit", clientId: "id", clientSecret: "secret" })
+  // Both other sources are present too, and must still not be used: the caller chose the token.
+  const c = new IntygaClient({
+    gatewayUrl: GW,
+    token: "t-explicit",
+    clientId: "id",
+    clientSecret: "secret",
+    allowStoredCredentials: true,
+  })
 
   await assert.rejects(
     () => c.authorize("Wire", { target: "test-rp" }),

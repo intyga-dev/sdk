@@ -11,10 +11,15 @@ import type { webcrypto } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { describe, it } from "node:test"
+import { describe, it, mock } from "node:test"
 // Tests run against the BUILT output, matching the convention in index.test.ts / cli.test.ts: this
 // package's `npm test` uses `node --test`, which resolves `.js` specifiers to real files.
-import { canonicalDelegationPayload, canonicalIntentPayload, verificationCode } from "@intyga/verify"
+import {
+  canonicalDelegationPayload,
+  canonicalIntentPayload,
+  canonicalOfflineIntentPayload,
+  verificationCode,
+} from "@intyga/verify"
 import {
   clearPendingApproval,
   createOfflineChallenge,
@@ -39,6 +44,7 @@ import {
 // ── fixtures ────────────────────────────────────────────────────────────────────
 const GATEWAY = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
 const GATEWAY_JWK = GATEWAY.publicKey.export({ format: "jwk" }) as webcrypto.JsonWebKey
+const TENANT_ID = "11111111-1111-4111-8111-111111111111"
 
 function makeApprover(did: string) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
@@ -77,7 +83,7 @@ function bundleOf(over: Partial<TrustBundle> = {}): TrustBundle {
   const bundle = {
     v: 1 as const,
     type: "div-trust-bundle-v1" as const,
-    tenantId: "11111111-1111-4111-8111-111111111111",
+    tenantId: TENANT_ID,
     approvers: [
       { did: ALICE.did, publicKeys: [ALICE.spki] },
       { did: BOB.did, publicKeys: [BOB.spki] },
@@ -504,6 +510,21 @@ describe("wire envelopes", () => {
 
 // ── challenge construction ──────────────────────────────────────────────────────
 describe("offline challenge construction", () => {
+  it("refuses a raw-JavaScript bundle with a missing or empty tenant instead of emitting v1", () => {
+    const missing = { ...bundleOf() } as Record<string, unknown>
+    delete missing.tenantId
+    for (const bundle of [missing, { ...bundleOf(), tenantId: "" }]) {
+      const result = createOfflineChallenge({
+        bundle: bundle as never,
+        ...ACTION,
+        requester: { did: "did:intyga:service:oncall", attestation: null },
+      })
+      assert.equal(result.ok, false)
+      assert.equal(result.challenge, undefined)
+      assert.match(result.reason ?? "", /tenantId must be a non-empty string/)
+    }
+  })
+
   it("takes the requirement from the BUNDLE, not from the caller", () => {
     const built = createOfflineChallenge({
       bundle: bundleOf(),
@@ -630,6 +651,35 @@ describe("useOfflineApproval", () => {
     assert.match(r.reason ?? "", /quorum not met: 1 of 2/)
   })
 
+  it("refuses before redemption if flushing the reconciliation record fails", async () => {
+    const dir = bundleDir()
+    const store = new FileRedemptionStore(path.join(dir, ".redeemed"))
+    const redeem = mock.method(store, "redeem")
+    const warnings: string[] = []
+    const flush = mock.method(fs, "fsyncSync", () => {
+      throw new Error("simulated disk failure")
+    })
+    try {
+      const r = await useOfflineApproval(ACTION, {
+        bundleDir: dir,
+        requesterDid,
+        store,
+        collectSignatures: collectFrom(ALICE, BOB),
+        warn: (m) => warnings.push(m),
+      })
+      assert.equal(r.ok, false)
+      assert.match(r.reason ?? "", /could not buffer/)
+      assert.equal(redeem.mock.callCount(), 0)
+      assert.equal(
+        warnings.some((m) => m.includes("OFFLINE APPROVAL USED")),
+        false,
+      )
+    } finally {
+      flush.mock.restore()
+      redeem.mock.restore()
+    }
+  })
+
   it("refuses a signature from someone outside the rule's approver list", async () => {
     const mallory = makeApprover("did:intyga:mallory")
     const r = await useOfflineApproval(ACTION, {
@@ -660,6 +710,7 @@ describe("useOfflineApproval", () => {
     const delegationDir = path.join(dir, "delegations")
     fs.mkdirSync(delegationDir)
     const payload = canonicalDelegationPayload({
+      tenantId: TENANT_ID,
       ...ACTION,
       requester: { did: requesterDid, attestation: null },
       requirement: {
@@ -708,6 +759,7 @@ describe("useOfflineApproval", () => {
     const delegationDir = path.join(dir, "delegations")
     fs.mkdirSync(delegationDir)
     const payload = canonicalDelegationPayload({
+      tenantId: TENANT_ID,
       ...ACTION,
       requester: { did: requesterDid, attestation: null },
       requirement: {
@@ -778,6 +830,7 @@ describe("useOfflineApproval", () => {
     const delegationDir = path.join(dir, "delegations")
     fs.mkdirSync(delegationDir)
     const payload = canonicalDelegationPayload({
+      tenantId: TENANT_ID,
       ...ACTION,
       requester: { did: requesterDid, attestation: null },
       requirement: {
@@ -921,6 +974,7 @@ describe("useOfflineApproval", () => {
     const sealedAt = new Date(asOf.getTime() - 1_000)
     const expiresAt = new Date(asOf.getTime() + 1_000)
     const payload = canonicalDelegationPayload({
+      tenantId: TENANT_ID,
       ...ACTION,
       requester: { did: requesterDid, attestation: null },
       requirement: {
@@ -1240,6 +1294,7 @@ describe("offline-sign.html signing path", () => {
         verificationCode: built.challenge!.verificationCode,
       },
       {
+        tenantId: built.challenge!.tenantId,
         target: ACTION.target,
         actionType: ACTION.actionType,
         params: ACTION.params,
@@ -1269,6 +1324,7 @@ describe("offline-sign.html signing path", () => {
 // ── delegation may narrow WHO, never HOW MANY (DIV §5a.5) ───────────────────────
 describe("delegation quorum floor", () => {
   const delegationFor = (delegatedQuorum: number) => ({
+    tenantId: TENANT_ID,
     delegatedTo: [ALICE.did, BOB.did],
     delegatedQuorum,
     target: ACTION.target,
@@ -1370,6 +1426,13 @@ describe("offline-sign.html source pin", () => {
   it("re-checks expiry at sign time, not only at decode time", () => {
     assert.match(html, /Date\.parse\(current\.expiresAt\) < Date\.now\(\)/)
   })
+
+  it("displays a non-empty v2 tenant and refuses to sign legacy v1", () => {
+    assert.match(html, /p\.v !== 2/)
+    assert.match(html, /typeof p\.tenantId !== "string"/)
+    assert.match(html, /rTenant/)
+    assert.match(html, /Legacy v1 requests are archival-only and cannot be signed/)
+  })
 })
 
 // Security review 2026-10-06, finding 2. Offline signing keys travel in their own list, and count only
@@ -1403,7 +1466,11 @@ describe("offline signing keys in the trust bundle (DIV §5a.4)", () => {
     const bundle = bundleOf(withOfflineKeys)
     assert.deepEqual(approverAnchor(bundle).resolveKey?.(ALICE.did), [ALICE.spki])
     assert.deepEqual(approverAnchor(bundle, undefined, "ordinary").resolveKey?.(ALICE.did), [ALICE.spki])
-    assert.deepEqual(approverAnchor(bundle, undefined, "offline-intent").resolveKey?.(ALICE.did), [
+    assert.throws(
+      () => approverAnchor(bundle, undefined, "offline-intent"),
+      /explicit eligible DID restriction/,
+    )
+    assert.deepEqual(approverAnchor(bundle, [ALICE.did], "offline-intent").resolveKey?.(ALICE.did), [
       ALICE.spki,
       ALICE_OFF.spki,
     ])
@@ -1440,6 +1507,7 @@ describe("offline signing keys in the trust bundle (DIV §5a.4)", () => {
     const delegationDir = path.join(dir, "delegations")
     fs.mkdirSync(delegationDir)
     const payload = canonicalDelegationPayload({
+      tenantId: TENANT_ID,
       ...ACTION,
       requester: { did: requesterDid, attestation: null },
       requirement: {
@@ -1558,6 +1626,32 @@ describe("signChallengeEnvelope", () => {
         .reason ?? "",
       /P-256/,
     )
+  })
+
+  it("decodes legacy v1 for archives but refuses to create a fresh signature for it", () => {
+    const challengedAt = new Date()
+    const canonical = canonicalOfflineIntentPayload({
+      ...ACTION,
+      requester: { did: "did:intyga:service:oncall", attestation: null },
+      requirement: {
+        requiredApprovals: 1,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      nonce: "legacy-v1-sign-refusal",
+      challengedAt: challengedAt.toISOString(),
+      expiresAt: new Date(challengedAt.getTime() + 60_000).toISOString(),
+    })
+    const envelope = `DIV1:${b64url(Buffer.from(canonical, "utf8"))}`
+    assert.equal(decodeChallengeEnvelope(envelope).ok, true)
+    const result = signChallengeEnvelope(envelope, {
+      privateKey: ALICE.pkcs8,
+      signerDid: ALICE.did,
+    })
+    assert.equal(result.ok, false)
+    assert.match(result.reason ?? "", /v1.*archival-only/)
   })
 })
 

@@ -78,6 +78,8 @@ export interface TrustBundle {
   v: 1
   type: typeof DIV_TRUST_BUNDLE_TYPE
   tenantId: string
+  /** Pinned by the bundle signature; never inferred from a delegation receipt. */
+  webauthn?: { origin: string; rpId: string }
   approvers: BundleApprover[]
   policy: BundlePolicy[]
   unmatchedActionPolicy: "DENY" | "BASELINE"
@@ -161,6 +163,17 @@ export function verifyTrustBundle(
   if (!bundle || typeof bundle !== "object") return { ok: false, reason: "invalid trust bundle payload" }
   if (bundle.type !== DIV_TRUST_BUNDLE_TYPE || bundle.v !== 1)
     return { ok: false, reason: "unsupported trust bundle type or version" }
+  if (typeof bundle.tenantId !== "string" || bundle.tenantId.length === 0)
+    return { ok: false, reason: "trust bundle tenantId must be a non-empty string" }
+  if (
+    bundle.webauthn !== undefined &&
+    (!bundle.webauthn ||
+      typeof bundle.webauthn.origin !== "string" ||
+      !bundle.webauthn.origin.length ||
+      typeof bundle.webauthn.rpId !== "string" ||
+      !bundle.webauthn.rpId.length)
+  )
+    return { ok: false, reason: "invalid trust bundle WebAuthn expectations" }
   if (bundle.unmatchedActionPolicy !== "DENY" && bundle.unmatchedActionPolicy !== "BASELINE")
     return { ok: false, reason: "trust bundle has no valid unmatched-action decision" }
   if (!Array.isArray(bundle.approvers) || bundle.approvers.length === 0)
@@ -276,15 +289,17 @@ export function loadTrustBundle(
  * Flattening every key into one allowlist — which is what a single-key resolver forces — would let one
  * approver holding a software key and two passkeys satisfy a 3-of-N quorum alone.
  *
- * `purpose` defaults to `ordinary`, which never admits an offline signing key. Pass `offline-intent`
- * only when the receipt being verified is a `div-offline-intent`: a bare offline key that could seal a
- * delegation would hand its holder the approval authority the delegation transfers.
+ * `purpose` defaults to `ordinary`, which never admits an offline signing key. `offline-intent`
+ * requires an explicit DID restriction and otherwise throws: admitting every offline key in a
+ * tenant bundle would let an ineligible approver satisfy this action's quorum.
  */
 export function approverAnchor(
   bundle: TrustBundle,
   limitToDids?: string[],
   purpose: BundleAnchorPurpose = "ordinary",
 ): ApproverTrustAnchor {
+  if (purpose === "offline-intent" && limitToDids === undefined)
+    throw new Error("offline-intent anchors require an explicit eligible DID restriction")
   const eligible = limitToDids
     ? bundle.approvers.filter((a) => limitToDids.includes(a.did))
     : bundle.approvers

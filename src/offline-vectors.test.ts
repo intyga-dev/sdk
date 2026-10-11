@@ -88,7 +88,14 @@ describe("offline-approval vectors", () => {
 
   it("bundleAnchor", () => {
     for (const c of V.bundleAnchor) {
-      const anchor = approverAnchor(V.bundle, c.limitToDids ?? undefined, c.purpose)
+      let anchor: ReturnType<typeof approverAnchor> | null = null
+      try {
+        anchor = approverAnchor(V.bundle, c.limitToDids ?? undefined, c.purpose)
+      } catch {
+        // refused
+      }
+      assert.equal(anchor !== null, c.ok, c.name)
+      if (!anchor || !c.expect) continue
       assert.deepEqual(anchor.dids, c.expect.dids)
       for (const [did, keys] of Object.entries(c.expect.keys))
         assert.deepEqual(anchor.resolveKey?.(did) ?? null, keys)
@@ -111,6 +118,7 @@ describe("offline-approval vectors", () => {
         got = {
           purpose: parsed.purpose,
           epoch: parsed.epoch,
+          ...(parsed.tenantId !== undefined ? { tenantId: parsed.tenantId } : {}),
           dids: anchor.dids,
           keys: Object.fromEntries(anchor.dids.map((d: string) => [d, anchor.resolveKey?.(d) ?? null])),
         }
@@ -124,9 +132,12 @@ describe("offline-approval vectors", () => {
 
   it("createChallenge", () => {
     for (const c of V.createChallenge) {
-      const { delegation, asOf, ...input } = c.input
+      const { delegation, asOf, bundleTenantId, ...input } = c.input
+      const bundle = { ...V.bundle } as Record<string, unknown>
+      if (bundleTenantId === null) delete bundle.tenantId
+      else if (bundleTenantId !== undefined) bundle.tenantId = bundleTenantId
       const r = createOfflineChallenge({
-        bundle: V.bundle,
+        bundle: bundle as never,
         ...input,
         asOf: new Date(asOf),
         ...(delegation
@@ -205,21 +216,35 @@ describe("offline-approval vectors", () => {
     try {
       for (const c of V.offlineApproval) {
         const dir = fs.mkdtempSync(path.join(scratch, "case-"))
-        fs.writeFileSync(path.join(dir, "trust-bundle.jws"), V.bundleJws)
+        fs.writeFileSync(path.join(dir, "trust-bundle.jws"), c.bundleJws ?? V.bundleJws)
         fs.writeFileSync(path.join(dir, "gateway-key.jwk.json"), JSON.stringify(V.gatewayJwk))
         let delegationDir: string | undefined
-        if (c.delegation) {
-          delegationDir = path.join(dir, "delegations")
-          fs.mkdirSync(delegationDir)
-          fs.writeFileSync(
-            path.join(delegationDir, `${c.delegation}.json`),
-            JSON.stringify(V.delegations[c.delegation]),
-          )
+        if (c.delegation || c.delegationArtifacts) {
+          const currentDelegationDir = path.join(dir, "delegations")
+          delegationDir = currentDelegationDir
+          fs.mkdirSync(currentDelegationDir)
+          if (c.delegationArtifacts) {
+            c.delegationArtifacts.forEach((artifact: unknown, index: number) => {
+              fs.writeFileSync(
+                path.join(currentDelegationDir, `00-invalid-${String(index).padStart(2, "0")}.json`),
+                JSON.stringify(artifact),
+              )
+            })
+          }
+          if (c.delegation) {
+            fs.writeFileSync(
+              path.join(currentDelegationDir, `${c.delegation}.json`),
+              JSON.stringify(V.delegations[c.delegation]),
+            )
+          }
         }
+        const bufferDir = c.bufferFailure ? path.join(dir, "not-a-directory") : undefined
+        if (bufferDir) fs.writeFileSync(bufferDir, "buffer failure")
         const r = await useOfflineApproval(c.action, {
           bundleDir: dir,
+          bufferDir,
           delegationDir,
-          requesterDid: V.requesterDid,
+          requesterDid: c.requesterDid ?? V.requesterDid,
           asOf: new Date(c.asOf),
           warn: () => {},
           collectSignatures: async (challenge) =>
@@ -235,6 +260,10 @@ describe("offline-approval vectors", () => {
             ),
         })
         assert.equal(r.ok, c.ok, `${c.name}: ${r.reason}`)
+        if (c.bufferFailure) {
+          assert.match(r.reason ?? "", /could not buffer/)
+          assert.deepEqual(fs.readdirSync(path.join(dir, ".redeemed")), [])
+        }
         if (!c.ok) continue
         assert.deepEqual([...(r.signers ?? [])].sort(), c.expect.signers, c.name)
         assert.equal(r.viaDelegation ?? null, c.expect.viaDelegation, c.name)

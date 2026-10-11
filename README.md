@@ -71,8 +71,8 @@ const hash = policy.blobHash(blob);          // matches the gateway's check
 intyga keygen [--out <prefix>]
 intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]
 intyga login --did <did> [--gateway <url>]
-intyga authorize "<action>" --gateway <url> --target <target> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]
-intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]
+intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]
+intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]
 intyga notify --url <approvalUrl> --context "<text>" [--slack <webhook>] [--teams <webhook>] [--code <code>]
 intyga sign <DIV1:...> --key <private.pem|private.der> --did <your-did> [--yes]
 intyga trust-bundle export --tenant <uuid> [--dir <dir>] [--gateway <url>]   # INTYGA_INTERNAL_TOKEN | --token-file | --token-stdin
@@ -89,6 +89,11 @@ whenever you know the rule the action must meet. `--request-id` (on `authorize`)
 printed with `--no-wait` and must reach the `await` step unchanged. `--evidence <file>` writes the
 receipt, what was expected, the trust anchor and the verification result as JSON (mode 0600), before
 consumption and again with `consumed: true` afterwards.
+
+Authentication uses an explicit token first, then supplied client ID and secret. A saved
+`intyga login` is used only when neither is supplied. An incomplete or rejected client-credential
+pair fails without falling back to your saved login, so it cannot silently change the requester
+or workspace. The CLI applies this order to flags and their `INTYGA_*` environment variables too.
 
 `audit-verify --roots` passes each roots-file line to the verifier as a trusted checkpoint record, not
 just its root: an evidence-bundle checkpoint that contradicts its line fails, and anchors are held to
@@ -109,6 +114,11 @@ policy names exactly one trusted issuer.
 `--target` is not optional on `authorize`/`await`: it names the relying party the approval is bound
 to (DIV Target Isolation), and the CLI exits non-zero without it.
 
+Tenant-bound DIV v2 receipts require a caller-trusted tenant expectation. Pass `--tenant`, set
+`INTYGA_TENANT_ID`, or use an `intyga-trust-anchor` file whose optional `tenantId` names the workspace.
+An explicit value that disagrees with the anchor is refused. The CLI never reads its expectation from
+the receipt. Legacy v1 receipts are accepted only when no tenant expectation is supplied.
+
 Invoke it as `npx @intyga/sdk <command>`, or `npm i -g @intyga/sdk` and then `intyga <command>`.
 (`npx intyga` resolves to an unrelated package — the binary is `intyga`, but it ships inside this package.)
 
@@ -125,6 +135,9 @@ assemble the result into an `OFFLINE_APPROVED` receipt — a status deliberately
 `APPROVED`, so adding the fallback cannot silently widen an existing `if (status !== "APPROVED")`
 guard. Call `intyga.reconcileOfflineApprovals()` on reconnect: until an offline approval is
 reported it exists only on your disk. See [`docs/DIV.md`](../../docs/DIV.md) §5a.
+New offline challenges and delegations are v2 and bind the tenant from the verified trust bundle.
+When building an `offline-intent` anchor directly, pass the action's explicit eligible DID list;
+`approverAnchor` throws if that restriction is omitted. Ordinary anchors may remain unrestricted.
 
 Update the gateway and SDK together, then re-export trust bundles used with overlapping approval
 rules. New exports carry signed rule-selection metadata; older bundles with multiple matching rules
@@ -160,6 +173,7 @@ if (r.status !== "APPROVED") throw new Error("not authorized");
 // `nonce` names the challenge you are redeeming — required, so you can enforce single-use yourself.
 const ok = verifyApprovalReceipt(r.receipt!, {
   ...action,
+  tenantId: process.env.INTYGA_TENANT_ID!, // independently configured workspace; never from receipt
   nonce: r.nonce!,
   // REQUIRED: the approver keys YOU trust, from your own config/directory. Verification never uses
   // the key inside the receipt — that would let a receipt vouch for its own signer. Do NOT fetch
@@ -185,14 +199,14 @@ if (!spent.ok) throw new Error(`could not consume the approval: ${spent.reason ?
 
 The same **request → approve → poll** primitive is available for Go, Rust and Java backends — the languages that run most payments, ledger, and infrastructure services — and for Python, where the agent frameworks live. Each of those SDKs brings its language's offline verifier with it, so you can verify the receipt in the same process without a second dependency.
 
-### Go — [`github.com/intyga-dev/sdk-go`](https://github.com/intyga-dev/sdk-go)
+### Go — [`github.com/intyga-dev/sdk-go/v2`](https://github.com/intyga-dev/sdk-go)
 
 ```go
 import (
 	"context"
 
-	intyga "github.com/intyga-dev/sdk-go"
-	verify "github.com/intyga-dev/verify-go"
+	intyga "github.com/intyga-dev/sdk-go/v2"
+	verify "github.com/intyga-dev/sdk-go/v2/verify"
 )
 
 client, err := intyga.NewClient(intyga.ClientOptions{
@@ -220,9 +234,13 @@ if err != nil || r.Status != intyga.StatusApproved {
 	log.Fatal("not authorized")
 }
 
-// Optional hard binding before executing — no INTYGA secret involved:
-// Approvers is REQUIRED: verification uses keys YOU resolved, never the one in the receipt.
+// Verify before executing, using the workspace and keys from YOUR trust configuration.
+tenantID := os.Getenv("INTYGA_TENANT_ID")
+if tenantID == "" {
+	log.Fatal("INTYGA_TENANT_ID must name the expected workspace")
+}
 res := verify.VerifyApprovalReceipt(*r.Receipt, verify.Expected{
+	TenantID: &tenantID,
 	Nonce: r.Nonce, ActionType: "wipe_production", Target: "prod-payments-eu",
 	Params:    params,
 	Approvers: verify.ApproverTrustAnchor{PublicKeys: []string{alicePubB64}},
@@ -328,7 +346,7 @@ Every APPROVED result carries a **receipt** you can verify in your own process, 
 | :--- | :--- | :--- |
 | TypeScript | [`@intyga/verify`](https://github.com/intyga-dev/verify) | none (Node built-in `crypto`) |
 | Python | [`intyga-sdk`](https://github.com/intyga-dev/sdk-python) (PyPI) | `cryptography` |
-| Go | [`github.com/intyga-dev/verify-go`](https://github.com/intyga-dev/verify-go) | none (standard library) |
+| Go | [`github.com/intyga-dev/verify-go/v2`](https://github.com/intyga-dev/verify-go) | none (standard library) |
 | Rust | [`intyga-verify`](https://github.com/intyga-dev/verify-rust) | 6 crates: `serde`, `serde_json`, `p256`, `ecdsa`, `base64`, `sha2` |
 | Java | [`com.intyga:intyga-verify`](https://github.com/intyga-dev/verify-java) | `jackson-databind` (JDK crypto) |
 

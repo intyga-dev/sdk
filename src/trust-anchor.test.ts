@@ -16,6 +16,7 @@ const VALID = {
   type: TRUST_ANCHOR_FILE_TYPE,
   v: 1,
   epoch: 3,
+  tenantId: "tenant-alpha ",
   approvers: [
     { did: "did:intyga:human-alice", publicKeys: [SPKI_B64] },
     { did: selfCertifyingDid(SPKI_B64), publicKeys: [] },
@@ -26,6 +27,7 @@ const VALID = {
 test("parses a valid file and builds a DID-mode anchor from it", () => {
   const file = parseTrustAnchorFile(JSON.stringify(VALID))
   assert.equal(file.epoch, 3)
+  assert.equal(file.tenantId, "tenant-alpha ")
   const anchor = trustAnchorApprovers(file)
   assert.deepEqual(anchor.dids, ["did:intyga:human-alice", selfCertifyingDid(SPKI_B64)])
   assert.deepEqual(anchor.resolveKey?.("did:intyga:human-alice"), [SPKI_B64])
@@ -67,6 +69,8 @@ test("refuses malformed inputs with a precise reason", () => {
   assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, v: 2 })), /unsupported version/)
   assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, epoch: -1 })), /epoch/)
   assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, epoch: 1.5 })), /epoch/)
+  assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, tenantId: "" })), /tenantId/)
+  assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, tenantId: null })), /tenantId/)
   assert.throws(() => parseTrustAnchorFile(JSON.stringify({ ...VALID, approvers: [] })), /non-empty/)
   assert.throws(
     () =>

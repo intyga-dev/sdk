@@ -40,6 +40,8 @@ export interface TrustAnchorFile {
    * something the file can prove about itself.
    */
   epoch: number
+  /** Exact tenant this independently trusted anchor was exported for. Older anchors omit it. */
+  tenantId?: string
   /** What the export was scoped to (an approval rule, a service). Display only. */
   label?: string
   /** The approver identities this RP trusts, each with every public key bound to them at export time. */
@@ -99,6 +101,8 @@ export function parseTrustAnchorFile(
     )
   if (typeof obj.epoch !== "number" || !Number.isInteger(obj.epoch) || obj.epoch < 0)
     return fail("epoch must be a non-negative integer")
+  if (obj.tenantId !== undefined && (typeof obj.tenantId !== "string" || obj.tenantId.length === 0))
+    return fail("tenantId must be a non-empty string when present")
   if (obj.label !== undefined && typeof obj.label !== "string") return fail("label must be a string")
   if (obj.exportedAt !== undefined && typeof obj.exportedAt !== "string")
     return fail("exportedAt must be a string")

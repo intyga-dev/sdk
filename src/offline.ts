@@ -85,6 +85,8 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 
 /** A locally generated offline challenge, ready to hand to the approvers. */
 export interface OfflineChallenge {
+  /** Opaque tenant identifier copied from the independently verified trust bundle and signed in v2. */
+  tenantId: string
   /** Generated HERE, by the party that will redeem it (DIV §5a.2) — nobody else can enforce its use. */
   nonce: string
   /** The exact bytes the approvers will sign. */
@@ -136,6 +138,11 @@ export function createOfflineChallenge(input: {
    */
   delegation?: VerifiedDelegation
 }): { ok: boolean; reason?: string; challenge?: OfflineChallenge } {
+  // This is a public JavaScript boundary, so the TrustBundle type is not an enforcement mechanism.
+  // Without this guard a raw JS caller could pass a legacy/malformed object with no tenantId and the
+  // optional canonical-builder argument would silently emit v1 for a brand-new challenge.
+  if (!input.bundle || typeof input.bundle.tenantId !== "string" || input.bundle.tenantId.length === 0)
+    return { ok: false, reason: "trust bundle tenantId must be a non-empty string" }
   // DIV §3 Invariant 5 (Target Isolation): a blank target binds no execution environment, so the
   // approval would verify at every relying party that also asserts it.
   if (typeof input.target !== "string" || !input.target.trim())
@@ -189,6 +196,9 @@ export function createOfflineChallenge(input: {
         `may narrow WHO approves, never HOW MANY (DIV §5a.5)`,
     }
   }
+  if (input.delegation && input.delegation.tenantId !== input.bundle.tenantId) {
+    return { ok: false, reason: "delegation and trust bundle belong to different tenants" }
+  }
 
   // Under a delegation the eligible set and the quorum are the DELEGATED ones. Everything else in the
   // requirement still comes from the bundle: a delegation narrows who may approve, never the policy.
@@ -198,6 +208,7 @@ export function createOfflineChallenge(input: {
   const approverDids = input.delegation ? input.delegation.delegatedTo : resolved.approverDids
 
   const canonicalPayload = canonicalOfflineIntentPayload({
+    tenantId: input.bundle.tenantId,
     target: input.target,
     actionType: input.actionType,
     display: input.display,
@@ -212,6 +223,7 @@ export function createOfflineChallenge(input: {
   return {
     ok: true,
     challenge: {
+      tenantId: input.bundle.tenantId,
       nonce,
       canonicalPayload,
       verificationCode: verificationCode(canonicalPayload),
@@ -231,6 +243,8 @@ export function createOfflineChallenge(input: {
 
 /** What an approver's signing tool shows before asking for confirmation. */
 export interface DecodedChallenge {
+  /** Present on tenant-bound v2 challenges; absent on preserved legacy v1 envelopes. */
+  tenantId?: string
   canonicalPayload: string
   verificationCode: string
   target: string
@@ -283,6 +297,7 @@ export function decodeChallengeEnvelope(envelope: string): {
   const shapeProblem = challengeShapeProblem(parsed)
   if (shapeProblem) return { ok: false, reason: `challenge payload ${shapeProblem} — refusing to sign it` }
   const fields = parsed as unknown as DecodedChallenge
+  const version = parsed.v
   // Re-serializing must reproduce the input byte-for-byte. If it does not, the envelope carries
   // non-canonical or mis-shaped JSON — hand-edited, truncated, or missing fields the review pane
   // would then render as "?" — and a signature over these bytes would not verify against the
@@ -291,6 +306,7 @@ export function decodeChallengeEnvelope(envelope: string): {
   let rebuilt: string
   try {
     rebuilt = canonicalOfflineIntentPayload({
+      ...(version === 2 ? { tenantId: fields.tenantId } : {}),
       target: fields.target,
       actionType: fields.actionType,
       display: fields.display,
@@ -318,6 +334,7 @@ export function decodeChallengeEnvelope(envelope: string): {
     challenge: {
       canonicalPayload,
       verificationCode: verificationCode(canonicalPayload),
+      ...(version === 2 ? { tenantId: fields.tenantId } : {}),
       target: fields.target,
       actionType: fields.actionType,
       display: fields.display,
@@ -333,6 +350,10 @@ export function decodeChallengeEnvelope(envelope: string): {
 
 /** Why a decoded challenge payload has the wrong shape, or null when every field is well-typed. */
 function challengeShapeProblem(p: Record<string, unknown>): string | null {
+  if (p.v !== 1 && p.v !== 2) return "has an unsupported DIV version"
+  if (p.v === 2 && (typeof p.tenantId !== "string" || p.tenantId.length === 0))
+    return "is missing a non-empty tenantId"
+  if (p.v === 1 && p.tenantId !== undefined) return "carries tenantId under legacy DIV v1"
   for (const field of ["target", "actionType", "display", "nonce", "challengedAt", "expiresAt"])
     if (typeof p[field] !== "string") return `field ${field} is not a string`
   if (!(p.target as string).trim()) return "has a blank target"
@@ -407,6 +428,9 @@ export function signChallengeEnvelope(
   const decoded = decodeChallengeEnvelope(envelope)
   if (!decoded.ok || !decoded.challenge) return { ok: false, reason: decoded.reason }
   const challenge = decoded.challenge
+  // v1 remains decodable for archived evidence, but every NEW signature must be tenant-bound.
+  if (typeof challenge.tenantId !== "string" || challenge.tenantId.length === 0)
+    return { ok: false, reason: "legacy DIV v1 challenges are archival-only and cannot be signed" }
   // A timestamp we cannot read is not one we can say is still valid. `NaN <= 0` is false, so an
   // unparseable expiresAt would otherwise sail past the expiry check (DIV §6.2).
   const expiryMs = parseRfc3339Ms(challenge.expiresAt)
@@ -579,7 +603,7 @@ export async function useOfflineApproval(
   // are the ones who must have signed away that entitlement.
   let delegation: VerifiedDelegation | undefined
   if (opts.delegationDir) {
-    const found = findDelegation(opts.delegationDir, bundle, expected, opts.asOf)
+    const found = findDelegation(opts.delegationDir, bundle, expected, opts.requesterDid, opts.asOf)
     if (found.reason) warn(`⚠ OFFLINE APPROVAL: ${found.reason}`)
     delegation = found.delegation
   }
@@ -627,9 +651,11 @@ export async function useOfflineApproval(
     receipt,
     {
       target: expected.target,
+      tenantId: bundle.tenantId,
       actionType: expected.actionType,
       params: expected.params,
       nonce: challenge.nonce,
+      requesterDid: opts.requesterDid,
       // Restricted to the approvers eligible for THIS action, so a valid signature from someone
       // outside the rule's approver list does not count toward its quorum. The one place offline
       // signing keys count: this receipt is a div-offline-intent.
@@ -647,7 +673,11 @@ export async function useOfflineApproval(
   // Buffer BEFORE redeeming: a crash between the two steps must leave a pending record behind. A
   // spurious record reconciles harmlessly (the gateway sees an approval that was never executed);
   // the old order left a redeemed, executed approval invisible to reconciliation forever.
-  bufferForReconciliation(challenge, receipt, delegation, opts)
+  try {
+    bufferForReconciliation(challenge, receipt, delegation, opts)
+  } catch {
+    return { ok: false, reason: "could not buffer offline approval for reconciliation" }
+  }
   if (!store.redeem(challenge.nonce)) {
     clearPendingApproval(challenge.nonce, opts)
     return { ok: false, reason: `nonce ${challenge.nonce} has already been redeemed here` }
@@ -677,6 +707,7 @@ function findDelegation(
   dir: string,
   bundle: TrustBundle,
   expected: { target: string; actionType: string; display: string; params: Record<string, unknown> },
+  requesterDid: string,
   asOf?: Date,
 ): { delegation?: VerifiedDelegation; reason?: string } {
   const resolved = requirementFor(bundle, expected.actionType, expected.display)
@@ -700,7 +731,10 @@ function findDelegation(
   for (const file of files) {
     let receipt: ApprovalReceipt
     try {
-      receipt = JSON.parse(fs.readFileSync(file, "utf8")) as ApprovalReceipt
+      const artifact: unknown = JSON.parse(fs.readFileSync(file, "utf8"))
+      const candidate = isObject(artifact) && "receipt" in artifact ? artifact.receipt : artifact
+      if (!isObject(candidate)) throw new Error("delegation receipt must be an object")
+      receipt = candidate as unknown as ApprovalReceipt
     } catch {
       rejected.push(`${path.basename(file)}: unreadable`)
       continue
@@ -711,6 +745,8 @@ function findDelegation(
         // The ORDINARY approver set — not the delegates. Whoever may approve this action is who must
         // have delegated it. Ordinary keys only: an offline signing key must never seal a delegation.
         approvers: approverAnchor(bundle, resolved.approverDids, "ordinary"),
+        tenantId: bundle.tenantId,
+        requesterDid,
         target: expected.target,
         actionType: expected.actionType,
         params: expected.params,
@@ -718,7 +754,7 @@ function findDelegation(
         // The AAGUID comparison below stays, because the floor does not cover allowedAaguids.
         requirement: requirementFloorOf(resolved.requirement),
       },
-      { asOf },
+      { asOf, expectedOrigin: bundle.webauthn?.origin, expectedRpId: bundle.webauthn?.rpId },
     )
     if (!res.ok || !res.delegation) {
       rejected.push(`${path.basename(file)}: ${res.reason}`)
@@ -776,9 +812,7 @@ export interface PendingApproval {
 /**
  * Record the approval so it can be reported when the gateway is reachable again.
  *
- * Best-effort by design: a buffering failure must never block the emergency action the operator is
- * mid-incident on. It is warned about loudly instead, because an unrecorded approval is exactly the
- * case reconciliation exists to surface.
+ * Failure propagates before redemption: an action without its reconciliation record is refused.
  */
 function bufferForReconciliation(
   challenge: OfflineChallenge,
@@ -796,16 +830,9 @@ function bufferForReconciliation(
     receipt,
     delegationNonce: delegation?.nonce,
   }
-  try {
-    if (!isPathSafeNonce(challenge.nonce)) throw new Error("nonce is not a safe path segment")
-    ensurePrivateDir(dir)
-    writePrivateFile(path.join(dir, `${challenge.nonce}.json`), `${JSON.stringify(record, null, 2)}\n`)
-  } catch (err) {
-    ;(opts.warn ?? ((m: string) => console.error(m)))(
-      `⚠ OFFLINE APPROVAL: could not buffer ${challenge.nonce} for reconciliation (${(err as Error).message}). ` +
-        `Report this manually — an unreported approval is indistinguishable from an unauthorized one.`,
-    )
-  }
+  if (!isPathSafeNonce(challenge.nonce)) throw new Error("nonce is not a safe path segment")
+  ensurePrivateDir(dir)
+  writePrivateFile(path.join(dir, `${challenge.nonce}.json`), `${JSON.stringify(record, null, 2)}\n`)
 }
 
 /**

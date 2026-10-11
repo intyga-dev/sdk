@@ -141,6 +141,7 @@
           <dt>Action</dt><dd id="rDisplay"></dd>
           <dt>Type</dt><dd><code id="rType"></code></dd>
           <dt>Target</dt><dd><code id="rTarget"></code></dd>
+          <dt>Tenant</dt><dd><code id="rTenant"></code></dd>
           <dt>Parameters</dt><dd><code id="rParams"></code></dd>
           <dt>Requested by</dt><dd><code id="rRequester"></code></dd>
           <dt>Quorum</dt><dd id="rQuorum"></dd>
@@ -260,6 +261,10 @@
           fail($("decodeErr"), "The request does not contain valid JSON. Was the paste truncated?")
           return
         }
+        if (!p || typeof p !== "object" || Array.isArray(p)) {
+          fail($("decodeErr"), "The request payload must be a JSON object. Refusing to sign it.")
+          return
+        }
         // Refuse anything that is not an offline challenge. Signing an ordinary intent payload here
         // would mint a live approval outside the gateway's single-use accounting; signing a delegation
         // would hand over approval authority. An approver must not be able to be walked into either.
@@ -270,6 +275,15 @@
           )
           return
         }
+        // Legacy v1 stays readable in verifier archives, but this live signing surface may only
+        // issue tenant-bound v2 signatures. Never let a missing tenant fall back to fresh v1.
+        if (p.v !== 2 || typeof p.tenantId !== "string" || p.tenantId.length === 0) {
+          fail(
+            $("decodeErr"),
+            "This request is not tenant-bound DIV v2. Legacy v1 requests are archival-only and cannot be signed.",
+          )
+          return
+        }
 
         const expiresMs = Date.parse(p.expiresAt)
         const secondsLeft = Math.round((expiresMs - Date.now()) / 1000)
@@ -277,6 +291,7 @@
         $("rDisplay").textContent = p.display ?? "(none given)"
         $("rType").textContent = p.actionType ?? "?"
         $("rTarget").textContent = p.target ?? "?"
+        $("rTenant").textContent = p.tenantId
         $("rParams").textContent = JSON.stringify(p.params ?? {})
         $("rRequester").textContent = (p.requester && p.requester.did) || "(unknown)"
         $("rQuorum").textContent = `${(p.requirement && p.requirement.requiredApprovals) || "?"} approver(s) required`
@@ -286,7 +301,7 @@
             : `${p.expiresAt} — ALREADY EXPIRED`
         $("rCode").textContent = await verificationCode(canonical)
 
-        current = { canonical, expiresAt: p.expiresAt }
+        current = { canonical, expiresAt: p.expiresAt, tenantId: p.tenantId }
         show($("reviewPanel"), true)
         if (secondsLeft <= 0) {
           fail($("decodeErr"), "This request has already expired. Ask the operator for a fresh one.")
@@ -312,6 +327,8 @@
         show($("signErr"), false)
         show($("resultPanel"), false)
         if (!current) return
+        if (typeof current.tenantId !== "string" || current.tenantId.length === 0)
+          return fail($("signErr"), "This request has no tenant binding and cannot be signed.")
 
         // Re-check expiry at SIGN time, not only at decode time: a challenge that lapsed while the
         // approver was reviewing would otherwise be signed and then refused by every verifier.

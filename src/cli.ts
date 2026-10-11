@@ -57,6 +57,7 @@ function approverKeys(): string[] {
 function resolveApproverAnchor(): {
   anchor: ApproverTrustAnchor
   webauthn?: { origin: string; rpId: string }
+  tenantId?: string
 } | null {
   const filePath = arg("approvers-file") ?? process.env.INTYGA_APPROVERS_FILE
   const keys = approverKeys()
@@ -75,7 +76,7 @@ function resolveApproverAnchor(): {
     }
     try {
       const file = parseTrustAnchorFile(text)
-      return { anchor: trustAnchorApprovers(file), webauthn: file.webauthn }
+      return { anchor: trustAnchorApprovers(file), webauthn: file.webauthn, tenantId: file.tenantId }
     } catch (err) {
       die(err instanceof Error ? err.message : String(err))
     }
@@ -530,7 +531,7 @@ async function pollVerifyConsume(
   timeoutMs: number,
   consume: boolean,
   onPending?: () => void,
-  opts: { requirement?: RequirementFloor; evidencePath?: string } = {},
+  opts: { requirement?: RequirementFloor; evidencePath?: string; tenantId?: string } = {},
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   // Peek once before blocking: if policy already resolved it (Discovery Mode / pre-approval window)
@@ -567,12 +568,21 @@ async function pollVerifyConsume(
   // what this did — let anything that can answer the status poll authorize any action, with no
   // approver key ever consulted.
   const allowAutoApproved = process.argv.includes("--allow-auto-approved")
+  if (opts.tenantId !== undefined && resolved.tenantId !== undefined && opts.tenantId !== resolved.tenantId) {
+    die(
+      `tenant expectation ${JSON.stringify(opts.tenantId)} conflicts with trust-anchor tenant ` +
+        `${JSON.stringify(resolved.tenantId)} — use the anchor exported for this workspace`,
+    )
+  }
+  // Flag/env wins over the independently trusted anchor file. The receipt is never an expectation.
+  const expectedTenantId = opts.tenantId ?? resolved.tenantId
 
   // The nonce is asserted too: it binds the receipt to the challenge this call issued, so a receipt
   // for some other (equally valid) approval cannot be substituted.
   const v = verifyApprovalReceipt(
     result.receipt,
     {
+      ...(expectedTenantId !== undefined ? { tenantId: expectedTenantId } : {}),
       target,
       actionType,
       params,
@@ -623,7 +633,14 @@ async function pollVerifyConsume(
     const evidence = {
       type: "intyga-approval-evidence",
       v: 1,
-      expected: { target, actionType, params, nonce, requirement: opts.requirement ?? null },
+      expected: {
+        tenantId: expectedTenantId ?? null,
+        target,
+        actionType,
+        params,
+        nonce,
+        requirement: opts.requirement ?? null,
+      },
       trustAnchor: resolved.anchor,
       receipt: result?.receipt,
       verification: v,
@@ -871,7 +888,7 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]',
+          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]',
         )
       const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
       const baseParams = parseParamsArg()
@@ -951,7 +968,11 @@ async function main() {
         timeoutMs,
         process.argv.indexOf("--consume") >= 0,
         onPending,
-        { requirement: requirementFloorFromArgs(), evidencePath: arg("evidence") },
+        {
+          requirement: requirementFloorFromArgs(),
+          evidencePath: arg("evidence"),
+          tenantId: arg("tenant") ?? process.env.INTYGA_TENANT_ID,
+        },
       )
       process.exit(0)
       return
@@ -960,7 +981,7 @@ async function main() {
       const nonce = rest.find((a) => !a.startsWith("--"))
       if (!nonce)
         die(
-          "usage: intyga await <nonce> --gateway <url> --target <target> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
+          "usage: intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
         )
       const { timeoutMs } = parseTimeout(arg("timeout"))
       const target = arg("target") ?? ""
@@ -982,7 +1003,11 @@ async function main() {
         timeoutMs,
         process.argv.indexOf("--consume") >= 0,
         undefined,
-        { requirement: requirementFloorFromArgs(), evidencePath: arg("evidence") },
+        {
+          requirement: requirementFloorFromArgs(),
+          evidencePath: arg("evidence"),
+          tenantId: arg("tenant") ?? process.env.INTYGA_TENANT_ID,
+        },
       )
       process.exit(0)
       return
@@ -1268,6 +1293,8 @@ async function main() {
       const decoded = decodeChallengeEnvelope(envelope)
       if (!decoded.ok || !decoded.challenge) die(decoded.reason ?? "unreadable challenge")
       const c = decoded.challenge
+      if (typeof c.tenantId !== "string" || c.tenantId.length === 0)
+        die("legacy DIV v1 challenges are archival-only and cannot be signed")
 
       // Show the human what they are authorizing, in full. An approver who signs an opaque blob has
       // not approved anything (DIV §5a.8), so this output is a security control, not decoration —
@@ -1283,6 +1310,7 @@ async function main() {
       console.log(`  Action     ${approverSafe(c.display)}`)
       console.log(`  Type       ${approverSafe(c.actionType)}`)
       console.log(`  Target     ${approverSafe(c.target)}`)
+      console.log(`  Tenant     ${approverSafe(c.tenantId)}`)
       console.log(`  Params     ${approverSafe(JSON.stringify(c.params))}`)
       console.log(`  Requested  ${approverSafe(c.requester?.did ?? "(unknown)")}`)
       console.log(`  Quorum     ${c.requirement?.requiredApprovals ?? "?"} approver(s) required`)
@@ -1371,8 +1399,8 @@ async function main() {
           "  intyga keygen --out <prefix>",
           "  intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
           "  intyga login --did <did> [--gateway <url>]",
-          '  intyga authorize "<action>" --gateway <url> (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
-          "  intyga await <nonce> --gateway <url> [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
+          '  intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
+          "  intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
           "",
           "  `authorize` and `await` verify the approval receipt offline and REQUIRE a trust anchor",
           "  you resolved yourself — the receipt's own key is never used, or it would vouch for its",
@@ -1383,6 +1411,8 @@ async function main() {
           "                              and the file can carry the WebAuthn expectations below",
           "    --approver-key <base64>   repeatable; base64 SPKI (raw P-256) or base64 COSE (passkey)",
           "    INTYGA_APPROVER_KEYS      comma-separated, same values (counts keys, not people)",
+          "  Tenant-bound v2 receipts require --tenant <tenantId>, INTYGA_TENANT_ID, or tenantId in",
+          "  the trust-anchor file. Conflicting explicit/anchor values fail; receipt values are ignored.",
           "  Passkey receipts additionally REQUIRE the WebAuthn expectations (the verifier fails",
           "  closed without them — an assertion from any other site would otherwise verify):",
           "    --webauthn-origin <url>   or INTYGA_WEBAUTHN_ORIGIN — the approval console's origin",

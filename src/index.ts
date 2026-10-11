@@ -13,6 +13,8 @@ export {
   type ApprovalReceipt,
   type ApproverTrustAnchor,
   canonicalIntentPayload,
+  DIV_TENANT_VERSION,
+  DIV_VERSION,
   type RequirementFloor,
   SELF_CERTIFYING_DID_PREFIX,
   selfCertifyingDid,
@@ -105,7 +107,7 @@ export interface IntygaClientOptions {
   token?: string
   clientId?: string
   clientSecret?: string
-  /** Allow loading stored bearer token from ~/.intyga/credentials.json (intended for CLI tools). */
+  /** Allow stored CLI login credentials only when no token or client credentials are supplied. */
   allowStoredCredentials?: boolean
 }
 
@@ -334,6 +336,11 @@ export class IntygaClient {
     if (this.cached && (this.cached.refreshAt === undefined || now < this.cached.refreshAt)) {
       return { token: this.cached.token, source: this.cached.source }
     }
+    // Explicit credentials select the requester and workspace. A saved personal CLI login must
+    // never override them, including when the supplied pair is incomplete or the exchange fails.
+    if (this.opts.clientId !== undefined || this.opts.clientSecret !== undefined) {
+      return this.exchange(now)
+    }
     if (this.opts.allowStoredCredentials) {
       // Re-read the file on every miss: a fresh `intyga login` in another terminal should be picked
       // up by a wait that is still running, instead of that wait dying on the token it started with.
@@ -344,10 +351,7 @@ export class IntygaClient {
           this.cached = { token: stored, source: "stored", refreshAt: exp }
           return { token: stored, source: "stored" }
         }
-        // Expired on disk, and there is nothing here to re-exchange it with — unless the caller ALSO
-        // supplied client credentials, which are still good and should not be blocked by a stale file.
-        if (!this.opts.clientId || !this.opts.clientSecret)
-          throw new StoredCredentialExpired(STORED_CREDENTIAL_EXPIRED)
+        throw new StoredCredentialExpired(STORED_CREDENTIAL_EXPIRED)
       }
     }
     return this.exchange(now)
@@ -355,10 +359,8 @@ export class IntygaClient {
 
   /**
    * The client-credentials exchange itself, bypassing the stored-credential lookup. The 401 retry in
-   * `authed()` calls this directly: going back through `resolveToken()` would consult
-   * `~/.intyga/credentials.json` first, so a process configured with BOTH a stored `intyga login`
-   * token and client credentials could retry an agent call as the human — a different principal, a
-   * different ceremony shape, and a different requester on the witness leaf.
+   * `authed()` calls this directly so retries keep the original credential source and cannot switch
+   * requester or workspace to a stored CLI login.
    */
   private async exchange(now: number): Promise<{ token: string; source: "exchange" }> {
     if (!this.opts.clientId || !this.opts.clientSecret) {
@@ -514,6 +516,7 @@ export class IntygaClient {
    *   // the verifier fails closed without them, or an assertion from any site would verify.
    *   const check = verifyApprovalReceipt(r.receipt!, {
    *     ...action,
+   *     tenantId: process.env.INTYGA_TENANT_ID!, // independently trusted workspace, never receipt
    *     nonce: r.nonce!,
    *     approvers: { publicKeys: trustedApproverKeys },
    *   }, {

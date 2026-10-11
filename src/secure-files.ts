@@ -34,14 +34,34 @@ export function writePrivateFile(file: string, contents: string | Buffer): void 
   }
   const temp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`)
   try {
-    fs.writeFileSync(temp, contents, { encoding: "utf8", mode: PRIVATE_FILE_MODE, flag: "wx" })
+    const fd = fs.openSync(temp, "wx", PRIVATE_FILE_MODE)
+    try {
+      fs.writeFileSync(fd, contents, "utf8")
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
     repairMode(temp, PRIVATE_FILE_MODE)
     fs.renameSync(temp, file)
     repairMode(file, PRIVATE_FILE_MODE)
+    syncPrivateDir(dir)
   } finally {
     try {
       fs.unlinkSync(temp)
     } catch {}
+  }
+}
+
+/** Persist a new/renamed entry and its containing directory on POSIX filesystems. */
+function syncPrivateDir(dir: string): void {
+  if (process.platform === "win32") return // Windows does not expose directory fsync.
+  for (const entry of [dir, path.dirname(dir)]) {
+    const fd = fs.openSync(entry, "r")
+    try {
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
   }
 }
 
@@ -57,9 +77,11 @@ export function createPrivateMarker(file: string, contents: string): boolean {
     try {
       fs.writeFileSync(fd, contents, "utf8")
       fs.fchmodSync(fd, PRIVATE_FILE_MODE)
+      fs.fsyncSync(fd)
     } finally {
       fs.closeSync(fd)
     }
+    syncPrivateDir(path.dirname(file))
     return true
   } catch {
     return false

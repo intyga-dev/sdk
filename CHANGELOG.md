@@ -5,6 +5,26 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0]
+
+- The `require-approval` GitHub Action v2 pins SDK/verifier 2.0.0; callers using its v1 major
+  must explicitly upgrade before the gateway cutover.
+
+- Bind delegation verification to the independently expected requester; a workload cannot reuse
+  another workload's otherwise valid delegation.
+
+- **Breaking: tenant-bound DIV v2 approvals.** Requests and offline approvals carry the tenant
+  established by authenticated credentials or a verified trust bundle. Receipt verification requires
+  an independently trusted tenant; a receipt cannot choose its own verification context.
+- Trust bundles require a nonempty signed `tenantId`; trust-anchor files may pin the expected tenant.
+  Offline-intent anchors require an explicit eligible-DID restriction, so delegate keys cannot
+  broaden a selected rule's approver set. Ordinary anchors keep their existing behavior.
+- Includes the matched 2.0.0 verifier and shared tenant-binding and offline-approval vectors.
+  Historical v1 receipts remain verifiable without a tenant expectation; new tenant-bound execution
+  refuses them. Publish the full matched set and upgrade consumers before the gateway cutover.
+- Explicit client credentials take precedence over a stored CLI login; incomplete or rejected
+  explicit credentials fail closed. Explicit access tokens retain first priority.
+
 ## [1.2.0]
 
 - **Offline signing keys are their own list in the trust bundle.** `BundleApprover.offlinePublicKeys`
