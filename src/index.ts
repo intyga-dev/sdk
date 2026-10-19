@@ -84,6 +84,15 @@ export {
   verifyPlatformReceipt,
 } from "@intyga/verify"
 export { type AgentSessionState, type LiveAgentConfig, verifyAgentForExecution } from "./agent-execution.js"
+export { buildExecutionEvidence, signExecutionEvidence } from "./execution-evidence.js"
+// The relying party's evidence-source trust file (docs/API.md §2e), the same loader every SDK ships.
+export {
+  EVIDENCE_SOURCES_FILE_TYPE,
+  type EvidenceSourceKey,
+  type EvidenceSourcesFile,
+  evidencePolicyFromFile,
+  parseEvidenceSourcesFile,
+} from "./evidence-sources.js"
 
 import type { AgentIntentContext, ApprovalReceipt } from "@intyga/verify"
 import {
@@ -132,8 +141,43 @@ export type ApprovalStatus =
    */
   | "OFFLINE_APPROVED"
 
+/**
+ * DEWP §4.7 execution evidence for a consumed approval, present once `reportDispatched` was called.
+ * `confirmed` / `contradicted` come only from statements signed by a REGISTERED evidence source;
+ * `unconfirmed` means the window closed without one. It reports what a source observed — not proof
+ * of what physically happened.
+ */
+export interface ExecutionState {
+  status: "pending" | "confirmed" | "contradicted" | "unconfirmed"
+  dispatchedAt: string
+  evidenceDeadline: string
+  evidence: Array<{
+    seq: string
+    verdict: "confirmed" | "contradicted"
+    source: string | null
+    recordedAt: string
+    /** The statement's own sample time and per-source counter (DEWP §4.7.2 rules 11–12). */
+    sampledAt: string | null
+    sequence: number | null
+    /**
+     * Sampled after the evidence window closed: witnessed, never counted. A late `contradicted` is the
+     * `challenge.execution_late_contradiction` alert — route it to escalation, not investigation.
+     */
+    late: boolean
+  }>
+}
+
+/** A refused execution-evidence call: the HTTP status and the gateway's public error code. */
+export interface ExecutionRefusal {
+  ok: false
+  status: number
+  code: string | null
+}
+
 export interface ApprovalResult {
   status: ApprovalStatus
+  /** DEWP §4.7 execution evidence; only on a CONSUMED result whose dispatch was reported. */
+  execution?: ExecutionState
   /** Issuer-completed v1 context retained from challenge creation, never copied from the receipt. */
   agentContext?: AgentIntentContext
   signatureHash?: string
@@ -489,6 +533,64 @@ export class IntygaClient {
       }),
     })
     return (await res.json()) as { ok: boolean; reason?: string }
+  }
+
+  /**
+   * DEWP §4.7: report that the consumed action was sent to its target, and how long an evidence
+   * source has to confirm it. Call after `consume` succeeded and the action was dispatched. Idempotent
+   * for the same window. Never affects the approval.
+   */
+  async reportDispatched(
+    nonce: string,
+    opts: { evidenceWithinSeconds: number },
+  ): Promise<
+    { ok: true; dispatchedAt: string; evidenceDeadline: string; auditSeq: string | null } | ExecutionRefusal
+  > {
+    const { res } = await this.authed(`/authorize/${encodeURIComponent(nonce)}/dispatched`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ evidenceWithinSeconds: opts.evidenceWithinSeconds }),
+    })
+    return this.executionResult(res)
+  }
+
+  /**
+   * DEWP §4.7: relay a statement an evidence source signed (`buildExecutionEvidence` +
+   * `signExecutionEvidence` on the source's side). The gateway accepts it only from a source the
+   * tenant registered in the console. `counted` is false for an observation outside the window — it is
+   * still witnessed, but does not change the status.
+   */
+  async submitEvidence(
+    nonce: string,
+    evidence: { statement: string; signature: string },
+  ): Promise<
+    | {
+        ok: true
+        verdict: "confirmed" | "contradicted"
+        counted: boolean
+        executionStatus: "confirmed" | "contradicted" | "unconfirmed" | null
+        auditSeq: string | null
+      }
+    | ExecutionRefusal
+  > {
+    const { res } = await this.authed(`/authorize/${encodeURIComponent(nonce)}/evidence`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ statement: evidence.statement, signature: evidence.signature }),
+    })
+    return this.executionResult(res)
+  }
+
+  /** Non-throwing like `consume`: a refusal reaches the caller as `{ ok: false, status, code }`. */
+  private async executionResult<T>(res: Response): Promise<(T & { ok: true }) | ExecutionRefusal> {
+    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null
+    if (res.ok && body && body.ok === true) return body as T & { ok: true }
+    const error = body?.error
+    const code =
+      error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+        ? (error as { code: string }).code
+        : null
+    return { ok: false, status: res.status, code }
   }
 
   /** Poll a challenge's current status (non-blocking). */

@@ -78,7 +78,7 @@ intyga sign <DIV1:...> --key <private.pem|private.der> --did <your-did> [--yes]
 intyga trust-bundle export --tenant <uuid> [--dir <dir>] [--gateway <url>]   # INTYGA_INTERNAL_TOKEN | --token-file | --token-stdin
 intyga trust-bundle show [--dir <dir>]
 intyga verify <documentHash> --gateway <url>
-intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--rekor-key <pem>] [--rekor-issuer <issuer>] [--tsa-trust <tsa-trust.json>] [--json]
+intyga audit-verify <bundle.json> [--root <hex> | --roots <roots.jsonl>] [--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] [--rekor-key <pem>] [--rekor-issuer <issuer>] [--tsa-trust <tsa-trust.json>] [--evidence-sources <sources.json>] [--require-execution-confirmed] [--execution-at <iso>] [--evidence-skew <seconds>] [--max-evidence-window <seconds>] [--json]
 ```
 
 `--required-approvals <n>` (or `INTYGA_REQUIRED_APPROVALS`) is the minimum number of independent human
@@ -144,6 +144,50 @@ rules. New exports carry signed rule-selection metadata; older bundles with mult
 are refused because their governing approver set cannot be selected reliably.
 
 Node ≥18 (global `fetch` + `node:crypto`); the only npm dependency is [`@intyga/verify`](https://github.com/intyga-dev/verify). Optional RFC 3161 verification also requires OpenSSL 3.
+
+## Execution evidence (DEWP §4.7)
+
+An approval proves a person approved exact bytes, not that the action took effect. After a consumed
+approval, report the dispatch; an evidence source independent of your service then signs what it
+observed, and you relay that statement. `confirmed` means a source you trust signed an in-window
+observation. It is not proof of what physically happened.
+
+```ts
+import { buildExecutionEvidence, signExecutionEvidence } from "@intyga/sdk"
+
+// Your service, after the approved action was sent:
+await intyga.reportDispatched(nonce, { evidenceWithinSeconds: 600 })
+
+// The evidence source (a protection relay, a meter, a measured-boot attester), on its own key:
+const statement = buildExecutionEvidence({
+  approvalPayload: receipt.canonicalPayload,
+  nonce,
+  source: "did:example:relay-7",
+  verdict: "confirmed",
+  observation: { breaker: "open", currentA: 0, previousCurrentA: 412 },
+  sequence: nextCounter(), // the source's own gapless, durable counter for this log
+  sampledAt, // when the measurement was taken; defaults to now
+})
+await intyga.submitEvidence(nonce, { statement, signature: signExecutionEvidence(statement, sourceKey) })
+```
+
+Offline, load the sources you trust from an `intyga-evidence-sources` file — the same format every
+INTYGA SDK reads — and verify an exported bundle under it:
+
+```ts
+import fs from "node:fs"
+import { evidencePolicyFromFile, parseEvidenceSourcesFile } from "@intyga/sdk"
+import { verifyEvidenceBundle } from "@intyga/verify"
+
+const evidencePolicy = evidencePolicyFromFile(parseEvidenceSourcesFile(fs.readFileSync("sources.json", "utf8")))
+const result = verifyEvidenceBundle(bundle, { trustedRoots, evidencePolicy, requireExecutionConfirmed: true })
+```
+
+A key in that file may carry `notBefore` / `notAfter`; it then counts only at the record's anchored
+time, so supply anchors and an anchor policy. A key object with any other member is refused at load.
+`requireExecutionConfirmed` also fails on conflicting dispatch records, gaps in a source's counter, and
+a contradiction the status could not count. The CLI equivalent is `intyga audit-verify
+--evidence-sources`.
 
 ## Verify approvals independently
 

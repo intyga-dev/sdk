@@ -10,6 +10,7 @@ import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
 import type { ApproverTrustAnchor, RequirementFloor } from "@intyga/verify"
 import { parseTrustAnchorFile, trustAnchorApprovers } from "./trust-anchor.js"
+import { evidencePolicyFromFile, parseEvidenceSourcesFile } from "./evidence-sources.js"
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
@@ -1055,7 +1056,9 @@ async function main() {
             "[--trusted-issuer <a,b>] [--anchor-keys <keys.json>] [--require-anchors <n>] " +
             "[--rekor-key <pem>] [--rekor-issuer <issuer>] [--rekor-submitter-key <pem>] " +
             "[--tsa-trust <tsa-trust.json>] [--max-anchor-lag <seconds>] " +
-            "[--approvers-file <trust.json>] [--require-signatures] [--webauthn-origin <url>] [--webauthn-rp-id <host>] [--json]\n" +
+            "[--approvers-file <trust.json>] [--require-signatures] [--webauthn-origin <url>] [--webauthn-rp-id <host>] " +
+            "[--evidence-sources <sources.json>] [--require-execution-confirmed] [--execution-at <iso>]\n" +
+            "              [--evidence-skew <seconds>] [--max-evidence-window <seconds>] [--json]\n" +
             "  Works for both single inclusion proofs and multi-entry evidence bundles.",
         )
 
@@ -1134,6 +1137,35 @@ async function main() {
       }
       const signatureOptions = { signaturePolicy, requireSignatures }
 
+      // DEWP §4.7 execution evidence: evidence-source trust is its own file, never the approver file.
+      let evidencePolicy: import("@intyga/verify").ExecutionEvidencePolicy | undefined
+      const sourcesFile = arg("evidence-sources") ?? process.env.INTYGA_EVIDENCE_SOURCES_FILE
+      if (sourcesFile) {
+        try {
+          evidencePolicy = evidencePolicyFromFile(
+            parseEvidenceSourcesFile(fs.readFileSync(sourcesFile, "utf8")),
+          )
+        } catch (err) {
+          die(`cannot load evidence-source trust: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      const executionAt = arg("execution-at")
+      const executionNow = executionAt === undefined ? undefined : Date.parse(executionAt)
+      if (executionNow !== undefined && !Number.isFinite(executionNow))
+        die("--execution-at must be an ISO 8601 timestamp")
+      const requireExecutionConfirmed = process.argv.includes("--require-execution-confirmed")
+      // DEWP §4.7.3 step 6: both bounds are the verifier's, never the dispatch's. The skew covers clock
+      // error only; the window cap is what keeps an executing party from leaving a nonce pending forever.
+      const seconds = (flag: string): number | undefined => {
+        const raw = arg(flag)
+        if (raw === undefined) return undefined
+        const n = Number(raw)
+        if (!Number.isInteger(n) || n < 0) die(`--${flag} must be a non-negative whole number of seconds`)
+        return n
+      }
+      const evidenceSkewSeconds = seconds("evidence-skew")
+      const maxEvidenceWindowSeconds = seconds("max-evidence-window")
+
       // Multi-entry evidence bundle (date-range export): its own verifier + report shape.
       const bundleKind = (bundle as { kind?: string }).kind
       if (bundleKind === EVIDENCE_BUNDLE_KIND) {
@@ -1150,6 +1182,11 @@ async function main() {
           trustedCheckpoints: rootsEntries?.map(toTrustedCheckpoint),
           ...anchorOpts,
           ...signatureOptions,
+          evidencePolicy,
+          requireExecutionConfirmed,
+          executionNow,
+          evidenceSkewSeconds,
+          maxEvidenceWindowSeconds,
         })
         if (process.argv.indexOf("--json") >= 0) {
           console.log(JSON.stringify(rootsChain ? { rootsChain, ...result } : result, null, 2))
@@ -1171,6 +1208,42 @@ async function main() {
         )
         for (const s of result.signatures.checks ?? []) {
           console.log(`    seq ${s.seq}: ${s.status.toUpperCase()} — ${s.reason}`)
+        }
+        // DEWP §4.7: what caller-trusted evidence sources reported — not proof of what physically happened.
+        const executions = Object.entries(result.execution.byNonce)
+        if (executions.length > 0 || result.execution.checks.length > 0) {
+          console.log(
+            `  execution         ${result.execution.confirmed.length} confirmed, ${result.execution.contradicted.length} contradicted, ` +
+              `${result.execution.unconfirmed.length} unconfirmed, ${result.execution.pending.length} pending, ` +
+              `${result.execution.notReported.length} not reported${evidencePolicy ? "" : " (no --evidence-sources: nothing can be confirmed)"}`,
+          )
+          for (const [nonce, e] of executions) {
+            const flags = [
+              e.windowCapped ? `window cut to ${e.effectiveDeadline}` : null,
+              e.dispatchConflict.length > 0
+                ? `CONFLICTING DISPATCH RECORDS seq ${e.dispatchConflict.join(", ")}`
+                : null,
+              e.lateContradiction.length > 0
+                ? `LATE CONTRADICTION seq ${e.lateContradiction.join(", ")} — a trusted source saw the action not take effect after the window; escalate`
+                : null,
+            ].filter((f): f is string => f !== null)
+            console.log(
+              `    nonce ${nonce}: ${e.status.toUpperCase()}${flags.length ? ` — ${flags.join("; ")}` : ""}`,
+            )
+          }
+          for (const k of result.execution.checks)
+            console.log(
+              `    seq ${k.seq}: evidence ${k.status.toUpperCase()}${k.trusted ? " (trusted source)" : ""} — ${k.reason}`,
+            )
+          // DEWP §4.7.3 source continuity: a gap is a statement the source signed that this bundle lacks.
+          for (const [source, c] of Object.entries(result.execution.sources)) {
+            const gaps = c.gaps.map(([a, b]) => (a === b ? String(a) : `${a}–${b}`)).join(", ")
+            console.log(
+              `    source ${source}: statements ${c.first}..${c.last}` +
+                (gaps ? `, MISSING ${gaps}` : ", no gaps") +
+                (c.divergent.length ? `, DIVERGENT at ${c.divergent.join(", ")}` : ""),
+            )
+          }
         }
         for (const r of result.roots) {
           const quorum =
@@ -1216,6 +1289,7 @@ async function main() {
         trustedCheckpoint,
         ...anchorOpts,
         ...signatureOptions,
+        evidencePolicy,
       })
 
       if (process.argv.indexOf("--json") >= 0) {
@@ -1248,6 +1322,10 @@ async function main() {
       console.log(`  [${m(c.anchored)}] anchor claim    ${c.anchored.detail}`)
       // DEWP §7.1 property model + summary level.
       console.log(`  signature       ${result.signature.status.toUpperCase()} — ${result.signature.reason}`)
+      if (result.execution)
+        console.log(
+          `  evidence        ${result.execution.status.toUpperCase()} — ${result.execution.reason} (export a bundle with the dispatch and approval records for an execution status)`,
+        )
       console.log(
         "  scope           Signature checks do not establish deployment authorization, approval quorum or hardware attestation.",
       )

@@ -882,3 +882,54 @@ test("audit-verify exposes WebAuthn status and enforces caller-trusted signature
     fs.rmSync(tmp, { recursive: true, force: true })
   }
 })
+
+test("audit-verify reports DEWP §4.7 execution status under a separate evidence-sources file", () => {
+  const data = JSON.parse(
+    fs.readFileSync(
+      new URL("../vectors/verifier-parity-vectors.json", import.meta.url),
+      "utf8",
+    ),
+  )
+  const v = data.executionEvidence.cases.find((c: { name: string }) => c.name === "confirmed")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "execution-evidence-"))
+  try {
+    const bundle = path.join(tmp, "evidence.json")
+    const sources = path.join(tmp, "sources.json")
+    fs.writeFileSync(bundle, JSON.stringify(v.bundle))
+    const args = [
+      "audit-verify",
+      bundle,
+      "--root",
+      v.options.trustedRoots[0],
+      "--execution-at",
+      v.options.now,
+    ]
+    // Without evidence-source trust nothing can be confirmed, so the gate refuses.
+    const untrusted = run([...args, "--require-execution-confirmed", "--json"])
+    assert.equal(untrusted.status, 1)
+    assert.deepEqual(JSON.parse(untrusted.stdout).execution.unconfirmed.length, 1)
+    fs.writeFileSync(
+      sources,
+      JSON.stringify({
+        type: "intyga-evidence-sources",
+        v: 1,
+        sources: Object.entries(v.options.evidencePolicy.trustedSources).map(([did, publicKeys]) => ({
+          did,
+          publicKeys,
+        })),
+      }),
+    )
+    const trusted = run([...args, "--evidence-sources", sources, "--require-execution-confirmed", "--json"])
+    assert.equal(trusted.status, 0, trusted.stdout)
+    assert.equal(JSON.parse(trusted.stdout).execution.confirmed.length, 1)
+    const text = run([...args, "--evidence-sources", sources])
+    assert.match(text.stdout, /execution\s+1 confirmed/)
+    assert.match(text.stdout, /evidence VERIFIED \(trusted source\)/)
+    // An approver trust file is not evidence-source trust.
+    const wrongType = run([...args, "--evidence-sources", path.join(tmp, "missing.json")])
+    assert.equal(wrongType.status, 1)
+    assert.equal(run([...args.slice(0, -1), "not-a-time"]).status, 1)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})

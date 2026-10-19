@@ -5,6 +5,23 @@ All notable changes to `@intyga/sdk` are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.0]
+
+- **DEWP 1.1 §4.7 execution evidence.** `IntygaClient.reportDispatched` and `submitEvidence`
+  (non-throwing, like `consume`), and an `execution` block on `status()` for a consumed approval.
+  `buildExecutionEvidence` / `signExecutionEvidence` for the evidence source's side.
+- CLI `audit-verify`: `--evidence-sources <file>` (an `intyga-evidence-sources` trust file, separate
+  from the approver trust anchor), `--require-execution-confirmed` and `--execution-at`.
+- **Pre-publication review of DEWP §4.7.** `buildExecutionEvidence` takes the source's per-log
+  gapless `sequence` (required) and `sampledAt` (when the measurement was taken; defaults to
+  `observedAt`); the gateway refuses a different statement under a sequence the source already used.
+  An `intyga-evidence-sources` entry may be `{ key, notBefore?, notAfter? }` — a validity interval the
+  verifier checks at the record's anchored time; an entry with any other member (a misspelt bound) is
+  refused at load, so it can never read as "no bound". `audit-verify` gains `--evidence-skew <seconds>`
+  (default 30) and `--max-evidence-window <seconds>` (default 86 400), and prints dispatch conflicts,
+  late contradictions, capped windows and per-source counter gaps. `status().execution.evidence[]`
+  carries `sampledAt`, `sequence` and `late`.
+
 ## [2.0.0]
 
 - The `require-approval` GitHub Action v2 pins SDK/verifier 2.0.0; callers using its v1 major

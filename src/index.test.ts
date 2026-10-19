@@ -959,3 +959,54 @@ test("requireApproval refuses an approval arriving after the caller's wait windo
   assert.equal(result.status, "EXPIRED")
   assert.equal(result.nonce, "late")
 })
+
+test("reportDispatched and submitEvidence post to the nonce's execution routes (DEWP §4.7)", async (t) => {
+  const f = stubFetch((call) =>
+    call.url.endsWith("/dispatched")
+      ? { body: { ok: true, dispatchedAt: "d", evidenceDeadline: "e", auditSeq: "9" } }
+      : {
+          body: {
+            ok: true,
+            verdict: "confirmed",
+            counted: true,
+            executionStatus: "confirmed",
+            auditSeq: "10",
+          },
+        },
+  )
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+  assert.deepEqual(await c.reportDispatched("n 1", { evidenceWithinSeconds: 600 }), {
+    ok: true,
+    dispatchedAt: "d",
+    evidenceDeadline: "e",
+    auditSeq: "9",
+  })
+  assert.equal(f.calls[0]!.url, `${GW}/authorize/n%201/dispatched`)
+  assert.deepEqual(f.calls[0]!.body, { evidenceWithinSeconds: 600 })
+  const r = await c.submitEvidence("n 1", { statement: "{}", signature: "c2ln" })
+  assert.equal(r.ok, true)
+  assert.equal(f.calls[1]!.url, `${GW}/authorize/n%201/evidence`)
+  assert.deepEqual(f.calls[1]!.body, { statement: "{}", signature: "c2ln" })
+})
+
+test("execution-evidence refusals come back as status and public error code, not a throw", async (t) => {
+  const f = stubFetch(() => ({
+    status: 403,
+    body: { error: { code: "FORBIDDEN", message: "x", requestId: "r" } },
+  }))
+  t.after(f.restore)
+  const c = new IntygaClient({ gatewayUrl: GW, token: "t" })
+  assert.deepEqual(await c.submitEvidence("n", { statement: "{}", signature: "c2ln" }), {
+    ok: false,
+    status: 403,
+    code: "FORBIDDEN",
+  })
+  const g = stubFetch(() => ({ status: 502, text: "bad gateway" }))
+  t.after(g.restore)
+  assert.deepEqual(await c.reportDispatched("n", { evidenceWithinSeconds: 60 }), {
+    ok: false,
+    status: 502,
+    code: null,
+  })
+})
