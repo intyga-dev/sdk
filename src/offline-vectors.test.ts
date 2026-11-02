@@ -20,7 +20,11 @@ import {
   signChallengeEnvelope,
   useOfflineApproval,
 } from "../dist/offline.js"
-import { parseTrustAnchorFile, trustAnchorApprovers } from "../dist/trust-anchor.js"
+import {
+  parseTrustAnchorFile,
+  trustAnchorApprovers,
+  trustAnchorEnrolledDeviceKeys,
+} from "../dist/trust-anchor.js"
 import { approverAnchor, requirementFor, type TrustBundle, verifyTrustBundle } from "../dist/trust-bundle.js"
 
 const V = JSON.parse(
@@ -30,6 +34,26 @@ const V = JSON.parse(
   ),
 )
 
+/** api-name-hints.json: rewrite the TypeScript API names in an expected reason into this language's. */
+const HINTS = JSON.parse(
+  fs.readFileSync(new URL("../vectors/api-name-hints.json", import.meta.url), "utf8"),
+) as { tokens: string[]; typescript: Record<string, string> }
+assert.deepEqual(
+  Object.keys(HINTS.typescript).sort(),
+  [...HINTS.tokens].sort(),
+  "api-name-hints typescript map",
+)
+function localized(text: string): string {
+  const order = [...HINTS.tokens].sort((a, b) => b.length - a.length)
+  let out = text
+  order.forEach((token, i) => {
+    out = out.split(token).join(`\u0000${i}\u0000`)
+  })
+  order.forEach((token, i) => {
+    out = out.split(`\u0000${i}\u0000`).join(HINTS.typescript[token] ?? token)
+  })
+  return out
+}
 const P256_N = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
 function keyFromSeed(seed: string): crypto.KeyObject {
   const h = BigInt(`0x${crypto.createHash("sha256").update(seed, "utf8").digest("hex")}`)
@@ -63,6 +87,16 @@ const sign = (id: string, kind: string, payload: string) =>
     })
     .toString("base64")
 const GATEWAY_JWK = V.gatewayJwk as webcrypto.JsonWebKey
+/** Every refusal carries the reference reason: exact `reason`, or `reasonPrefix` where the text embeds a library message. */
+function assertReason(c: { name: string; reason?: string; reasonPrefix?: string }, got: string | undefined) {
+  if (c.reason !== undefined) assert.equal(got, localized(c.reason), `${c.name}: reason`)
+  else if (c.reasonPrefix !== undefined)
+    assert.ok(
+      got?.startsWith(localized(c.reasonPrefix)),
+      `${c.name}: reason ${got} lacks prefix ${c.reasonPrefix}`,
+    )
+  else assert.fail(`${c.name}: a refusal vector must carry reason or reasonPrefix`)
+}
 const bundleWith = (over: Record<string, unknown>): TrustBundle => ({ ...V.bundle, ...over })
 
 describe("offline-approval vectors", () => {
@@ -83,18 +117,30 @@ describe("offline-approval vectors", () => {
       const r = verifyTrustBundle(c.jws, c.gatewayJwk ?? GATEWAY_JWK, { asOf: new Date(c.asOf) })
       assert.equal(r.ok, c.ok, `${c.name}: ${r.reason}`)
       if (c.ok) assert.deepEqual(r.bundle, c.bundle, c.name)
+      else assertReason(c, r.reason)
     }
   })
 
   it("bundleAnchor", () => {
     for (const c of V.bundleAnchor) {
       let anchor: ReturnType<typeof approverAnchor> | null = null
+      let reason: string | undefined
       try {
-        anchor = approverAnchor(V.bundle, c.limitToDids ?? undefined, c.purpose)
-      } catch {
-        // refused
+        anchor = approverAnchor(
+          {
+            ...V.bundle,
+            ...(c.approvers ? { approvers: c.approvers } : {}),
+            ...(c.controllerKeys ? { controllerKeys: c.controllerKeys } : {}),
+          },
+          c.limitToDids ?? undefined,
+          c.purpose,
+          c.excludedDids ?? [],
+        )
+      } catch (err) {
+        reason = (err as Error).message
       }
       assert.equal(anchor !== null, c.ok, c.name)
+      if (!c.ok) assertReason(c, reason)
       if (!anchor || !c.expect) continue
       assert.deepEqual(anchor.dids, c.expect.dids)
       for (const [did, keys] of Object.entries(c.expect.keys))
@@ -104,38 +150,58 @@ describe("offline-approval vectors", () => {
 
   it("requirementFor", () => {
     for (const c of V.requirementFor) {
-      const bundle = bundleWith({ policy: c.policy, unmatchedActionPolicy: c.unmatchedActionPolicy })
-      assert.deepEqual(requirementFor(bundle, c.actionType, c.display), c.expect, c.name)
+      const bundle = bundleWith({
+        ...(c.bundleVersion !== undefined ? { v: c.bundleVersion } : {}),
+        policy: c.policy,
+        unmatchedActionPolicy: c.unmatchedActionPolicy,
+        ...(c.requesterControllers !== undefined ? { requesterControllers: c.requesterControllers } : {}),
+      })
+      assert.deepEqual(requirementFor(bundle, c.actionType, c.display, c.requesterDid), c.expect, c.name)
     }
   })
 
   it("trustAnchorFile", () => {
     for (const c of V.trustAnchorFile) {
       let got: unknown = null
+      let reason: string | undefined
       try {
         const parsed = parseTrustAnchorFile(c.text, { purpose: c.purpose })
         const anchor = trustAnchorApprovers(parsed)
+        const enrolledDeviceKeys = trustAnchorEnrolledDeviceKeys(parsed)
         got = {
           purpose: parsed.purpose,
           epoch: parsed.epoch,
           ...(parsed.tenantId !== undefined ? { tenantId: parsed.tenantId } : {}),
           dids: anchor.dids,
           keys: Object.fromEntries(anchor.dids.map((d: string) => [d, anchor.resolveKey?.(d) ?? null])),
+          ...(enrolledDeviceKeys.length > 0 ? { enrolledDeviceKeys } : {}),
         }
-      } catch {
-        // refused
+      } catch (err) {
+        reason = (err as Error).message
       }
       assert.equal(got !== null, c.ok, c.name)
       if (c.ok) assert.deepEqual(got, c.expect, c.name)
+      else assertReason(c, reason)
     }
   })
 
   it("createChallenge", () => {
     for (const c of V.createChallenge) {
-      const { delegation, asOf, bundleTenantId, ...input } = c.input
+      const {
+        delegation,
+        asOf,
+        bundleTenantId,
+        bundleRequesterControllers,
+        bundleVersion,
+        bundlePolicy,
+        ...input
+      } = c.input
       const bundle = { ...V.bundle } as Record<string, unknown>
+      if (bundleVersion !== undefined) bundle.v = bundleVersion
+      if (bundlePolicy !== undefined) bundle.policy = bundlePolicy
       if (bundleTenantId === null) delete bundle.tenantId
       else if (bundleTenantId !== undefined) bundle.tenantId = bundleTenantId
+      if (bundleRequesterControllers === null) delete bundle.requesterControllers
       const r = createOfflineChallenge({
         bundle: bundle as never,
         ...input,
@@ -153,7 +219,10 @@ describe("offline-approval vectors", () => {
           : {}),
       })
       assert.equal(r.ok, c.ok, `${c.name}: ${r.reason}`)
-      if (!c.ok) continue
+      if (!c.ok) {
+        assertReason(c, r.reason)
+        continue
+      }
       for (const field of Object.keys(c.expect))
         assert.deepEqual(
           (r.challenge as Record<string, unknown>)[field],
@@ -168,6 +237,7 @@ describe("offline-approval vectors", () => {
       const r = decodeChallengeEnvelope(c.envelope)
       assert.equal(r.ok, c.ok, `${c.name}: ${r.reason}`)
       if (c.ok) assert.deepEqual(r.challenge, c.expect, c.name)
+      else assertReason(c, r.reason)
     }
   })
 
@@ -177,6 +247,7 @@ describe("offline-approval vectors", () => {
       const r = decodeSignatureEnvelope(c.envelope)
       assert.equal(r.ok, c.ok, c.name)
       if (c.ok) assert.deepEqual(r.witness, c.witness, c.name)
+      else assertReason(c, r.reason)
     }
   })
 
@@ -188,7 +259,10 @@ describe("offline-approval vectors", () => {
         asOf: new Date(c.asOf),
       })
       assert.equal(r.ok, c.ok, `${c.name}: ${r.reason}`)
-      if (!c.ok) continue
+      if (!c.ok) {
+        assertReason(c, r.reason)
+        continue
+      }
       const w = decodeSignatureEnvelope(r.envelope ?? "").witness
       assert.equal(w?.signerDid, c.expect.signerDid)
       assert.equal(w?.signerPublicKey, c.expect.signerPublicKey)
@@ -264,7 +338,10 @@ describe("offline-approval vectors", () => {
           assert.match(r.reason ?? "", /could not buffer/)
           assert.deepEqual(fs.readdirSync(path.join(dir, ".redeemed")), [])
         }
-        if (!c.ok) continue
+        if (!c.ok) {
+          assertReason(c, r.reason)
+          continue
+        }
         assert.deepEqual([...(r.signers ?? [])].sort(), c.expect.signers, c.name)
         assert.equal(r.viaDelegation ?? null, c.expect.viaDelegation, c.name)
       }

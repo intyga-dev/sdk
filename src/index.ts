@@ -20,6 +20,7 @@ export {
   selfCertifyingDid,
   verificationCode,
   verifyApprovalReceipt,
+  validSignerExclusions,
   verifyEcdsaP256,
   WEAKER_REQUIREMENT_REASON,
 } from "@intyga/verify"

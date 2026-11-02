@@ -30,6 +30,7 @@ test("execution PEP recomputes the monetary aggregate and rejects drift", () => 
     nbf: "2026-09-20T12:00:00.000Z",
   }
   const canonicalPayload = canonicalIntentPayload({
+    tenantId: "11111111-1111-4111-8111-111111111111",
     target: "payments-prod",
     actionType: "payments.send",
     display: "Pay invoice",
@@ -63,19 +64,37 @@ test("execution PEP recomputes the monetary aggregate and rejects drift", () => 
     verificationCode: "unused",
   }
   const expected = {
+    tenantId: "11111111-1111-4111-8111-111111111111",
     target: "payments-prod",
     actionType: "payments.send",
     params: { invoice: "test" },
     nonce: "invoice-test-nonce",
     requesterDid: "did:intyga:agent:pay",
-    approvers: { dids: ["did:intyga:owner"], resolveKey: () => publicKey },
+    approvers: {
+      dids: ["did:intyga:owner"],
+      resolveKey: (did: string) => (did === "did:intyga:owner" ? publicKey : null),
+    },
     agentContext,
+    requirement: {
+      requiredApprovals: 1,
+      requireHardwareKey: false,
+      allowedAaguids: [],
+      requesterCannotApprove: true,
+      signerClass: "human",
+    },
   }
   const opts = { asOf: new Date("2026-09-20T12:02:00.000Z") }
   const state = { head: prev, seq: "1", aggregate: { amount: "3.00", currency: "SEK" } }
   const accepted = verifyAgentForExecution(receipt, expected, liveConfig, state, opts)
   assert.equal(accepted.ok, true, accepted.reason)
   assert.match(accepted.nextHead ?? "", /^sha256:[0-9a-f]{64}$/)
+  assert.match(
+    verifyAgentForExecution(receipt, expected, liveConfig, state, {
+      asOf: new Date("2026-09-20T12:06:00.000Z"),
+      allowExpired: true,
+    }).reason ?? "",
+    /expired/,
+  )
   assert.match(
     verifyAgentForExecution(
       receipt,

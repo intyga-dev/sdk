@@ -147,7 +147,7 @@ export function createOfflineChallenge(input: {
   // approval would verify at every relying party that also asserts it.
   if (typeof input.target !== "string" || !input.target.trim())
     return { ok: false, reason: "target is required (DIV Target Isolation)" }
-  const resolved = requirementFor(input.bundle, input.actionType, input.display)
+  const resolved = requirementFor(input.bundle, input.actionType, input.display, input.requester.did)
   if (!resolved)
     return {
       ok: false,
@@ -162,6 +162,12 @@ export function createOfflineChallenge(input: {
     return {
       ok: false,
       reason: `"${input.actionType}" requires a hardware-backed WebAuthn credential, which cannot be produced offline — this action cannot be approved out of band (DIV §5a.3)`,
+    }
+  // Same class of refusal: an offline key is never an enrolled approver device key (DIV §5a.3).
+  if (resolved.requirement.requireEnrolledDevice === true)
+    return {
+      ok: false,
+      reason: `"${input.actionType}" requires an enrolled approver device, which cannot sign offline — this action cannot be approved out of band (DIV §5a.3)`,
     }
 
   if (input.windowMinutes !== undefined && !Number.isSafeInteger(input.windowMinutes))
@@ -207,18 +213,26 @@ export function createOfflineChallenge(input: {
     : resolved.requirement
   const approverDids = input.delegation ? input.delegation.delegatedTo : resolved.approverDids
 
-  const canonicalPayload = canonicalOfflineIntentPayload({
-    tenantId: input.bundle.tenantId,
-    target: input.target,
-    actionType: input.actionType,
-    display: input.display,
-    params: input.params,
-    requester: input.requester,
-    requirement,
-    nonce,
-    challengedAt,
-    expiresAt,
-  })
+  // A refusal, never an exception (docs/OFFLINE-APPROVAL-SDK.md, "Capabilities"): params with a value
+  // the verifiers cannot all serialize identically, or a malformed requester extension, are a property
+  // of this action, and every port reports them the same way.
+  let canonicalPayload: string
+  try {
+    canonicalPayload = canonicalOfflineIntentPayload({
+      tenantId: input.bundle.tenantId,
+      target: input.target,
+      actionType: input.actionType,
+      display: input.display,
+      params: input.params,
+      requester: input.requester,
+      requirement,
+      nonce,
+      challengedAt,
+      expiresAt,
+    })
+  } catch (err) {
+    return { ok: false, reason: `the action cannot be canonicalized: ${(err as Error).message}` }
+  }
 
   return {
     ok: true,
@@ -360,6 +374,19 @@ function challengeShapeProblem(p: Record<string, unknown>): string | null {
   if (!isObject(p.params)) return "params is not a JSON object"
   if (!isObject(p.requester) || typeof p.requester.did !== "string") return "requester is not an identity"
   if (!isObject(p.requirement)) return "requirement is not a JSON object"
+  // DIV §4.3.2 types, not merely bytes that re-serialize: `requiredApprovals: 1.5` canonicalizes to
+  // itself, yet no verifier would count toward it and no relying party builds it.
+  const r = p.requirement
+  if (
+    !Number.isSafeInteger(r.requiredApprovals) ||
+    Number(r.requiredApprovals) < 1 ||
+    typeof r.requireHardwareKey !== "boolean" ||
+    typeof r.requesterCannotApprove !== "boolean" ||
+    !Array.isArray(r.allowedAaguids) ||
+    !r.allowedAaguids.every((a) => typeof a === "string") ||
+    typeof r.signerClass !== "string"
+  )
+    return "requirement is not a valid approval requirement"
   return null
 }
 
@@ -645,7 +672,7 @@ export async function useOfflineApproval(
   // bundle's ORDINARY rule, re-resolved here rather than read back from the challenge. Under a
   // delegation that is still the right floor: createOfflineChallenge refused any delegatedQuorum
   // below the ordinary quorum (DIV §5a.5), and the rest of the requirement is copied from the rule.
-  const ordinary = requirementFor(bundle, expected.actionType, expected.display)
+  const ordinary = requirementFor(bundle, expected.actionType, expected.display, opts.requesterDid)
   if (!ordinary) return { ok: false, reason: "no unambiguous approval rule applies to this action" }
   const result = verifyApprovalReceipt(
     receipt,
@@ -659,7 +686,12 @@ export async function useOfflineApproval(
       // Restricted to the approvers eligible for THIS action, so a valid signature from someone
       // outside the rule's approver list does not count toward its quorum. The one place offline
       // signing keys count: this receipt is a div-offline-intent.
-      approvers: approverAnchor(bundle, challenge.approverDids, "offline-intent"),
+      approvers: approverAnchor(
+        bundle,
+        challenge.approverDids,
+        "offline-intent",
+        excludedDidsFor(ordinary.requirement, opts.requesterDid, challenge.requester.credentialIssuerDid),
+      ),
       requirement: requirementFloorOf(ordinary.requirement),
     },
     { allowOffline: true, delegation, asOf: opts.asOf },
@@ -710,7 +742,7 @@ function findDelegation(
   requesterDid: string,
   asOf?: Date,
 ): { delegation?: VerifiedDelegation; reason?: string } {
-  const resolved = requirementFor(bundle, expected.actionType, expected.display)
+  const resolved = requirementFor(bundle, expected.actionType, expected.display, requesterDid)
   if (!resolved)
     return {
       reason:
@@ -744,7 +776,12 @@ function findDelegation(
       {
         // The ORDINARY approver set — not the delegates. Whoever may approve this action is who must
         // have delegated it. Ordinary keys only: an offline signing key must never seal a delegation.
-        approvers: approverAnchor(bundle, resolved.approverDids, "ordinary"),
+        approvers: approverAnchor(
+          bundle,
+          resolved.approverDids,
+          "ordinary",
+          excludedDidsFor(resolved.requirement, requesterDid, receipt.requester?.credentialIssuerDid),
+        ),
         tenantId: bundle.tenantId,
         requesterDid,
         target: expected.target,
@@ -774,7 +811,13 @@ function findDelegation(
     if (
       sealed.requiredApprovals < ordinary.requiredApprovals ||
       (ordinary.requireHardwareKey && !sealed.requireHardwareKey) ||
+      // A delegation can never carry requireEnrolledDevice (DIV §4.3.2), so it can never be as
+      // strict as an ordinary rule that demands an enrolled device.
+      ordinary.requireEnrolledDevice === true ||
       (ordinary.requesterCannotApprove && !sealed.requesterCannotApprove) ||
+      (ordinary.excludedSignerDids !== undefined &&
+        (sealed.excludedSignerDids === undefined ||
+          !ordinary.excludedSignerDids.every((did) => sealed.excludedSignerDids?.includes(did)))) ||
       weakerAaguids
     ) {
       rejected.push(
@@ -787,12 +830,27 @@ function findDelegation(
   return rejected.length > 0 ? { reason: `no delegation applies (${rejected.join("; ")})` } : {}
 }
 
+function excludedDidsFor(
+  requirement: ApprovalRequirementAttestation,
+  requesterDid: string,
+  issuerDid?: string,
+): string[] {
+  return [
+    ...new Set([
+      ...(requirement.excludedSignerDids ?? []),
+      ...(requirement.requesterCannotApprove ? [requesterDid, ...(issuerDid ? [issuerDid] : [])] : []),
+    ]),
+  ]
+}
+
 /** The DIV §5 step 3d floor a bundle rule imposes on a signed requirement. */
 function requirementFloorOf(rule: ApprovalRequirementAttestation): RequirementFloor {
   return {
     requiredApprovals: rule.requiredApprovals,
     requesterCannotApprove: rule.requesterCannotApprove,
     requireHardwareKey: rule.requireHardwareKey,
+    ...(rule.requireEnrolledDevice === true ? { requireEnrolledDevice: true } : {}),
+    ...(rule.excludedSignerDids !== undefined ? { excludedSignerDids: rule.excludedSignerDids } : {}),
   }
 }
 

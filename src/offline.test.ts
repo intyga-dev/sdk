@@ -176,6 +176,59 @@ describe("trust bundle", () => {
     assert.deepEqual(selected?.approverDids, [ALICE.did, BOB.did])
   })
 
+  it("requires a requester controller snapshot for a new four-eyes challenge", () => {
+    const policy = bundleOf().policy.map((rule) =>
+      rule.actionPattern === "db.restart" ? { ...rule, requesterCannotApprove: true } : rule,
+    )
+    const requesterDid = "did:intyga:service:oncall"
+    assert.equal(requirementFor(bundleOf({ policy }), "db.restart", ACTION.display, requesterDid), null)
+
+    const resolved = requirementFor(
+      bundleOf({
+        policy,
+        requesterControllers: {
+          [requesterDid]: [BOB.did, ALICE.did, BOB.did],
+        },
+      }),
+      "db.restart",
+      ACTION.display,
+      requesterDid,
+    )
+    assert.deepEqual(resolved?.requirement.excludedSignerDids, [ALICE.did, BOB.did])
+  })
+
+  it("unions policy exclusions with requester controllers without excluding independent approvers", () => {
+    const requesterDid = "did:intyga:service:oncall"
+    const policy = bundleOf().policy.map((rule) =>
+      rule.actionPattern === "db.restart"
+        ? { ...rule, requesterCannotApprove: true, excludedSignerDids: [CAROL.did] }
+        : rule,
+    )
+    const resolved = requirementFor(
+      bundleOf({ requesterControllers: { [requesterDid]: [ALICE.did] }, policy }),
+      "db.restart",
+      ACTION.display,
+      requesterDid,
+    )
+    assert.deepEqual(resolved?.requirement.excludedSignerDids, [ALICE.did, CAROL.did])
+    assert.equal(resolved?.requirement.excludedSignerDids?.includes(BOB.did), false)
+  })
+
+  it("refuses malformed requester-controller snapshots", () => {
+    for (const requesterControllers of [
+      { requester: [ALICE.did] },
+      { "did:intyga:requester": ["alice"] },
+      { "did:intyga:requester": "did:intyga:alice" },
+    ]) {
+      const r = verifyTrustBundle(
+        signBundle(bundleOf({ requesterControllers: requesterControllers as never })),
+        GATEWAY_JWK,
+      )
+      assert.equal(r.ok, false)
+      assert.match(r.reason ?? "", /malformed requester controllers/)
+    }
+  })
+
   it("refuses a tampered payload", () => {
     const jws = signBundle(bundleOf())
     const [h, p, s] = jws.split(".") as [string, string, string]
@@ -806,6 +859,7 @@ describe("useOfflineApproval", () => {
   it("refuses a validly signed seal that drops the ordinary requesterCannotApprove requirement", async () => {
     const dir = bundleDir({
       approvers: [ALICE, BOB, MALLORY, CAROL].map((a) => ({ did: a.did, publicKeys: [a.spki] })),
+      requesterControllers: { [requesterDid]: [] },
       policy: [
         {
           actionPattern: ACTION.actionType,
@@ -1474,6 +1528,70 @@ describe("offline signing keys in the trust bundle (DIV §5a.4)", () => {
       ALICE.spki,
       ALICE_OFF.spki,
     ])
+  })
+
+  it("keeps every trusted identity resolvable without widening a subset's eligible DIDs", () => {
+    const anchor = approverAnchor(bundleOf(withOfflineKeys), [BOB.did], "offline-intent")
+
+    // Only Bob may satisfy this action's quorum. Alice and Carol remain resolvable solely so the
+    // verifier can compare a witness key against signed requester/controller exclusions and detect
+    // a second DID that aliases an excluded person's key.
+    assert.deepEqual(anchor.dids, [BOB.did])
+    assert.deepEqual(anchor.resolveKey?.(BOB.did), [BOB.spki, BOB_OFF.spki])
+    assert.deepEqual(anchor.resolveKey?.(ALICE.did), [ALICE.spki, ALICE_OFF.spki])
+    assert.deepEqual(anchor.resolveKey?.(CAROL.did), [CAROL.spki])
+    assert.equal(anchor.dids.includes(ALICE.did), false)
+    assert.equal(anchor.dids.includes(CAROL.did), false)
+  })
+
+  it("uses controller key facts only for excluded identities", () => {
+    const bundle = bundleOf({
+      approvers: [{ did: BOB.did, publicKeys: [BOB.spki], offlinePublicKeys: [BOB_OFF.spki] }],
+      controllerKeys: {
+        [ALICE.did]: [BOB_OFF.spki],
+        [BOB.did]: [MALLORY.spki],
+      },
+    })
+    const anchor = approverAnchor(bundle, [BOB.did], "offline-intent", [ALICE.did])
+
+    assert.deepEqual(anchor.dids, [BOB.did])
+    assert.deepEqual(anchor.resolveKey?.(ALICE.did), [BOB_OFF.spki])
+    assert.deepEqual(
+      anchor.resolveKey?.(BOB.did),
+      [BOB.spki, BOB_OFF.spki],
+      "an unexcluded controller fact must not become an eligible approver key",
+    )
+  })
+
+  it("refuses an eligible approver whose key aliases an excluded non-approver controller", async () => {
+    const baseline = { ...bundleOf().policy[1]!, approverDids: [BOB.did] }
+    const policy = [
+      baseline,
+      {
+        ...baseline,
+        actionPattern: "admin.issue-personal-key",
+        approverDids: [BOB.did],
+        requiredApprovals: 1,
+        requesterCannotApprove: true,
+      },
+    ]
+    const bundle = bundleOf({
+      approvers: [{ did: BOB.did, publicKeys: [BOB.spki], offlinePublicKeys: [BOB_OFF.spki] }],
+      policy,
+      requesterControllers: { [requesterDid]: [ALICE.did] },
+      controllerKeys: { [ALICE.did]: [BOB_OFF.spki] },
+    })
+    const result = await useOfflineApproval(
+      { ...ACTION, actionType: "admin.issue-personal-key" },
+      {
+        bundleDir: bundleDir(bundle),
+        requesterDid,
+        collectSignatures: collectFrom(BOB_OFF),
+        warn: () => {},
+      },
+    )
+    assert.equal(result.ok, false)
+    assert.match(result.reason ?? "", /shared|excluded|four-eyes/i)
   })
 
   it("refuses a bundle that lists one key as both ordinary and offline-only", () => {

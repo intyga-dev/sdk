@@ -3,7 +3,43 @@
 All notable changes to `@intyga/sdk` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.3.0]
+
+- DIV 1.3.0 enrolled approver devices (ADR 027). Trust Bundle version 2 (§5a.4): `v` is 2 exactly
+  when a policy entry carries `requireEnrolledDevice: true`, so an older reader refuses such a bundle
+  instead of reading the rule as weaker. `requirementFor` carries the field; `createOfflineChallenge`
+  refuses it ("… requires an enrolled approver device, which cannot sign offline …"), and the
+  step-3d floor derived from a bundle rule keeps demanding it.
+- Trust-anchor files may list `enrolledDeviceKeys` (online anchors only, each also pinned under an
+  approver); `trustAnchorEnrolledDeviceKeys(file)` returns them for `expected.enrolledDeviceKeys`.
+- CLI: an `--approvers-file` anchor's enrolled device keys are passed to verification;
+  `--require-enrolled-device` (or `INTYGA_REQUIRE_ENROLLED_DEVICE=1`) adds the requirement to the
+  floor.
+
+## [2.2.0]
+
+- `decodeChallengeEnvelope` (and so `signChallengeEnvelope`) refuses a challenge whose requirement
+  lacks its DIV §4.3.2 types — e.g. `requiredApprovals: 1.5` or `"2"`, which re-canonicalize to
+  themselves — with "challenge payload requirement is not a valid approval requirement — refusing to
+  sign it". The stricter of the ports' behaviours; no relying party builds such a challenge.
+- `createOfflineChallenge` returns a refusal ("the action cannot be canonicalized: …") instead of
+  throwing when the action's params or requester cannot be canonicalized portably, as the other four
+  SDKs already did and docs/OFFLINE-APPROVAL-SDK.md requires.
+- `requirementFor` returns `null` for a `requesterCannotApprove` rule when no `requesterDid` is
+  given, exactly as when the requester has no signed `requesterControllers` entry (DIV §5a.4). It
+  used to return the rule's own exclusions alone, the requester-only fallback the spec rules out. No
+  in-repo caller is affected: `createOfflineChallenge`, `useOfflineApproval` and the delegation search
+  always pass the requester.
+- `verifyTrustBundle` decodes the JWS parts as strict base64url: a character outside the alphabet is
+  refused (header and payload as "not JSON", signature as not verifying) instead of being skipped by
+  Node's decoder, which let a stray character in the signature part still verify. The other SDKs
+  already refused such input. A JSON array as the header or payload is now "invalid trust bundle
+  header" / "invalid trust bundle payload" rather than being read as an object with no fields.
+- `offline-approval-vectors.json` refusal cases carry the reference refusal text (`reason`, or
+  `reasonPrefix` where it embeds a library message), and new `order-…` cases pin validation order for
+  trust bundles, challenge creation and approver signing; every port asserts them.
+- Agent execution now requires explicit RP-owned tenant binding and requirement floor, and cannot
+  enable the verifier's forensic expired-receipt override on the live execution path.
 
 ## [2.1.0]
 

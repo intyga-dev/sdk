@@ -9,7 +9,7 @@ import { blobHash, encryptPolicy, generateOrgKeypair } from "./policy.js"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import { assertGatewayUrl, GATEWAY_TIMEOUT_MS, isRedirect, redirectHint } from "./transport.js"
 import type { ApproverTrustAnchor, RequirementFloor } from "@intyga/verify"
-import { parseTrustAnchorFile, trustAnchorApprovers } from "./trust-anchor.js"
+import { parseTrustAnchorFile, trustAnchorApprovers, trustAnchorEnrolledDeviceKeys } from "./trust-anchor.js"
 import { evidencePolicyFromFile, parseEvidenceSourcesFile } from "./evidence-sources.js"
 
 function arg(name: string): string | undefined {
@@ -59,6 +59,7 @@ function resolveApproverAnchor(): {
   anchor: ApproverTrustAnchor
   webauthn?: { origin: string; rpId: string }
   tenantId?: string
+  enrolledDeviceKeys?: string[]
 } | null {
   const filePath = arg("approvers-file") ?? process.env.INTYGA_APPROVERS_FILE
   const keys = approverKeys()
@@ -77,7 +78,13 @@ function resolveApproverAnchor(): {
     }
     try {
       const file = parseTrustAnchorFile(text)
-      return { anchor: trustAnchorApprovers(file), webauthn: file.webauthn, tenantId: file.tenantId }
+      const enrolledDeviceKeys = trustAnchorEnrolledDeviceKeys(file)
+      return {
+        anchor: trustAnchorApprovers(file),
+        webauthn: file.webauthn,
+        tenantId: file.tenantId,
+        ...(enrolledDeviceKeys.length > 0 ? { enrolledDeviceKeys } : {}),
+      }
     } catch (err) {
       die(err instanceof Error ? err.message : String(err))
     }
@@ -491,10 +498,15 @@ function parseParamsArg(): Record<string, unknown> {
  */
 function requirementFloorFromArgs(): RequirementFloor | undefined {
   const raw = arg("required-approvals") ?? process.env.INTYGA_REQUIRED_APPROVALS
-  if (raw === undefined || raw === "") return undefined
-  const n = Number(raw)
-  if (!/^[1-9][0-9]?$/.test(raw) || n > 64) die("--required-approvals must be an integer from 1 to 64")
-  return { requiredApprovals: n }
+  // --require-enrolled-device demands the signed policy require an enrolled approver device
+  // (DIV §4.3.2); it needs --approvers-file, whose enrolledDeviceKeys the verifier then checks.
+  const device =
+    process.argv.includes("--require-enrolled-device") || process.env.INTYGA_REQUIRE_ENROLLED_DEVICE === "1"
+  if ((raw === undefined || raw === "") && !device) return undefined
+  const n = raw === undefined || raw === "" ? 1 : Number(raw)
+  if (raw !== undefined && raw !== "" && (!/^[1-9][0-9]?$/.test(raw) || n > 64))
+    die("--required-approvals must be an integer from 1 to 64")
+  return { requiredApprovals: n, ...(device ? { requireEnrolledDevice: true } : {}) }
 }
 
 /**
@@ -590,6 +602,8 @@ async function pollVerifyConsume(
       nonce,
       approvers: resolved.anchor,
       ...(opts.requirement ? { requirement: opts.requirement } : {}),
+      // Only from the independently adopted anchor file, never from the receipt (DIV §4.3.2).
+      ...(resolved.enrolledDeviceKeys ? { enrolledDeviceKeys: resolved.enrolledDeviceKeys } : {}),
     },
     { allowAutoApproved, ...webauthnExpectations(resolved.webauthn) },
   )
@@ -889,7 +903,7 @@ async function main() {
       const actionDescription = rest.find((a) => !a.startsWith("--"))
       if (!actionDescription)
         die(
-          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--request-id] [--evidence <file>]',
+          'usage: intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] [--type <actionType>] [--params <json>] [--token <t> | --client-id <> --client-secret <>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--require-enrolled-device] [--request-id] [--evidence <file>]',
         )
       const { timeoutSec, timeoutMs } = parseTimeout(arg("timeout"))
       const baseParams = parseParamsArg()
@@ -982,7 +996,7 @@ async function main() {
       const nonce = rest.find((a) => !a.startsWith("--"))
       if (!nonce)
         die(
-          "usage: intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
+          "usage: intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--require-enrolled-device] [--evidence <file>]",
         )
       const { timeoutMs } = parseTimeout(arg("timeout"))
       const target = arg("target") ?? ""
@@ -1478,7 +1492,7 @@ async function main() {
           "  intyga policy-encrypt <manifest.json> --pubkey <public.key> [--out <blob.json>]",
           "  intyga login --did <did> [--gateway <url>]",
           '  intyga authorize "<action>" --gateway <url> --target <target> [--tenant <tenantId>] (--token <t> | --client-id <> --client-secret <>) [--type <actionType>] [--params <json>] [--timeout <s>] [--web <appUrl>] [--no-wait] [--no-open] [--consume] [--allow-auto-approved]',
-          "  intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--evidence <file>]",
+          "  intyga await <nonce> --gateway <url> --target <target> [--tenant <tenantId>] [--type <t>] [--params <json>] [--timeout <s>] [--consume] [--allow-auto-approved] [--required-approvals <n>] [--require-enrolled-device] [--evidence <file>]",
           "",
           "  `authorize` and `await` verify the approval receipt offline and REQUIRE a trust anchor",
           "  you resolved yourself — the receipt's own key is never used, or it would vouch for its",

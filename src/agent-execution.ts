@@ -29,6 +29,9 @@ export function verifyAgentForExecution(
   trustedState: AgentSessionState,
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; nextHead?: string } {
+  if (!expected.tenantId) return { ok: false, reason: "agent execution requires an RP-owned tenantId" }
+  if (!expected.requirement)
+    return { ok: false, reason: "agent execution requires an RP-owned requirement floor" }
   let actualDigest: string
   try {
     actualDigest = agentConfigDigest(liveConfig)
@@ -62,7 +65,11 @@ export function verifyAgentForExecution(
   } catch {
     return { ok: false, reason: "invalid agent session amount or sequence" }
   }
-  const proof = verifyApprovalReceipt(receipt, expected, { ...opts, allowAutoApproved: false })
+  const proof = verifyApprovalReceipt(receipt, expected, {
+    ...opts,
+    allowAutoApproved: false,
+    allowExpired: false,
+  })
   if (!proof.ok) return { ok: false, reason: proof.reason }
   return { ok: true, nextHead: agentReceiptDigest(receipt) }
 }

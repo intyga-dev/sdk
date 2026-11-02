@@ -52,6 +52,13 @@ export interface TrustAnchorFile {
    * carry them; a flag or environment variable still wins over the file.
    */
   webauthn?: { origin: string; rpId: string }
+  /**
+   * Online anchors only. The approver keys that are ENROLLED APPROVER DEVICE keys (DIV §4.3.2):
+   * pass them as `expected.enrolledDeviceKeys` so a receipt whose signed policy requires an enrolled
+   * device verifies. Every entry must also be pinned under some approver's `publicKeys` — the list
+   * narrows which trusted keys count, it never adds trust.
+   */
+  enrolledDeviceKeys?: string[]
   exportedAt?: string
 }
 
@@ -135,6 +142,24 @@ export function parseTrustAnchorFile(
       )
   }
 
+  if (obj.enrolledDeviceKeys !== undefined) {
+    if (purpose !== "online")
+      return fail(
+        "enrolledDeviceKeys is only meaningful in an online anchor — offline approvals cannot use an enrolled device",
+      )
+    if (!Array.isArray(obj.enrolledDeviceKeys))
+      return fail("enrolledDeviceKeys must be an array of base64 SPKI keys")
+    const pinned = new Set((obj.approvers as Array<{ publicKeys: string[] }>).flatMap((a) => a.publicKeys))
+    for (const key of obj.enrolledDeviceKeys) {
+      if (typeof key !== "string" || !isBase64(key))
+        return fail("enrolledDeviceKeys must be an array of base64 SPKI keys")
+      if (!pinned.has(key))
+        return fail(
+          `enrolledDeviceKeys entry ${key.slice(0, 16)}… is not pinned under any approver — list it in that approver's publicKeys`,
+        )
+    }
+  }
+
   if (obj.webauthn !== undefined) {
     const w = obj.webauthn as Record<string, unknown>
     if (typeof w !== "object" || w === null) return fail("webauthn must be an object")
@@ -145,6 +170,11 @@ export function parseTrustAnchorFile(
   }
 
   return { ...(obj as unknown as TrustAnchorFile), purpose }
+}
+
+/** The file's enrolled approver device keys, for `expected.enrolledDeviceKeys` (empty when none). */
+export function trustAnchorEnrolledDeviceKeys(file: TrustAnchorFile): string[] {
+  return [...(file.enrolledDeviceKeys ?? [])]
 }
 
 /**

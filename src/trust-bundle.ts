@@ -26,7 +26,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { ensurePrivateDir, writePrivateFile } from "./secure-files.js"
 import type { ApproverTrustAnchor, ApprovalRequirementAttestation } from "@intyga/verify"
-import { parseRfc3339Ms, SIGNER_CLASS_HUMAN } from "@intyga/verify"
+import { parseRfc3339Ms, SIGNER_CLASS_HUMAN, validControllerDid, validSignerExclusions } from "@intyga/verify"
 
 /** Bundle `type` discriminator, inside the signed JWS payload. */
 export const DIV_TRUST_BUNDLE_TYPE = "div-trust-bundle-v1"
@@ -70,21 +70,56 @@ export interface BundlePolicy extends PolicyRule {
   requireHardwareKey: boolean
   allowedAaguids: string[]
   requesterCannotApprove: boolean
+  /**
+   * DIV §5a.4: only in a version 2 bundle, and only as `true`. No offline challenge can be created
+   * under a rule that sets it (an offline key is not an enrolled approver device).
+   */
+  requireEnrolledDevice?: true
   /** Which approvers are eligible for THIS pattern. A subset of `approvers`. */
   approverDids: string[]
 }
 
 export interface TrustBundle {
-  v: 1
+  /** `2` exactly when some policy entry carries `requireEnrolledDevice` (DIV §5a.4). */
+  v: 1 | 2
   type: typeof DIV_TRUST_BUNDLE_TYPE
   tenantId: string
   /** Pinned by the bundle signature; never inferred from a delegation receipt. */
   webauthn?: { origin: string; rpId: string }
   approvers: BundleApprover[]
   policy: BundlePolicy[]
+  /** Signed controller snapshots; missing entries cannot support new independent offline requests. */
+  requesterControllers?: Record<string, string[]>
+  /** Key facts for exclusions only; never expands eligible approver identities or their keys. */
+  controllerKeys?: Record<string, string[]>
   unmatchedActionPolicy: "DENY" | "BASELINE"
   issuedAt: string
   expiresAt: string
+}
+
+export function validRequesterControllers(value: unknown): value is Record<string, string[]> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.entries(value).every(
+      ([did, controllers]) => validControllerDid(did) && validSignerExclusions(controllers),
+    )
+  )
+}
+
+export function validControllerKeys(value: unknown): value is Record<string, string[]> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.entries(value).every(
+      ([did, keys]) =>
+        validControllerDid(did) &&
+        Array.isArray(keys) &&
+        keys.every((key) => typeof key === "string" && key.length > 0),
+    )
+  )
 }
 
 /** What `loadTrustBundle` writes/reads: the bundle JWS plus the key it must be verified against. */
@@ -98,7 +133,13 @@ export interface TrustBundleFiles {
 const BUNDLE_FILE = "trust-bundle.jws"
 const KEY_FILE = "gateway-key.jwk.json"
 
-function b64urlToBuffer(s: string): Buffer {
+/**
+ * Strict base64url (RFC 7515 §2; optional `=` padding tolerated as the envelopes do), or null.
+ * Node's decoder skips characters outside the alphabet, so a stray character in the signature part
+ * used to be ignored and the bundle still verified; every other SDK refuses such input.
+ */
+function b64urlToBuffer(s: string): Buffer | null {
+  if (!/^[A-Za-z0-9_-]*={0,2}$/.test(s)) return null
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64")
 }
 
@@ -121,11 +162,15 @@ export function verifyTrustBundle(
 
   let header: { alg?: string; typ?: string }
   try {
-    header = JSON.parse(b64urlToBuffer(headerB64).toString("utf8")) as { alg?: string; typ?: string }
+    const headerBytes = b64urlToBuffer(headerB64)
+    if (!headerBytes) throw new Error("not base64url")
+    header = JSON.parse(headerBytes.toString("utf8")) as { alg?: string; typ?: string }
   } catch {
     return { ok: false, reason: "trust bundle header is not JSON" }
   }
-  if (!header || typeof header !== "object") return { ok: false, reason: "invalid trust bundle header" }
+  // A JOSE header is a JSON object (RFC 7515 §4); an array is not one, whatever `typeof` says.
+  if (!header || typeof header !== "object" || Array.isArray(header))
+    return { ok: false, reason: "invalid trust bundle header" }
   if (header.alg !== "RS256")
     return { ok: false, reason: `trust bundle alg must be RS256, got ${header.alg ?? "(none)"}` }
 
@@ -140,14 +185,17 @@ export function verifyTrustBundle(
   }
 
   const signingInput = Buffer.from(`${headerB64}.${payloadB64}`, "utf8")
+  const signature = b64urlToBuffer(sigB64)
   let verified = false
   try {
-    verified = crypto.verify(
-      "sha256",
-      signingInput,
-      { key: keyObject, padding: crypto.constants.RSA_PKCS1_PADDING },
-      b64urlToBuffer(sigB64),
-    )
+    verified =
+      signature !== null &&
+      crypto.verify(
+        "sha256",
+        signingInput,
+        { key: keyObject, padding: crypto.constants.RSA_PKCS1_PADDING },
+        signature,
+      )
   } catch (err) {
     return { ok: false, reason: `trust bundle signature check failed: ${(err as Error).message}` }
   }
@@ -156,12 +204,20 @@ export function verifyTrustBundle(
 
   let bundle: TrustBundle
   try {
-    bundle = JSON.parse(b64urlToBuffer(payloadB64).toString("utf8")) as TrustBundle
+    const payloadBytes = b64urlToBuffer(payloadB64)
+    if (!payloadBytes) throw new Error("not base64url")
+    bundle = JSON.parse(payloadBytes.toString("utf8")) as TrustBundle
   } catch {
     return { ok: false, reason: "trust bundle payload is not JSON" }
   }
-  if (!bundle || typeof bundle !== "object") return { ok: false, reason: "invalid trust bundle payload" }
-  if (bundle.type !== DIV_TRUST_BUNDLE_TYPE || bundle.v !== 1)
+  if (!bundle || typeof bundle !== "object" || Array.isArray(bundle))
+    return { ok: false, reason: "invalid trust bundle payload" }
+  // DIV §5a.4: version 2 exists only to carry requireEnrolledDevice, so a version 2 bundle with no
+  // such entry is an unsupported version — one policy has one form, and the refusal (and its order)
+  // stays exactly what a version 1 reader reports for any unknown version.
+  const deviceRule =
+    Array.isArray(bundle.policy) && bundle.policy.some((r) => r?.requireEnrolledDevice === true)
+  if (bundle.type !== DIV_TRUST_BUNDLE_TYPE || (bundle.v !== 1 && !(bundle.v === 2 && deviceRule)))
     return { ok: false, reason: "unsupported trust bundle type or version" }
   if (typeof bundle.tenantId !== "string" || bundle.tenantId.length === 0)
     return { ok: false, reason: "trust bundle tenantId must be a non-empty string" }
@@ -197,7 +253,11 @@ export function verifyTrustBundle(
   const ordinaryKeys = new Set(bundle.approvers.flatMap((a) => a.publicKeys))
   if (bundle.approvers.some((a) => (a.offlinePublicKeys ?? []).some((k) => ordinaryKeys.has(k))))
     return { ok: false, reason: "trust bundle lists an offline signing key as an ordinary key" }
-  if (!Array.isArray(bundle.policy) || !bundle.policy.every(validBundlePolicy))
+  if (bundle.controllerKeys !== undefined && !validControllerKeys(bundle.controllerKeys))
+    return { ok: false, reason: "trust bundle carries malformed controller key facts" }
+  if (bundle.requesterControllers !== undefined && !validRequesterControllers(bundle.requesterControllers))
+    return { ok: false, reason: "trust bundle carries malformed requester controllers" }
+  if (!Array.isArray(bundle.policy) || !bundle.policy.every((entry) => validBundlePolicy(entry, bundle.v)))
     return { ok: false, reason: "trust bundle carries invalid or incomplete policy" }
   try {
     validateExactApprovalPolicy(bundle.policy)
@@ -297,6 +357,7 @@ export function approverAnchor(
   bundle: TrustBundle,
   limitToDids?: string[],
   purpose: BundleAnchorPurpose = "ordinary",
+  excludedDids: readonly string[] = [],
 ): ApproverTrustAnchor {
   if (purpose === "offline-intent" && limitToDids === undefined)
     throw new Error("offline-intent anchors require an explicit eligible DID restriction")
@@ -304,13 +365,20 @@ export function approverAnchor(
     ? bundle.approvers.filter((a) => limitToDids.includes(a.did))
     : bundle.approvers
   const byDid = new Map(
-    eligible.map((a) => [
+    bundle.approvers.map((a) => [
       a.did,
       purpose === "offline-intent" ? [...a.publicKeys, ...(a.offlinePublicKeys ?? [])] : a.publicKeys,
     ]),
   )
+  if (bundle.controllerKeys !== undefined) {
+    if (!validControllerKeys(bundle.controllerKeys)) throw new Error("Malformed controller key facts")
+    for (const did of excludedDids) {
+      const facts = bundle.controllerKeys[did]
+      if (facts) byDid.set(did, [...new Set([...(byDid.get(did) ?? []), ...facts])])
+    }
+  }
   return {
-    dids: [...byDid.keys()],
+    dids: [...new Set(eligible.map((a) => a.did))],
     resolveKey: (did) => byDid.get(did) ?? null,
   }
 }
@@ -320,19 +388,22 @@ export function approverAnchor(
  *
  * Matching follows the gateway's exact-ID evaluator. Signed rank/key fields are informational;
  * constraints are evaluated from the complete v1 policy. Unsupported offline controls,
- * conflicts, malformed bundles, and unmatched actions return null (refusal).
+ * conflicts, malformed bundles, and unmatched actions return null (refusal). A rule with
+ * `requesterCannotApprove` also returns null unless `requesterDid` is given and the bundle's signed
+ * `requesterControllers` has an entry for it (DIV §5a.4): there is no requester-only fallback.
  */
 export function requirementFor(
   bundle: TrustBundle,
   actionType: string,
   display: string,
+  requesterDid?: string,
 ): { requirement: ApprovalRequirementAttestation; approverDids: string[] } | null {
   if (
-    bundle?.v !== 1 ||
+    (bundle?.v !== 1 && bundle?.v !== 2) ||
     bundle.type !== DIV_TRUST_BUNDLE_TYPE ||
     (bundle.unmatchedActionPolicy !== "DENY" && bundle.unmatchedActionPolicy !== "BASELINE") ||
     !Array.isArray(bundle.policy) ||
-    !bundle.policy.every(validBundlePolicy)
+    !bundle.policy.every((entry) => validBundlePolicy(entry, bundle.v))
   )
     return null
   let winner: BundlePolicy | undefined
@@ -352,22 +423,46 @@ export function requirementFor(
     winner.autoApproveRequesterDid
   )
     return null
+  let exclusions = winner.excludedSignerDids
+  if (winner.requesterCannotApprove) {
+    // DIV §5a.4: a four-eyes requirement is incomplete without the requester's controllers, so it is
+    // refused when the requester is unknown, exactly as when its controller entry is missing. Returning
+    // the rule's own exclusions alone would be the requester-only fallback the spec rules out.
+    if (
+      requesterDid === undefined ||
+      !validRequesterControllers(bundle.requesterControllers) ||
+      !Object.hasOwn(bundle.requesterControllers, requesterDid)
+    )
+      return null
+    const controllers = bundle.requesterControllers[requesterDid]
+    if (!controllers) return null
+    exclusions = [...new Set([...(exclusions ?? []), ...controllers])].sort()
+  }
   return {
     requirement: {
+      ...(exclusions !== undefined ? { excludedSignerDids: [...new Set(exclusions)].sort() } : {}),
       requiredApprovals: Math.max(1, winner.requiredApprovals),
       requireHardwareKey: winner.requireHardwareKey,
       allowedAaguids: winner.allowedAaguids ?? [],
       requesterCannotApprove: winner.requesterCannotApprove,
+      // Carried, never dropped: the offline ceremony refuses it explicitly (DIV §5a.3 step 4) and a
+      // relying party's step-3d floor built from this requirement keeps demanding it.
+      ...(winner.requireEnrolledDevice === true ? { requireEnrolledDevice: true } : {}),
       signerClass: SIGNER_CLASS_HUMAN,
     },
     approverDids: winner.approverDids ?? [],
   }
 }
 
-function validBundlePolicy(value: unknown): value is BundlePolicy {
+function validBundlePolicy(value: unknown, version: number): value is BundlePolicy {
   if (!value || typeof value !== "object") return false
   const p = value as Record<string, unknown>
   if (p.signerClass !== "human") return false
+  // DIV §5a.4: version 2 admits `requireEnrolledDevice: true` and nothing else under that key; a
+  // version 1 bundle never carries it, so an older reader cannot meet it read as weaker.
+  if (Object.hasOwn(p, "requireEnrolledDevice") && (version !== 2 || p.requireEnrolledDevice !== true))
+    return false
+  if (p.excludedSignerDids !== undefined && !validSignerExclusions(p.excludedSignerDids)) return false
   if (
     typeof p.actionPattern !== "string" ||
     !p.actionPattern.trim() ||
